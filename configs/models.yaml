@@ -1,0 +1,93 @@
+# -----------------------------------------------------------------
+# Model & Ensemble Configuration (configs/models.yaml)
+# Defines sub-models, feature lists, and horizons.
+# -----------------------------------------------------------------
+
+# Global settings
+random_seed: 42
+horizons:
+  - "14d"  # One bi-weekly period ahead
+  - "1m"   # Two periods
+  - "3m"   # Six periods
+
+# Hurdle model parameters (Two-stage: Classification -> Regression)
+hurdle_params:
+  classifier_downsample_ratio: 3 # 3:1 (negatives:positives)
+  regressor_loss_function: "huber"
+  # Additional LGBM params can be added here (e.g., n_estimators, learning_rate)
+
+# Sub-model feature definitions
+# Note: 'fatalities_sum_lag1' is included in most models as the 
+# primary autoregressive control variable.
+
+submodels:
+  baseline:
+    features:
+      - fatalities_sum_lag1
+      - pop_log
+      - pop_missing
+  
+  conflicthistory:
+    features:
+      - fatalities_sum_lag1
+      - fatalities_sum_lag2
+      - fatalities_sum_lag3
+      - decay_30d_fatalities_sum
+      - decay_90d_fatalities_sum
+      - protest_count_lag1
+      - riot_count_lag1
+  
+  natsoc: # "Natural & Social" - uses Static Features from Script 01 & 07
+    features:
+      - fatalities_sum_lag1 # Control
+      - pop_log
+      - pop_missing
+      - dist_to_capital
+      - dist_to_city
+      - dist_to_border
+      - dist_to_road
+      - elevation_mean
+      - slope_mean
+  
+  drought:
+    features:
+      - fatalities_sum_lag1 # Control
+      - precip_90d_total
+      - precip_90d_anomaly
+      - precip_90d_spi
+      - vhi_mean_30d
+      - vhi_stress_flag_20
+      - vhi_stress_flag_40
+  
+  protest:
+    features:
+      - fatalities_sum_lag1 # Control
+      - protest_count_lag1
+      - protest_count_lag2
+      - riot_count_lag1
+      - riot_count_lag2
+      - vac_count_lag1 # Violence Against Civilians
+  
+  migration: # Uses IOM Data from Script 06
+    features:
+      - fatalities_sum_lag1 # Control
+      - iom_displacement_count_lag1
+      - iom_displacement_count_lag2
+      - decay_30d_iom_displacement_count
+  
+  spatlag_model: # Spatial Lags (Neighboring conflict)
+    features:
+      - fatalities_sum_lag1
+      - spatlag_1_fatalities_sum_lag1
+      - spatlag_1_protest_count_lag1
+      - spatlag_1_riot_count_lag1
+  
+  event_distance_model: # Distance to recent conflict events
+    features:
+      - fatalities_sum_lag1
+      - time_since_last_fatal_event
+      - distance_to_most_recent_fatal_event
+  
+  broad:
+    features: "all_pca" # Special flag for training script to use PCA
+    pca_variance_to_keep: 0.95 # Keep 95% variance in PCA

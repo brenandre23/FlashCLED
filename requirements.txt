@@ -1,0 +1,32 @@
+#requirements.txt
+
+#--- Core Data Science & ML ---
+
+pandas
+numpy
+scikit-learn
+lightgbm
+xgboost
+
+#--- Geospatial ---
+
+geopandas
+rasterio
+rasterstats
+osmnx
+
+#--- Data Ingestion & Database ---
+
+requests          # For downloading from APIs (ACLED, CHIRPS, IOM)
+h5py              # For reading HDF5 files (NOAA VHI data)
+pystac-client     # For querying the WorldPop STAC API
+sqlalchemy        # For connecting to PostgreSQL
+psycopg2          # Python-PostgreSQL driver
+pyarrow           # For reading/writing Parquet files
+pyyaml            # For reading/writing yaml
+
+#--- Utilities & Plotting ---
+
+matplotlib        # For plotting maps and graphs
+seaborn           # For prettier plots
+python-dotenv     # For loading your .env file with credentials

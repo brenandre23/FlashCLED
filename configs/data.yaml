@@ -1,0 +1,75 @@
+# -----------------------------------------------------------------
+# Data Source Configuration (configs/data.yaml)
+# Defines all external data sources, URLs, and API endpoints
+# -----------------------------------------------------------------
+
+# World Bank Admin 0 Boundary
+# Used by: 01_build_static_features.py
+world_bank_boundary:
+  iso3: "CAF"
+  url: "https://datacatalogfiles.worldpop.org/ddh-published-v2/0038272/5/DR0095369/World%20Bank%20Official%20Boundaries%20(GeoJSON)/World%20Bank%20Official%20Boundaries%20-%20Admin%200.geojson"
+  filter_property: "ISO_A3"
+
+# H3 Grid Configuration
+h3:
+  resolution: 5
+  buffer_km: 50
+
+# OSM & Settlements (Roads & Cities)
+# Used by: 03_fetch_temporal_roads_HYBRID.py
+osm:
+  # Ohsome API for historical road data
+  ohsome_api_url: "https://api.ohsome.org/v1/elements/geometry"
+  
+  # HDX / SIGCAF Settlements Shapefile (Zip)
+  settlements_hdx_url: "https://data.humdata.org/dataset/27db004a-4f10-4046-a561-c0b0aea98ef0/resource/6d28d003-333c-442c-9d39-6903bb264814/download/caf_settlements_sigcaf.zip"
+  
+  roads_tags:
+    highway: ["motorway", "trunk", "primary", "secondary", "tertiary", "unclassified", "residential"]
+  
+  grid_size: 4 # NxN tiling for API requests
+
+# Copernicus / Sentinel Hub (DEM & Terrain)
+# Used by: 07_calculate_terrain.py
+copernicus:
+  token_url: "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+  process_api_url: "https://sh.dataspace.copernicus.eu/api/v1/process"
+  dem_instance: "COPERNICUS_90"
+
+# Population Data (WorldPop)
+# Used by: 07b_fetch_population.py
+population:
+  # Base URL for R2025A (Unconstrained/Constrained) 100m data
+  base_url: "https://data.worldpop.org/GIS/Population/Global_2000_2020_Constrained" 
+  
+  start_year: 2015
+  end_year: 2030
+  
+  # Matches the files found in your data/raw/worldpop/ directory
+  # e.g. caf_pop_2015_CN_100m_R2025A_v1.tif
+  filename_template: "caf_pop_{year}_CN_100m_R2025A_v1.tif" 
+
+# IOM DTM (Migration/Displacement)
+# Used by: 06_fetch_iom.py (via dtmapi library)
+iom_dtm:
+  country_name: "Central African Republic"
+  # API URL is handled internally by dtmapi, but listed here for reference
+  api_docs: "https://displacement.iom.int/data/api"
+
+# ACLED (Conflict Data)
+acled:
+  api_url: "https://api.acleddata.com/acled/api"
+  query_params:
+    country: "Central African Republic"
+    region: [1, 2, 8, 9]  # Central, East, Middle, West Africa
+    limit: 0
+
+# CHIRPS (Precipitation)
+chirps:
+  ftp_url: "https://data.chc.ucsb.edu/products/CHIRPS-2.0/global_daily/tifs/"
+  climatology_base_period_start: 1981
+  climatology_base_period_end: 2010
+
+# NOAA VHI (Vegetation Health)
+vhi:
+  ftp_url: "https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/VHP_H_Global_P/"

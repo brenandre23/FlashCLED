@@ -1,0 +1,41 @@
+# -----------------------------------------------------------------
+# Feature Engineering Configuration (configs/features.yaml)
+# Defines all windows, lags, and parameters for feature generation
+# -----------------------------------------------------------------
+
+# Global CRS definitions
+# Used by: scripts/01_build_static_features.py
+metric_crs: "EPSG:32634"  # UTM Zone 34N (Correct for Central African Republic)
+geodetic_crs: "EPSG:4326" # WGS84 (Lat/Lon)
+
+# Temporal transforms (for dynamic feature generation)
+lags: [1, 2, 3] # k-periods (e.g., 1 bi-week, 2 bi-weeks)
+decays:
+  - half_life_days: 30
+  - half_life_days: 90
+
+# Spatial transforms (H3 K-Ring Smoothing)
+spatlag:
+  k_ring: 1        # Radius of neighbors to smooth over
+  min_neighbors: 3 # Minimum neighbors required to compute a spatial lag
+
+# Special event-based features (for event_distance_model)
+special_event_features:
+  - "time_since_last_fatal_event"
+  - "distance_to_most_recent_fatal_event"
+
+# Environmental feature windows (Rolling averages)
+environmental_windows_days: [14, 30, 90]
+
+# Environmental stress definitions (VHI thresholds)
+vhi_stress_thresholds: [20, 40]
+
+# Climatology definition (CHIRPS baseline)
+climatology_base_period:
+  start_year: 1981
+  end_year: 2010
+
+# Population Imputation Strategy
+population:
+  data_start_year: 2015       # First year of reliable WorldPop constrained data
+  imputation_method: "median" # Strategy for pre-2015 data
