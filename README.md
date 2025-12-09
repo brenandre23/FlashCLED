@@ -8,8 +8,6 @@ The system ingests multi-source data (satellite, economic, political), engineers
 
 ## 📄 Key documents (PDF)
 
-Put these in `docs/` (recommended) so they render as clickable links on GitHub:
-
 - **Thesis overview:** [`docs/CEWP_Thesis_Overview.pdf`](docs/CEWP_Thesis_Overview.pdf)
 - **Data source audit:** [`docs/CEWP_Data_Source_Audit.pdf`](docs/CEWP_Data_Source_Audit.pdf)
 
@@ -54,7 +52,7 @@ pip install -e .
 ```
 
 ### 3) Configure secrets
-Create a `.env` file in the repo root (do **not** commit this):
+Create a `.env` file in the root fplder
 
 ```ini
 DB_HOST=localhost
@@ -93,8 +91,6 @@ We take **OCHA Admin 2 (Sub-prefectures)** and store it under the filename the p
 2) Download **OCHA Admin 2 (Sub-prefectures)** → convert to GeoJSON if needed → save/rename as **`wbgCAFadmin3.geojson`**
 
 > Note: If you download Shapefiles (`.shp`), convert them to GeoJSON before saving/renaming.
-
-**Recommended:** keep a separate `DATA_INSTRUCTIONS.md` in the repo root with detailed download steps (ACLED / EPR / Admin boundaries).
 
 ### 5) Run the full pipeline
 ```bash
