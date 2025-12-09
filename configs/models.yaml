@@ -1,93 +1,81 @@
-# -----------------------------------------------------------------
-# Model & Ensemble Configuration (configs/models.yaml)
-# Defines sub-models, feature lists, and horizons.
-# -----------------------------------------------------------------
+# configs/models.yaml
+# =================================================================
+# MODELING EXPERIMENT CONFIGURATION
+# =================================================================
 
-# Global settings
-random_seed: 42
+feature_matrix:
+  build_start_date: "2000-01-01"
+  build_end_date: "2025-12-31" # Updated to 2025
+  chunk_size: "yearly"
+
+experiment:
+  random_seed: 42
+
+# --- TARGET HORIZONS ---
 horizons:
-  - "14d"  # One bi-weekly period ahead
-  - "1m"   # Two periods
-  - "3m"   # Six periods
+  - name: "14d"
+    steps: 1
+  - name: "1m"
+    steps: 2
+  - name: "3m"
+    steps: 6
 
-# Hurdle model parameters (Two-stage: Classification -> Regression)
+# --- LEARNER PARAMETERS ---
 hurdle_params:
-  classifier_downsample_ratio: 3 # 3:1 (negatives:positives)
+  classifier_scale_pos_weight: "auto"
   regressor_loss_function: "huber"
-  # Additional LGBM params can be added here (e.g., n_estimators, learning_rate)
+  regressor_huber_delta: 1.0
 
-# Sub-model feature definitions
-# Note: 'fatalities_sum_lag1' is included in most models as the 
-# primary autoregressive control variable.
+base_learner:
+  model_type: "xgboost"
+  xgb_params:
+    n_estimators: 300
+    max_depth: 6
+    learning_rate: 0.05
+    tree_method: "hist"
 
+# --- FEATURE SUBSETS ---
 submodels:
   baseline:
+    enabled: true
     features:
-      - fatalities_sum_lag1
+      - fatalities_14d_sum
       - pop_log
-      - pop_missing
-  
+
   conflicthistory:
+    enabled: true
     features:
-      - fatalities_sum_lag1
-      - fatalities_sum_lag2
-      - fatalities_sum_lag3
-      - decay_30d_fatalities_sum
-      - decay_90d_fatalities_sum
+      - fatalities_decay_30d
       - protest_count_lag1
       - riot_count_lag1
-  
-  natsoc: # "Natural & Social" - uses Static Features from Script 01 & 07
+
+  geography:
+    enabled: true
     features:
-      - fatalities_sum_lag1 # Control
-      - pop_log
-      - pop_missing
       - dist_to_capital
-      - dist_to_city
-      - dist_to_border
+      - terrain_ruggedness_index
       - dist_to_road
-      - elevation_mean
-      - slope_mean
-  
-  drought:
+      - water_coverage_lag1
+      - water_presence_lag1 
+
+  resources_economy:
+    enabled: true
     features:
-      - fatalities_sum_lag1 # Control
-      - precip_90d_total
-      - precip_90d_anomaly
-      - precip_90d_spi
-      - vhi_mean_30d
-      - vhi_stress_flag_20
-      - vhi_stress_flag_40
-  
-  protest:
+      - dist_to_diamond_mine
+      - commodity_gold_price_usd_lag1
+      - viirs_ntl_mean_lag1
+
+  sociopolitics:
+    enabled: true
     features:
-      - fatalities_sum_lag1 # Control
-      - protest_count_lag1
-      - protest_count_lag2
-      - riot_count_lag1
-      - riot_count_lag2
-      - vac_count_lag1 # Violence Against Civilians
-  
-  migration: # Uses IOM Data from Script 06
-    features:
-      - fatalities_sum_lag1 # Control
+      - epr_excluded_groups_count
       - iom_displacement_count_lag1
-      - iom_displacement_count_lag2
-      - decay_30d_iom_displacement_count
-  
-  spatlag_model: # Spatial Lags (Neighboring conflict)
+      - ipc_phase_class_lag1
+
+  # NEW: Broad PCA Model
+  broad_pca:
+    enabled: true
+    type: "pca"
+    variance_retention: 0.90
     features:
-      - fatalities_sum_lag1
-      - spatlag_1_fatalities_sum_lag1
-      - spatlag_1_protest_count_lag1
-      - spatlag_1_riot_count_lag1
-  
-  event_distance_model: # Distance to recent conflict events
-    features:
-      - fatalities_sum_lag1
-      - time_since_last_fatal_event
-      - distance_to_most_recent_fatal_event
-  
-  broad:
-    features: "all_pca" # Special flag for training script to use PCA
-    pca_variance_to_keep: 0.95 # Keep 95% variance in PCA
+      - all_candidates # Handled dynamically in train_models.py

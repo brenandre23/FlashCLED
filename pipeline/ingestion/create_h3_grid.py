@@ -1,5 +1,5 @@
 """
-01_build_static_features.py
+create_h3_grid.py
 ============================
 Purpose: Generate master H3 grid for CAR study area.
 Output: car_cewp.features_static table with h3_index + geometry columns.
@@ -16,11 +16,11 @@ from shapely.geometry import Polygon as ShapelyPolygon
 from pathlib import Path
 
 # --- Import Centralized Utilities ---
-# Add the parent directory (scripts/) to sys.path to locate utils.py
-file_path = Path(__file__).resolve()
-sys.path.append(str(file_path.parent))
-import utils
-from utils import logger
+ROOT_DIR = Path(__file__).resolve().parents[2]  # ingestion -> pipeline -> root
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
+
+from utils import logger, PATHS, get_db_engine, load_configs, get_boundary
 
 SCHEMA = "car_cewp"
 STATIC_TABLE = "features_static"
@@ -144,16 +144,17 @@ def upload_grid_to_postgis(gdf, engine):
     logger.info("Upload complete.")
 
 def main():
+    engine = None
     try:
         # 1. Load Configs
-        data_config, features_config, _ = utils.load_configs()
-        engine = utils.get_db_engine()
+        data_config, features_config, _ = load_configs()
+        engine = get_db_engine()
         
-        # Extract parameters
-        buffer_km = data_config["h3"]["buffer_km"]
-        resolution = data_config["h3"]["resolution"]
-        metric_crs = features_config["metric_crs"]
-        geodetic_crs = features_config["geodetic_crs"]
+        # Extract parameters (FIXED: Updated paths to match new config structure)
+        buffer_km = features_config["spatial"]["buffer_km"]
+        resolution = features_config["spatial"]["h3_resolution"]
+        metric_crs = features_config["spatial"]["crs"]["metric"]
+        geodetic_crs = features_config["spatial"]["crs"]["geodetic"]
         
         logger.info("="*60)
         logger.info("STEP 1: H3 GRID GENERATION")
@@ -162,13 +163,12 @@ def main():
         # 2. Checkpoint
         exists, count = check_grid_exists(engine)
         if exists:
-            logger.info(f" CHECKPOINT: Grid already exists ({count:,} cells).")
-            logger.info("Skipping generation. To regenerate: TRUNCATE TABLE car_cewp.features_static;")
+            logger.info(f"✓ CHECKPOINT: Grid already exists ({count:,} cells).")
+            logger.info("  Skipping generation. To regenerate: TRUNCATE TABLE car_cewp.features_static;")
             return
         
         # 3. Get Boundary
-        # utils.get_boundary handles downloading and caching the GeoJSON
-        boundary_gdf = utils.get_boundary(data_config, features_config)
+        boundary_gdf = get_boundary(data_config, features_config)
         
         # 4. Generate Cells
         h3_cells = generate_h3_grid(
@@ -188,12 +188,15 @@ def main():
         upload_grid_to_postgis(gdf_grid, engine)
         
         logger.info("="*60)
-        logger.info("GRID GENERATION SUCCESSFUL")
+        logger.info("✓ GRID GENERATION SUCCESSFUL")
         logger.info("="*60)
         
     except Exception as e:
-        logger.error(f"Grid generation failed: {e}", exc_info=True)
+        logger.error(f"✗ Grid generation failed: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        if engine:
+            engine.dispose()
 
 if __name__ == "__main__":
     main()

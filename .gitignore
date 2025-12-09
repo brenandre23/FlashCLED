@@ -1,4 +1,4 @@
-# Python
+# --- Python Standard ---
 __pycache__/
 *.py[cod]
 *.class
@@ -23,24 +23,50 @@ wheels/
 .installed.cfg
 *.egg
 
-# Jupyter Notebook
+# --- Jupyter ---
 .ipynb_checkpoints
 
-# Environment variables
+# --- Secrets (CRITICAL) ---
 .env
 .venv
+GoogleKeys/
 
-# IDE
+# --- IDE & OS ---
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Project-specific: Data and cache folders
-data/
-cache/
+# --- Project Specific ---
+
+# 1. Logs & Audit
+logs/
+data_audit/
+data/raw/failed_windows_*.txt
+data/raw/processing.log
+analysis/
+KDTree/
+deprecated/
+# 2. Cache & Temp
+cache/*
+cached_originals/
+
+# Logs anywhere
+*.log
+
+!cache/.gitkeep  # (Optional: keeps the folder structure but empty)
+
+# 3. Heavy/Generated Data (Ignore these)
+data/processed/*
+data/raw/*.nc
+data/raw/*.zip
+data/raw/*.tif
+data/raw/*.tiff
+data/raw/esa_cci_extracted/
+data/raw/worldpop_comparison/
+KDTree
+
+clean_cache.py

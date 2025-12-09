@@ -1,41 +1,99 @@
-# -----------------------------------------------------------------
-# Feature Engineering Configuration (configs/features.yaml)
-# Defines all windows, lags, and parameters for feature generation
-# -----------------------------------------------------------------
+# configs/features.yaml
+# =================================================================
+# FEATURE ENGINEERING CONFIGURATION
+# Backbone for pipeline/processing/feature_engineering.py
+# =================================================================
 
-# Global CRS definitions
-# Used by: scripts/01_build_static_features.py
-metric_crs: "EPSG:32634"  # UTM Zone 34N (Correct for Central African Republic)
-geodetic_crs: "EPSG:4326" # WGS84 (Lat/Lon)
+# --- SPATIAL DEFINITIONS ---
+spatial:
+  crs:
+    metric: "EPSG:32634"  # UTM Zone 34N
+    geodetic: "EPSG:4326" # WGS84
+  h3_resolution: 5
+  buffer_km: 50
 
-# Temporal transforms (for dynamic feature generation)
-lags: [1, 2, 3] # k-periods (e.g., 1 bi-week, 2 bi-weeks)
-decays:
-  - half_life_days: 30
-  - half_life_days: 90
+# --- TEMPORAL DEFINITIONS (The 14-Day Spine) ---
+temporal:
+  base_unit: "step"
+  step_days: 14           # 1 Step = 14 Days
+  alignment_date: "2000-01-01"
 
-# Spatial transforms (H3 K-Ring Smoothing)
-spatlag:
-  k_ring: 1        # Radius of neighbors to smooth over
-  min_neighbors: 3 # Minimum neighbors required to compute a spatial lag
+  # Decay functions for conflict history (Exponential Weighted Moving Average)
+  # Used by process_conflict in feature_engineering.py
+  decays:
+    # 30 days is approx 2.14 steps (30 / 14)
+    half_life_30d:
+      steps: 2.14
+    # 90 days is approx 6.43 steps (90 / 14)
+    half_life_90d:
+      steps: 6.43
 
-# Special event-based features (for event_distance_model)
-special_event_features:
-  - "time_since_last_fatal_event"
-  - "distance_to_most_recent_fatal_event"
+# --- FEATURE REGISTRY ---
+# The Master Script parses this to determine which columns to keep and transform.
+# Sources map to specific processing phases in the script.
+registry:
+  # --- ENVIRONMENTAL (Phase 3) ---
+  # Transformation 'anomaly' triggers Z-Score calculation against Climatology Baseline
+  - raw: "precip_mean_depth_mm"
+    source: "CHIRPS"
+    transformation: "anomaly"
+    output_col: "chirps_precip_anomaly"
+  
+  - raw: "temp_mean"
+    source: "ERA5"
+    transformation: "anomaly"
+    output_col: "era5_temp_anomaly"
+  
+  - raw: "soil_moisture_mean"
+    source: "ERA5"
+    transformation: "anomaly"
+    output_col: "era5_soil_moisture_anomaly"
+  
+  - raw: "ndvi_max"
+    source: "MODIS"
+    transformation: "anomaly"
+    output_col: "ndvi_anomaly"
 
-# Environmental feature windows (Rolling averages)
-environmental_windows_days: [14, 30, 90]
+  - raw: "ntl_mean"
+    source: "VIIRS"
+    transformation: "anomaly"
+    output_col: "viirs_ntl_anomaly"
 
-# Environmental stress definitions (VHI thresholds)
-vhi_stress_thresholds: [20, 40]
+  # --- CONFLICT (Phase 4) ---
+  # Transformation 'decay_30d' triggers EWM with half_life_30d settings above
+  - raw: "fatalities"
+    source: "ACLED"
+    transformation: "decay_30d"
+    output_col: "fatalities_decay_30d"
+  
+  # Note: The Master Script aggregates Protests & Riots into 'protest_count'
+  - raw: "protest_count"
+    source: "ACLED"
+    transformation: "decay_30d"
+    output_col: "protest_decay_30d"
 
-# Climatology definition (CHIRPS baseline)
-climatology_base_period:
-  start_year: 1981
-  end_year: 2010
+  - raw: "gdelt_event_count"
+    source: "GDELT"
+    transformation: "decay_30d"
+    output_col: "gdelt_decay_30d"
 
-# Population Imputation Strategy
-population:
-  data_start_year: 2015       # First year of reliable WorldPop constrained data
-  imputation_method: "median" # Strategy for pre-2015 data
+  # --- ECONOMIC (Phase 2) ---
+  # Global data aligned via backward merge
+  - raw: "commodity_gold_price_usd"
+    source: "YahooFinance"
+    transformation: "lag_1_step"
+    output_col: "gold_price_lag1"
+
+  # --- SOCIAL (Phase 2) ---
+  # Spatial disaggregation results
+  - raw: "ipc_phase_class"
+    source: "FEWS_NET"
+    transformation: "lag_1_step"
+    output_col: "ipc_phase_lag1"
+
+# --- IMPUTATION STRATEGY ---
+# Informational: The Master Script enforces forward_fill (limit=4) by default
+imputation:
+  defaults:
+    method: "forward_fill"
+    limit: 4

@@ -1,75 +1,106 @@
-# -----------------------------------------------------------------
-# Data Source Configuration (configs/data.yaml)
-# Defines all external data sources, URLs, and API endpoints
-# -----------------------------------------------------------------
+# configs/data.yaml
+# =================================================================
+# DATA SOURCE CONFIGURATION
+# =================================================================
 
-# World Bank Admin 0 Boundary
-# Used by: 01_build_static_features.py
+# --- GLOBAL DATE CONTROL ---
+global_date_window:
+  start_date: "2000-01-01"
+  end_date: "2025-12-31"
+
+# --- MODEL TRAINING SPLITS ---
+split:
+  test_year: 2023
+  validation_years: [2021, 2022, 2024, 2025]
+  train_cutoff: "2020-12-31"
+
+# --- SPATIAL BOUNDING BOX ---
+car_bbox: [14.0, 2.0, 28.0, 11.5]
+
+# =================================================================
+# DATASETS
+# =================================================================
+
+# 1. CONFLICT & EVENTS
+acled:
+  local_file: "data/raw/acled.csv"
+  country: "Central African Republic"
+
+gdelt:
+  bq_dataset: "gdelt-bq.gdeltv2.events"
+  country_iso3: "CF"
+
+# 2. ENVIRONMENTAL (Cloud APIs)
+gee:
+  project_id: "thesis-project-478503"
+  collections:
+    chirps: "UCSB-CHG/CHIRPS/DAILY"
+    era5: "ECMWF/ERA5_LAND/HOURLY"
+    modis: "MODIS/061/MCD43A4"
+    viirs: "NASA/VIIRS/002/VNP46A2"
+
+era5_cds:
+  product: "reanalysis-era5-land"
+  variables: ["2m_temperature", "2m_dewpoint_temperature"]
+  hours: ["00:00", "06:00", "12:00", "18:00"]
+
+# 3. SOCIO-POLITICAL
+epr:
+  geoepr_url: "https://icr.ethz.ch/data/epr/geoepr/GeoEPR-2021.geojson"
+  core_url: "https://icr.ethz.ch/data/epr/core/EPR-2021.csv"
+
+iom_dtm:
+  api_endpoint: "https://api.dtm.iom.int/v3"
+  country_name: "Central African Republic"
+
+fews_net:
+  ipc_url: "https://fdw.fews.net/api/ipcphase/"
+  iso2: "CF"
+  iso3: "CAF"
+  markets_geojson_url: "https://fdw.fews.net/api/feature/?format=geojson&unit_set_version=3380"
+  fallback_region_bundle: ""
+
+wfp_vam:
+  market_api_url: "https://api.vam.wfp.org/"
+  country_iso3: "CAF"
+
+# 4. INFRASTRUCTURE & GEOGRAPHY
 world_bank_boundary:
   iso3: "CAF"
   url: "https://datacatalogfiles.worldpop.org/ddh-published-v2/0038272/5/DR0095369/World%20Bank%20Official%20Boundaries%20(GeoJSON)/World%20Bank%20Official%20Boundaries%20-%20Admin%200.geojson"
   filter_property: "ISO_A3"
 
-# H3 Grid Configuration
-h3:
-  resolution: 5
-  buffer_km: 50
+admin_boundaries:
+  admin1_path: "data/raw/wbgCAFadmin1.geojson" #labeled as admin1 in source from World Bank
+  admin2_path: "data/raw/wbgCAFadmin2.geojson" #labeled as admin2 in source from World Bank
+  admin3_path: "data/raw/wbgCAFadmin3.geojson" #labeled as admin2 in source from OCHA
+  url: "https://datacatalog.worldbank.org/search/dataset/0038272/World-Bank-Official-Boundaries"
 
-# OSM & Settlements (Roads & Cities)
-# Used by: 03_fetch_temporal_roads_HYBRID.py
-osm:
-  # Ohsome API for historical road data
-  ohsome_api_url: "https://api.ohsome.org/v1/elements/geometry"
-  
-  # HDX / SIGCAF Settlements Shapefile (Zip)
-  settlements_hdx_url: "https://data.humdata.org/dataset/27db004a-4f10-4046-a561-c0b0aea98ef0/resource/6d28d003-333c-442c-9d39-6903bb264814/download/caf_settlements_sigcaf.zip"
-  
-  roads_tags:
-    highway: ["motorway", "trunk", "primary", "secondary", "tertiary", "unclassified", "residential"]
-  
-  grid_size: 4 # NxN tiling for API requests
 
-# Copernicus / Sentinel Hub (DEM & Terrain)
-# Used by: 07_calculate_terrain.py
+population:
+  base_url_v2: "https://data.worldpop.org/GIS/Population/Global_2015_2030/R2025A"
+  filename_template_v2: "caf_pop_{year}_CN_100m_R2025A_v1.tif"
+
 copernicus:
   token_url: "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
   process_api_url: "https://sh.dataspace.copernicus.eu/api/v1/process"
   dem_instance: "COPERNICUS_90"
 
-# Population Data (WorldPop)
-# Used by: 07b_fetch_population.py
-population:
-  # Base URL for R2025A (Unconstrained/Constrained) 100m data
-  base_url: "https://data.worldpop.org/GIS/Population/Global_2000_2020_Constrained" 
-  
-  start_year: 2015
-  end_year: 2030
-  
-  # Matches the files found in your data/raw/worldpop/ directory
-  # e.g. caf_pop_2015_CN_100m_R2025A_v1.tif
-  filename_template: "caf_pop_{year}_CN_100m_R2025A_v1.tif" 
+grip4:
+  region3_url: "https://dataportaal.pbl.nl/downloads/GRIP4/GRIP4_Region3_vector_shp.zip"
 
-# IOM DTM (Migration/Displacement)
-# Used by: 06_fetch_iom.py (via dtmapi library)
-iom_dtm:
-  country_name: "Central African Republic"
-  # API URL is handled internally by dtmapi, but listed here for reference
-  api_docs: "https://displacement.iom.int/data/api"
+hydrorivers:
+  url: "https://data.hydrosheds.org/file/HydroRIVERS/HydroRIVERS_v10_af_shp.zip"
+  min_stream_order: 3
 
-# ACLED (Conflict Data)
-acled:
-  api_url: "https://api.acleddata.com/acled/api"
-  query_params:
-    country: "Central African Republic"
-    region: [1, 2, 8, 9]  # Central, East, Middle, West Africa
-    limit: 0
+osm:
+  settlements_hdx_url: "https://data.humdata.org/dataset/27db004a-4f10-4046-a561-c0b0aea98ef0/resource/6d28d003-333c-442c-9d39-6903bb264814/download/caf_settlements_sigcaf.zip"
 
-# CHIRPS (Precipitation)
-chirps:
-  ftp_url: "https://data.chc.ucsb.edu/products/CHIRPS-2.0/global_daily/tifs/"
-  climatology_base_period_start: 1981
-  climatology_base_period_end: 2010
+# 5. ECONOMY
+ipis_mines:
+  wfs_url: "https://geo.ipisresearch.be/geoserver/public/caf_mines_curated_all_opendata_p_ipis/wfs"
+  type_name: "public:caf_mines_curated_all_opendata_p_ipis"
 
-# NOAA VHI (Vegetation Health)
-vhi:
-  ftp_url: "https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/VHP_H_Global_P/"
+commodities:
+  oil_series_id: "PET.RBRTE.D"
+  ioda_entity_code: "CF"
