@@ -1,16 +1,27 @@
 import logging
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 import numpy as np
 import pandas as pd
-import xgboost as xgb
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.base import clone
 from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
     mean_squared_error,
 )
+
+# Optional imports for type hinting convenience
+try:
+    import xgboost as xgb
+except ImportError:
+    xgb = None
+
+try:
+    import lightgbm as lgb
+except ImportError:
+    lgb = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,6 +30,7 @@ logger = logging.getLogger(__name__)
 class TwoStageEnsemble:
     """
     Two-stage stacked ensemble for conflict prediction.
+    Model-Agnostic: Supports XGBoost, LightGBM, or any Scikit-Learn compatible estimator.
 
     Stage 1:
         - A set of theme-specific base models (each with a classifier and regressor)
@@ -50,8 +62,8 @@ class TwoStageEnsemble:
                 List of dicts with the following keys:
                     - 'name': str, theme name
                     - 'features': list[str], feature column names used by this theme
-                    - 'binary_model': an unfitted XGBClassifier (or similar)
-                    - 'regress_model': an unfitted XGBRegressor (or similar)
+                    - 'binary_model': an unfitted classifier (XGBClassifier/LGBMClassifier)
+                    - 'regress_model': an unfitted regressor (XGBRegressor/LGBMRegressor)
 
             n_folds:
                 Number of TimeSeriesSplit splits used to generate OOF predictions.
@@ -124,6 +136,7 @@ class TwoStageEnsemble:
                     f"Train: {len(train_idx)}, Val: {len(val_idx)}"
                 )
 
+                # Ensure contiguous memory for LightGBM stability
                 X_train_fold = X_theme.iloc[train_idx]
                 X_val_fold = X_theme.iloc[val_idx]
                 y_train_binary = y_binary.iloc[train_idx]
@@ -170,29 +183,36 @@ class TwoStageEnsemble:
                 # ---------------------------------------------------------
 
                 # 1) Fit classifier on (possibly) downsampled training data
-                binary_model: xgb.XGBClassifier = theme["binary_model"]
-                binary_model.fit(X_train_for_clf, y_train_for_clf)
+                binary_model = theme["binary_model"]
+                # Use clone to ensure a fresh fit for each fold
+                binary_fold_model = clone(binary_model)
+                binary_fold_model.fit(X_train_for_clf, y_train_for_clf)
 
                 # Predict probabilities on **full** validation fold
-                oof_binary[val_idx, theme_idx] = binary_model.predict_proba(
-                    X_val_fold
-                )[:, 1]
+                try:
+                    probs = binary_fold_model.predict_proba(X_val_fold)[:, 1]
+                except AttributeError:
+                    probs = binary_fold_model.predict(X_val_fold)
+                
+                oof_binary[val_idx, theme_idx] = probs
 
                 # 2) Fit regressor ONLY on conflict cases in the full training fold
-                regress_model: xgb.XGBRegressor = theme["regress_model"]
+                regress_model = theme["regress_model"]
+                regress_fold_model = clone(regress_model)
+                
                 conflict_mask_train = (y_train_binary == 1)
-                conflict_mask_val = (y_val_binary == 1)
-
+                
                 if conflict_mask_train.sum() > 0:
                     X_train_conflict = X_train_fold[conflict_mask_train]
                     y_train_fatalities_conflict = y_train_fatalities[conflict_mask_train]
 
-                    regress_model.fit(X_train_conflict, y_train_fatalities_conflict)
+                    regress_fold_model.fit(X_train_conflict, y_train_fatalities_conflict)
 
                     # Predict on validation conflicts
+                    conflict_mask_val = (y_val_binary == 1)
                     if conflict_mask_val.sum() > 0:
                         X_val_conflict = X_val_fold[conflict_mask_val]
-                        preds = regress_model.predict(X_val_conflict)
+                        preds = regress_fold_model.predict(X_val_conflict)
 
                         # Place predictions only on conflict positions for this fold
                         oof_regress[val_idx[conflict_mask_val], theme_idx] = preds
@@ -265,6 +285,18 @@ class TwoStageEnsemble:
             )
             self.meta_regress = None
 
+        # Final Retrain of Base Models on FULL Dataset
+        logger.info("Retraining base models on full dataset...")
+        for theme in self.theme_models:
+            X_theme = X[theme["features"]]
+            
+            # Classifier
+            theme["binary_model"].fit(X_theme, y_binary)
+            
+            # Regressor
+            if conflict_mask.sum() > 0:
+                theme["regress_model"].fit(X_theme[conflict_mask], y_fatalities[conflict_mask])
+
         self.is_fitted = True
         logger.info("TwoStageEnsemble fitted successfully.")
 
@@ -307,11 +339,14 @@ class TwoStageEnsemble:
 
             X_theme = X[feature_cols]
 
-            binary_model: xgb.XGBClassifier = theme["binary_model"]
-            regress_model: xgb.XGBRegressor = theme["regress_model"]
+            binary_model = theme["binary_model"]
+            regress_model = theme["regress_model"]
 
             # Predict classifier probability
-            binary_preds[:, theme_idx] = binary_model.predict_proba(X_theme)[:, 1]
+            try:
+                binary_preds[:, theme_idx] = binary_model.predict_proba(X_theme)[:, 1]
+            except AttributeError:
+                binary_preds[:, theme_idx] = binary_model.predict(X_theme)
 
             # Predict fatalities
             regress_preds[:, theme_idx] = regress_model.predict(X_theme)

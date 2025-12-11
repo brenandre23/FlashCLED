@@ -8,7 +8,9 @@ FIXES APPLIED:
    'global_date_window' (2017-2025) to ensure full history is fetched.
 2. Idempotency: Uses upload_to_postgis for UPSERTs.
 3. Resilience: Retains BigQuery retry logic.
+4. CACHE OPTIMIZATION: Smart incremental caching for GDELT (only fetches missing dates).
 """
+
 import sys
 import requests
 import pandas as pd
@@ -24,7 +26,7 @@ from sqlalchemy import text
 from google.cloud import bigquery
 from google.api_core import exceptions
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 
 # --- Import Utilities ---
@@ -32,7 +34,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from utils import load_configs, get_db_engine, PATHS, get_boundary, logger, upload_to_postgis
+from utils import ensure_h3_int64, load_configs, get_db_engine, PATHS, logger, upload_to_postgis
 
 logger = logging.getLogger(__name__)
 
@@ -175,34 +177,27 @@ def execute_bigquery_query(client, sql, job_config):
     return client.query(sql, job_config=job_config).to_dataframe()
 
 # -----------------------------------------------------------------------------
-# 3. GDELT INGESTION WITH FAILURE HANDLING
+# 3. GDELT INGESTION WITH SMART INCREMENTAL CACHING
 # -----------------------------------------------------------------------------
 
-def fetch_gdelt_with_fallback(config, start_date, end_date):
+def fetch_gdelt_from_bigquery_incremental(config, start_date, end_date):
     """
-    Fetch GDELT data from BigQuery with comprehensive failure handling.
-    Returns DataFrame or empty DataFrame if all attempts fail.
+    Fetch GDELT data from BigQuery for a specific date range.
+    Wrapper around the original BigQuery logic for incremental fetching.
     """
-    logger.info("Fetching GDELT data from BigQuery...")
-    
-    # Cache setup
-    cache_dir = PATHS["cache"] / "gdelt"
-    cache_file = cache_dir / f"gdelt_{start_date.date()}_{end_date.date()}.parquet"
-    
-    # Step 1: Validate credentials before attempting
+    # Validate credentials before attempting
     if not validate_bigquery_credentials():
-        logger.warning("⚠️  Falling back to cached GDELT data (credentials missing)")
-        return load_gdelt_cache(cache_file, start_date, end_date)
+        logger.warning("⚠️  BigQuery credentials not available")
+        return pd.DataFrame()
     
-    # Step 2: Try to create client with retry
+    # Try to create client
     try:
         client = create_bigquery_client_with_retry()
     except Exception as e:
-        logger.error(f"❌ BigQuery client creation failed after retries: {e}")
-        logger.warning("⚠️  Falling back to cached GDELT data")
-        return load_gdelt_cache(cache_file, start_date, end_date)
+        logger.error(f"❌ BigQuery client creation failed: {e}")
+        return pd.DataFrame()
     
-    # Step 3: Execute query
+    # Prepare parameters
     data_config = config.get('data', {})
     features_config = config.get('features', {})
     iso3 = data_config.get('gdelt', {}).get('country_iso3', 'CF')
@@ -210,8 +205,16 @@ def fetch_gdelt_with_fallback(config, start_date, end_date):
     resolution = features_config.get('spatial', {}).get('h3_resolution', 5)
     
     fips_code = GDELT_FIPS_MAP.get(iso3, iso3)
-    s_int = int(start_date.strftime("%Y%m%d"))
-    e_int = int(end_date.strftime("%Y%m%d"))
+    
+    # Convert dates to integer format for BigQuery
+    if isinstance(start_date, date):
+        s_int = int(start_date.strftime("%Y%m%d"))
+        e_int = int(end_date.strftime("%Y%m%d"))
+    else:
+        s_int = int(pd.to_datetime(start_date).strftime("%Y%m%d"))
+        e_int = int(pd.to_datetime(end_date).strftime("%Y%m%d"))
+    
+    logger.info(f"Querying BigQuery for dates: {s_int} to {e_int}")
     
     sql = f"""
         SELECT SQLDATE, Actor1Geo_Lat as lat, Actor1Geo_Long as lon, 
@@ -235,35 +238,37 @@ def fetch_gdelt_with_fallback(config, start_date, end_date):
     
     try:
         df = execute_bigquery_query(client, sql, job_config)
-    except exceptions.NotFound as e:
-        logger.error(f"❌ BigQuery table not found: {e}")
-        logger.warning("⚠️  Falling back to cached GDELT data")
-        return load_gdelt_cache(cache_file, start_date, end_date)
-    except exceptions.Forbidden as e:
-        logger.error(f"❌ BigQuery query forbidden: {e}")
-        logger.warning("⚠️  Falling back to cached GDELT data")
-        return load_gdelt_cache(cache_file, start_date, end_date)
     except Exception as e:
-        logger.error(f"❌ BigQuery query failed after retries: {e}")
-        logger.warning("⚠️  Falling back to cached GDELT data")
-        return load_gdelt_cache(cache_file, start_date, end_date)
+        logger.error(f"❌ BigQuery query failed: {e}")
+        return pd.DataFrame()
     
     if df.empty:
-        logger.warning("⚠️  BigQuery returned empty results")
-        return load_gdelt_cache(cache_file, start_date, end_date)
+        logger.warning("BigQuery returned empty results")
+        return pd.DataFrame()
     
-    logger.info(f"  Raw GDELT Rows: {len(df)}")
+    logger.info(f"  Raw GDELT Rows fetched: {len(df)}")
     
-    # Step 4: Process data
+    # Process data with H3 Type Safety
     try:
-        # Calculate H3
-        try:
-            df['h3_index'] = [h3.latlng_to_cell(lat, lon, resolution) 
-                              for lat, lon in zip(df['lat'], df['lon'])]
-        except (ValueError, TypeError):
-            import h3 as h3_std
-            df['h3_index'] = [int(h3_std.latlng_to_cell(lat, lon, resolution), 16) 
-                              for lat, lon in zip(df['lat'], df['lon'])]
+        # Calculate H3 & Enforce Int64
+        # We import here to ensure the library is available within the scope
+        import h3.api.basic_int as h3_int
+        
+        def get_safe_h3(lat, lon):
+            try:
+                # Basic Int API returns integer (possibly unsigned in some versions)
+                val = h3_int.latlng_to_cell(lat, lon, resolution)
+                # Force signed int64 for PostgreSQL compatibility
+                return ensure_h3_int64(val)
+            except:
+                return None
+
+        # Apply safe conversion
+        df['h3_index'] = [get_safe_h3(r.lat, r.lon) for r in df.itertuples()]
+        
+        # Drop invalid cells and cast
+        df = df.dropna(subset=['h3_index'])
+        df['h3_index'] = df['h3_index'].astype('int64')
 
         df['date'] = pd.to_datetime(df['SQLDATE'], format='%Y%m%d')
         
@@ -279,16 +284,131 @@ def fetch_gdelt_with_fallback(config, start_date, end_date):
                           var_name='variable', 
                           value_name='value').dropna()
         
-        # Save to cache for future fallback
-        save_gdelt_cache(result, cache_file)
-        
         logger.info(f"✓ GDELT processed: {len(result):,} feature rows")
         return result
         
     except Exception as e:
         logger.error(f"❌ GDELT data processing failed: {e}")
-        logger.warning("⚠️  Falling back to cached data")
-        return load_gdelt_cache(cache_file, start_date, end_date)
+        return pd.DataFrame()
+
+def fetch_gdelt_with_fallback(config, start_date, end_date):
+    """
+    Fetch GDELT data from BigQuery with cache-first incremental strategy.
+    
+    Strategy:
+    1. Check for existing full cache file
+    2. If cache exists and covers requested range, use it entirely
+    3. If cache exists but is outdated, only fetch missing recent data
+    4. Merge, deduplicate, and save updated cache
+    5. Fall back to cache if BigQuery fails
+    """
+    logger.info("Fetching GDELT data (cache-first incremental)...")
+    
+    # Setup cache - use a single file for all data (easier for incremental updates)
+    cache_dir = PATHS["cache"] / "gdelt"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / "gdelt_full_cache.parquet"
+    
+    # Convert dates to datetime.date for consistent comparison
+    start_date_date = start_date.date() if isinstance(start_date, datetime) else pd.to_datetime(start_date).date()
+    end_date_date = end_date.date() if isinstance(end_date, datetime) else pd.to_datetime(end_date).date()
+    
+    # Step 1: Check for existing cache
+    if cache_file.exists():
+        try:
+            logger.info(f"Loading existing GDELT cache: {cache_file}")
+            df_cache = pd.read_parquet(cache_file)
+            
+            # Ensure date column is in proper format
+            if 'date' in df_cache.columns:
+                df_cache['date'] = pd.to_datetime(df_cache['date'])
+                
+                # Get the maximum date in cache
+                if not df_cache.empty:
+                    max_cache_date = df_cache['date'].max().date()
+                    logger.info(f"Cache contains data up to: {max_cache_date}")
+                    
+                    # Step 2: Check if cache already covers requested range
+                    if max_cache_date >= end_date_date:
+                        logger.info(f"✓ Cache fully covers requested range ({start_date_date} to {end_date_date})")
+                        
+                        # Filter cache to requested date range
+                        mask = (df_cache['date'].dt.date >= start_date_date) & \
+                               (df_cache['date'].dt.date <= end_date_date)
+                        df_filtered = df_cache[mask].copy()
+                        
+                        if not df_filtered.empty:
+                            logger.info(f"✓ Using cached GDELT data: {len(df_filtered):,} rows")
+                            return df_filtered
+                        else:
+                            logger.warning("Cache exists but empty for requested date range")
+                    else:
+                        # Step 3: Cache is outdated - calculate what we need to fetch
+                        logger.info(f"Cache outdated. Missing data from {max_cache_date + timedelta(days=1)} to {end_date_date}")
+                        
+                        # Filter cache for existing data in requested range
+                        mask = (df_cache['date'].dt.date >= start_date_date) & \
+                               (df_cache['date'].dt.date <= end_date_date)
+                        df_existing = df_cache[mask].copy()
+                        
+                        # Calculate fetch range (only missing dates)
+                        fetch_start_date = max_cache_date + timedelta(days=1)
+                        
+                        # Don't fetch if start is after end
+                        if fetch_start_date > end_date_date:
+                            logger.info("No missing dates to fetch")
+                            return df_existing
+                        
+                        # Fetch only missing data
+                        logger.info(f"Fetching missing data from {fetch_start_date} to {end_date_date}")
+                        df_new = fetch_gdelt_from_bigquery_incremental(
+                            config, fetch_start_date, end_date_date
+                        )
+                        
+                        if df_new.empty:
+                            logger.warning("No new GDELT data fetched from BigQuery")
+                            return df_existing
+                        
+                        # Step 4: Merge and deduplicate
+                        logger.info("Merging cached and new data...")
+                        df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+                        
+                        # Deduplicate (same primary keys as table)
+                        before_dedup = len(df_combined)
+                        df_combined = df_combined.drop_duplicates(
+                            subset=['h3_index', 'date', 'variable'], 
+                            keep='last'
+                        )
+                        after_dedup = len(df_combined)
+                        
+                        if before_dedup != after_dedup:
+                            logger.info(f"Removed {before_dedup - after_dedup} duplicate rows")
+                        
+                        # Save updated cache
+                        logger.info("Saving updated cache...")
+                        df_combined.to_parquet(cache_file, index=False)
+                        logger.info(f"✓ Updated cache saved: {len(df_combined):,} total rows")
+                        
+                        return df_combined
+                else:
+                    logger.warning("Cache file exists but is empty")
+            else:
+                logger.warning("Cache file exists but missing 'date' column")
+                
+        except Exception as e:
+            logger.error(f"Error loading cache: {e}")
+    
+    # Step 5: No cache or cache error - fetch full range from BigQuery
+    logger.info("No valid cache found. Fetching full date range from BigQuery...")
+    df_full = fetch_gdelt_from_bigquery_incremental(config, start_date_date, end_date_date)
+    
+    if not df_full.empty:
+        # Save initial cache
+        logger.info(f"Saving initial cache with {len(df_full):,} rows...")
+        df_full.to_parquet(cache_file, index=False)
+        logger.info(f"✓ Initial cache saved: {cache_file}")
+    
+    return df_full
 
 # -----------------------------------------------------------------------------
 # 4. IODA INGESTION (SUBNATIONAL OPTIMIZED) - MINIMAL CHANGES
@@ -472,7 +592,7 @@ def run(configs_bundle, engine):
         create_dynamic_table(engine)
         start_date, end_date = get_date_range(engine, configs_bundle)
         
-        # 1. GDELT with comprehensive error handling
+        # 1. GDELT with smart incremental caching
         logger.info("\n--- GDELT Ingestion ---")
         df_gdelt = fetch_gdelt_with_fallback(configs_bundle, start_date, end_date)
         

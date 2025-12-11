@@ -3,20 +3,18 @@ fetch_geoepr.py
 ===============================
 Efficient ingestion of GeoEPR polygons (ETH Zürich).
 
-- Downloads GeoEPR GeoJSON (cached)
-- Clips by CAR boundary
-- Uploads to PostGIS (Replace Mode)
-
 FIXES APPLIED:
-- Fixed SyntaxError in main() (orphaned finally block).
-- Added proper resource management (engine.dispose) in run().
+1. TEMPORAL FILTER: Excludes polygons that expired before 2000.
+2. DEDUPLICATION: Keeps only the most recent polygon for each group ID to prevent PK violations.
+3. UPSERT MODE: Uses upload_to_postgis for safe database insertion.
 """
 
 import sys
 from pathlib import Path
 import geopandas as gpd
+import pandas as pd
 import requests
-from sqlalchemy import text, inspect
+from sqlalchemy import text
 
 # --- Import central utilities ---
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -48,6 +46,24 @@ def download_if_needed(url: str, cache_path: Path) -> Path:
         logger.error(f"Failed to download GeoEPR: {e}")
         raise
 
+# ------------------------------------------------------------
+# Schema Management
+# ------------------------------------------------------------
+def ensure_table_exists(engine):
+    """Creates the geoepr_polygons table if it doesn't exist."""
+    with engine.begin() as conn:
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA};"))
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {SCHEMA}.{TABLE_POLYGONS} (
+                gwgroupid BIGINT PRIMARY KEY,
+                group_name TEXT,
+                geometry GEOMETRY(Geometry, 4326),
+                "from" INTEGER,
+                "to" INTEGER,
+                type TEXT
+            );
+        """))
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_POLYGONS}_geom ON {SCHEMA}.{TABLE_POLYGONS} USING GIST (geometry);"))
 
 # ------------------------------------------------------------
 # Main Polygon Ingestion
@@ -57,48 +73,69 @@ def ingest_geoepr_polygons(geoepr_url: str, boundary_gdf, engine):
     cache_path = PATHS["cache"] / "GeoEPR-2021.geojson"
     local_file = download_if_needed(geoepr_url, cache_path)
 
-    # 1. Load & Filter
-    # Using bbox for speed, though GeoJSON reading is often full-scan
-    bbox = boundary_gdf.total_bounds
+    # 1. Load Polygons
     logger.info("Loading GeoEPR polygons...")
-    
     try:
-        gdf = gpd.read_file(local_file, bbox=bbox)
-    except Exception:
+        # Load entire file first to ensure we can filter correctly
         gdf = gpd.read_file(local_file)
+    except Exception as e:
+        logger.error(f"Failed to read GeoEPR file: {e}")
+        raise
 
+    # 2. Filter & Deduplicate (CRITICAL FIX)
+    logger.info(f"  Raw polygons: {len(gdf)}")
+
+    # A. Temporal Filter: Keep only polygons valid during/after 2000
+    if 'to' in gdf.columns:
+        gdf = gdf[gdf['to'] >= 2000].copy()
+    
+    # B. Deduplication: Sort by 'from' year descending (newest first)
+    if 'from' in gdf.columns:
+        gdf = gdf.sort_values(by='from', ascending=False)
+    
+    # C. Keep only the newest record for each gwgroupid
+    gdf = gdf.drop_duplicates(subset=['gwgroupid'], keep='first')
+    logger.info(f"  Polygons after temporal filter & deduplication: {len(gdf)}")
+
+    # 3. Spatial Processing
     if gdf.crs != boundary_gdf.crs:
         gdf = gdf.to_crs(boundary_gdf.crs)
 
-    # 2. Clip to CAR
     logger.info("Clipping polygons to CAR boundary...")
     gdf = gpd.clip(gdf, boundary_gdf)
 
     if gdf.empty:
-        raise RuntimeError("GeoEPR returned no polygons in CAR.")
+        logger.warning("No GeoEPR polygons found inside CAR boundary after clipping.")
+        return
 
-    # 3. Validate Geometries
+    # 4. Validate Geometries
     gdf["geometry"] = gdf["geometry"].apply(lambda geom: geom if geom.is_valid else geom.buffer(0))
     
-    # 4. Upload (Replace Mode)
-    logger.info(f"Uploading {len(gdf)} polygons to {SCHEMA}.{TABLE_POLYGONS} (Replace Mode)...")
+    # 5. Prepare for Upload
+    ensure_table_exists(engine)
+
+    # Convert to DataFrame for upload helper
+    df = pd.DataFrame(gdf)
+    df['geometry'] = df['geometry'].apply(lambda x: x.wkt)
     
-    # Determine PK
-    # GeoEPR usually has 'gwgroupid' and 'from', 'to', but we treat it as static polygons here
-    # or use year if available.
+    # Handle column naming (Map 'group' -> 'group_name')
+    if 'group' in df.columns: 
+        df.rename(columns={'group': 'group_name'}, inplace=True)
     
-    # Write Table (Handles Creation)
-    gdf.to_postgis(TABLE_POLYGONS, engine, schema=SCHEMA, if_exists='replace', index=False)
+    # Select strict columns matching schema
+    target_cols = ['gwgroupid', 'group_name', 'geometry', 'from', 'to', 'type']
+    available_cols = [c for c in target_cols if c in df.columns]
     
-    # Add Indexes & Constraints
-    with engine.begin() as conn:
-        try:
-            # Note: GeoEPR polygons might overlap over time, so a simple PK on groupid might fail 
-            # if multiple years are present. For now, we index geometry.
-            conn.execute(text(f"CREATE INDEX idx_{TABLE_POLYGONS}_geom ON {SCHEMA}.{TABLE_POLYGONS} USING GIST (geometry);"))
-            logger.info("Table optimized with Spatial Index.")
-        except Exception as e:
-            logger.warning(f"Constraint application warning (ignorable): {e}")
+    # 6. Upload (Upsert Mode)
+    logger.info(f"Uploading {len(df)} polygons to {SCHEMA}.{TABLE_POLYGONS} (Upsert Mode)...")
+    
+    upload_to_postgis(
+        engine, 
+        df[available_cols], 
+        TABLE_POLYGONS, 
+        SCHEMA, 
+        primary_keys=['gwgroupid']
+    )
 
     logger.info(f"Ingestion complete.")
 
@@ -110,7 +147,6 @@ def run():
     engine = None
     try:
         logger.info("=== Fetching GeoEPR Polygons ===")
-        # Load configs locally since main.py calls this without args
         data_config, features_config, _ = load_configs()
         engine = get_db_engine()
 
@@ -129,7 +165,6 @@ def run():
             engine.dispose()
 
 def main():
-    """Entry point wrapper."""
     run()
 
 if __name__ == "__main__":

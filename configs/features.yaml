@@ -19,7 +19,6 @@ temporal:
   alignment_date: "2000-01-01"
 
   # Decay functions for conflict history (Exponential Weighted Moving Average)
-  # Used by process_conflict in feature_engineering.py
   decays:
     # 30 days is approx 2.14 steps (30 / 14)
     half_life_30d:
@@ -30,10 +29,8 @@ temporal:
 
 # --- FEATURE REGISTRY ---
 # The Master Script parses this to determine which columns to keep and transform.
-# Sources map to specific processing phases in the script.
 registry:
   # --- ENVIRONMENTAL (Phase 3) ---
-  # Transformation 'anomaly' triggers Z-Score calculation against Climatology Baseline
   - raw: "precip_mean_depth_mm"
     source: "CHIRPS"
     transformation: "anomaly"
@@ -56,21 +53,43 @@ registry:
 
   - raw: "ntl_mean"
     source: "VIIRS"
-    transformation: "anomaly"
-    output_col: "viirs_ntl_anomaly"
+    transformation: "lag_1_step"
+    output_col: "viirs_ntl_mean_lag1"
+
+  # --- WATER FEATURES (JRC Global Surface Water) ---
+  # MAPPING NOTE:
+  # DB Column 'water_local_max' (Binary: 1 if water detected anywhere in cell) maps to 'water_presence_lag1'
+  # DB Column 'water_local_mean' (Float: % area covered by water) maps to 'water_coverage_lag1'
+  - raw: "water_local_max"
+    source: "JRC_Landsat"
+    transformation: "lag_1_step"
+    output_col: "water_presence_lag1"
+
+  - raw: "water_local_mean"
+    source: "JRC_Landsat"
+    transformation: "lag_1_step"
+    output_col: "water_coverage_lag1"
 
   # --- CONFLICT (Phase 4) ---
-  # Transformation 'decay_30d' triggers EWM with half_life_30d settings above
   - raw: "fatalities"
     source: "ACLED"
     transformation: "decay_30d"
     output_col: "fatalities_decay_30d"
-  
-  # Note: The Master Script aggregates Protests & Riots into 'protest_count'
+
+  - raw: "fatalities"
+    source: "ACLED"
+    transformation: "sum"
+    output_col: "fatalities_14d_sum"
+
   - raw: "protest_count"
     source: "ACLED"
-    transformation: "decay_30d"
-    output_col: "protest_decay_30d"
+    transformation: "lag_1_step"
+    output_col: "protest_count_lag1"
+
+  - raw: "riot_count"
+    source: "ACLED"
+    transformation: "lag_1_step"
+    output_col: "riot_count_lag1"
 
   - raw: "gdelt_event_count"
     source: "GDELT"
@@ -78,21 +97,84 @@ registry:
     output_col: "gdelt_decay_30d"
 
   # --- ECONOMIC (Phase 2) ---
-  # Global data aligned via backward merge
   - raw: "commodity_gold_price_usd"
     source: "YahooFinance"
     transformation: "lag_1_step"
-    output_col: "gold_price_lag1"
+    output_col: "commodity_gold_price_usd_lag1"
 
-  # --- SOCIAL (Phase 2) ---
-  # Spatial disaggregation results
+  # --- SOCIAL (Phase 2B) ---
   - raw: "ipc_phase_class"
     source: "FEWS_NET"
     transformation: "lag_1_step"
-    output_col: "ipc_phase_lag1"
+    output_col: "ipc_phase_class_lag1"
+
+  - raw: "iom_displacement_sum"
+    source: "IOM_DTM"
+    transformation: "lag_1_step"
+    output_col: "iom_displacement_count_lag1"
+
+  - raw: "epr_excluded_groups_count"
+    source: "EPR"
+    transformation: "none"
+    output_col: "epr_excluded_groups_count"
+
+  - raw: "epr_discriminated_groups_count"
+    source: "EPR"
+    transformation: "none"
+    output_col: "epr_discriminated_groups_count"
+
+  - raw: "epr_status_mean"
+    source: "EPR"
+    transformation: "none"
+    output_col: "epr_status_mean"
+
+  - raw: "epr_status_entropy"
+    source: "EPR"
+    transformation: "none"
+    output_col: "epr_horizontal_inequality"
+
+  - raw: "ethnic_group_count"
+    source: "EPR"
+    transformation: "none"
+    output_col: "ethnic_group_count"
+
+  # --- DEMOGRAPHICS ---
+  - raw: "pop_count"
+    source: "WorldPop"
+    transformation: "log1p"
+    output_col: "pop_log"
+
+# =================================================================
+# STATIC DISTANCE FEATURES (from calculate_static_distances.py)
+# =================================================================
+
+  - raw: "dist_to_capital"
+    source: "Static_Geography"
+    transformation: "none"
+    output_col: "dist_to_capital"
+
+  - raw: "dist_to_border"
+    source: "Static_Geography"
+    transformation: "none"
+    output_col: "dist_to_border"
+
+  - raw: "dist_to_road"
+    source: "GRIP4"
+    transformation: "none"
+    output_col: "dist_to_road"
+
+  - raw: "dist_to_diamond_mine"
+    source: "IPIS_Mines"
+    transformation: "none"
+    output_col: "dist_to_diamond_mine"
+
+  - raw: "terrain_ruggedness_index"
+    source: "Copernicus_DEM"
+    transformation: "none"
+    output_col: "terrain_ruggedness_index"
+
 
 # --- IMPUTATION STRATEGY ---
-# Informational: The Master Script enforces forward_fill (limit=4) by default
 imputation:
   defaults:
     method: "forward_fill"

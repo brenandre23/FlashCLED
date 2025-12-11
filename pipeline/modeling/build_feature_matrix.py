@@ -8,28 +8,35 @@ Refactored for Phase 5 (Robust Dynamic Logic).
 CRITICAL FIXES:
 1. Dynamic Temporal vs Static column selection (No more hardcoding).
 2. Dynamic Target Generation based on models.yaml horizons.
-3. Strict H3 Type enforcement (BigInt).
+3. Strict H3 Type enforcement (BigInt) via centralized helper.
 4. FIX: Robust feature selection from registry (avoids NumPy boolean ambiguity).
+5. Pre-flight column validation: ensures all required columns exist before running the query.
 """
 
 import sys
+import json
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from sqlalchemy import text
+from typing import Dict, List, Tuple, Set, Any, Optional
+from sqlalchemy import text, Engine
+from sqlalchemy.engine import Engine as SqlEngine
 
 # --- Import Utils ---
-ROOT_DIR = Path(__file__).resolve().parents[3] # Adjusted to match nested structure if needed, or use robust lookup
-# Fallback if standard relative path fails
+# Determine project root. The original code climbed three directory levels
+# from this file, which was incorrect for the current project structure.
+# We now go up two levels (from pipeline/modeling to the repository root).
+ROOT_DIR = Path(__file__).resolve().parents[2]
+
+# Fallback if standard relative path fails. Append ROOT_DIR to sys.path so
+# that the "utils" module can be resolved when running this script directly.
 if "utils" not in sys.modules:
-    # Try 3 levels up (pipeline/modeling/script -> root)
-    sys.path.append(str(Path(__file__).resolve().parents[2])) 
+    sys.path.append(str(ROOT_DIR))
 
-from utils import logger, PATHS, get_db_engine, load_configs
+from utils import logger, PATHS, get_db_engine, load_configs, SCHEMA, ensure_h3_int64
 
-SCHEMA = "car_cewp"
 
-def get_required_features(models_cfg):
+def get_required_features(models_cfg: Dict[str, Any]) -> List[str]:
     """
     Extracts the SET of all feature names required by enabled submodels.
     """
@@ -45,7 +52,8 @@ def get_required_features(models_cfg):
                 required.update(reqs)
     return list(required)
 
-def get_enabled_features_from_registry(features_cfg):
+
+def get_enabled_features_from_registry(features_cfg: Dict[str, Any]) -> Set[str]:
     """
     Parses features.yaml registry to find globally enabled features.
     
@@ -69,12 +77,6 @@ def get_enabled_features_from_registry(features_cfg):
         logger.info(f"Registry: All {len(df)} features enabled (no 'enabled' flag detected).")
         return set(df["output_col"].dropna().unique())
 
-    # FIX: Explicit boolean filtering
-    # df["enabled"] == True creates a boolean mask safely.
-    # df[mask] selects rows.
-    # We explicitly cast to boolean to handle 0/1 integers or strings like "true" if necessary,
-    # but normally yaml parses true/false as booleans.
-    
     # Fill NAs with True (default to enabled)
     df["enabled"] = df["enabled"].fillna(True)
     
@@ -86,7 +88,24 @@ def get_enabled_features_from_registry(features_cfg):
         
     return set(enabled_features)
 
-def _table_columns(engine, schema: str, table: str) -> set[str]:
+
+def check_model_features_against_registry(required_features: List[str], features_cfg: Dict[str, Any]):
+    """
+    Validates that every feature requested by models.yaml is actually defined
+    in the features.yaml registry (output_col).
+    """
+    registry = features_cfg.get("registry", [])
+    registered_outputs = {item.get("output_col") for item in registry if "output_col" in item}
+    
+    missing = [f for f in required_features if f not in registered_outputs]
+    
+    # Note: Static features (dist_to_road, etc.) won't be in registry.
+    # So we don't raise an error here, but we log it for debugging.
+    if missing:
+        logger.debug(f"Features requested but not in registry (likely static): {missing}")
+
+
+def _table_columns(engine: SqlEngine, schema: str, table: str) -> Set[str]:
     q = text("""
         SELECT column_name
         FROM information_schema.columns
@@ -95,7 +114,47 @@ def _table_columns(engine, schema: str, table: str) -> set[str]:
     df = pd.read_sql(q, engine, params={"schema": schema, "table": table})
     return set(df["column_name"].tolist())
 
-def classify_features(required_features, engine):
+
+def validate_columns(engine: SqlEngine, table: str, required_cols: List[str]) -> None:
+    """
+    Pre-flight validation to ensure all required columns exist in the specified
+    table. Queries ``information_schema.columns`` for the given schema and
+    table and raises a descriptive ValueError if any columns are missing.
+
+    Parameters
+    ----------
+    engine : sqlalchemy.engine.Engine
+        Active database engine.
+    table : str
+        Name of the table (without schema) to inspect.
+    required_cols : Iterable[str]
+        Column names that must be present in the table.
+
+    Raises
+    ------
+    ValueError
+        If any columns in ``required_cols`` are absent from the table.
+    """
+    if not required_cols:
+        return
+    query = text(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = :schema AND table_name = :table
+        """
+    )
+    df_cols = pd.read_sql(query, engine, params={"schema": SCHEMA, "table": table})
+    existing_cols = set(df_cols["column_name"].tolist())
+    missing = [col for col in required_cols if col not in existing_cols]
+    if missing:
+        raise ValueError(
+            f"Missing columns in {SCHEMA}.{table}: {missing}. "
+            "Ensure these columns are ingested or adjust models.yaml accordingly."
+        )
+
+
+def classify_features(required_features: List[str], engine: SqlEngine) -> Tuple[List[str], List[str]]:
     """
     Decide whether each feature should be pulled from:
       - car_cewp.temporal_features  => t.<col>
@@ -128,7 +187,14 @@ def classify_features(required_features, engine):
 
     return temporal_selects, static_selects
 
-def build_dynamic_query(start_date, end_date, temp_cols, static_cols, horizons):
+
+def build_dynamic_query(
+    start_date: str, 
+    end_date: str, 
+    temp_cols: List[str], 
+    static_cols: List[str], 
+    horizons: List[Dict[str, Any]]
+) -> str:
     """
     Constructs SQL query dynamically handling Targets and Joins.
     """
@@ -142,7 +208,11 @@ def build_dynamic_query(start_date, end_date, temp_cols, static_cols, horizons):
         steps = h["steps"]
         # Name convention: target_{steps}_step
         # We partition by H3 and order by Date
-        clause = f"LEAD(t.fatalities_14d_sum, {steps}) OVER (PARTITION BY t.h3_index ORDER BY t.date) as target_{steps}_step"
+        clause = (
+            f"LEAD(t.fatalities_14d_sum, {steps}) "
+            f"OVER (PARTITION BY t.h3_index ORDER BY t.date) "
+            f"as target_{steps}_step"
+        )
         target_clauses.append(clause)
         
     target_sql = ",\n        ".join(target_clauses)
@@ -160,10 +230,16 @@ def build_dynamic_query(start_date, end_date, temp_cols, static_cols, horizons):
     """
     return sql
 
-def run(configs, engine, start_date=None, end_date=None):
-    logger.info("="*60)
+
+def run(
+    configs: Dict[str, Any], 
+    engine: SqlEngine, 
+    start_date: Optional[str] = None, 
+    end_date: Optional[str] = None
+) -> None:
+    logger.info("=" * 60)
     logger.info("BUILDING FEATURE MATRIX (Fixed Dynamic Version)")
-    logger.info("="*60)
+    logger.info("=" * 60)
     
     data_cfg = configs["data"]
     models_cfg = configs["models"]
@@ -181,21 +257,20 @@ def run(configs, engine, start_date=None, end_date=None):
     req_feats = get_required_features(models_cfg)
     
     # 3. Validation: Check against Registry Enabled Flags
-    # If a feature is in the registry but disabled, we should warn or remove it.
-    # Note: Not all features are in the registry (e.g. static ones), so we only check intersection.
-    
+    check_model_features_against_registry(req_feats, features_cfg)
+
     registry_enabled_set = get_enabled_features_from_registry(features_cfg)
     
-    # If registry has entries, we can check for explicitly disabled ones.
-    # To do this, we need the set of ALL registry features first.
+    # Determine all registry features for conflict detection
     registry_all = set()
     if features_cfg.get("registry"):
-        registry_all = {item.get("output_col") for item in features_cfg["registry"] if "output_col" in item}
+        registry_all = {
+            item.get("output_col") for item in features_cfg["registry"] if "output_col" in item
+        }
         
-    # Check for conflicts
+    # Filter out disabled features
     final_req_feats = []
     for f in req_feats:
-        # If feature is KNOWN to the registry but NOT enabled -> Skip/Error
         if f in registry_all and f not in registry_enabled_set:
             logger.warning(f"Feature '{f}' requested by models.yaml but DISABLED in features.yaml. Skipping.")
             continue
@@ -210,11 +285,20 @@ def run(configs, engine, start_date=None, end_date=None):
     logger.info(f" -> Mapped to Temporal: {len(t_cols)}")
     logger.info(f" -> Mapped to Static:   {len(s_cols)}")
     
-    # 5. Build Query
+    # 5. Pre-flight Column Validation
+    # Validate that all temporal and static columns exist in the database before
+    # constructing the large SQL query. Extract the raw column names from
+    # the "t." and "s." prefixes used by classify_features.
+    temporal_fields = [c.split(".", 1)[1] for c in t_cols]
+    static_fields = [c.split(".", 1)[1] for c in s_cols]
+    validate_columns(engine, "temporal_features", temporal_fields)
+    validate_columns(engine, "features_static", static_fields)
+
+    # 6. Build Query
     horizons = models_cfg["horizons"]
     sql = build_dynamic_query(start_date, end_date, t_cols, s_cols, horizons)
     
-    # 6. Stream & Process
+    # 7. Stream & Process
     out_path = PATHS["data_proc"] / "feature_matrix.parquet"
     chunk_size = 50000
     
@@ -225,9 +309,9 @@ def run(configs, engine, start_date=None, end_date=None):
     total_rows = 0
     
     for i, chunk in enumerate(chunks):
-        # Enforce H3 BigInt (Critical Fix for compatibility)
-        chunk['h3_index'] = chunk['h3_index'].astype('int64')
-        chunk['date'] = pd.to_datetime(chunk['date'])
+        # Enforce H3 BigInt (Critical Fix for compatibility) using centralized helper
+        chunk["h3_index"] = chunk["h3_index"].apply(ensure_h3_int64).astype("int64")
+        chunk["date"] = pd.to_datetime(chunk["date"])
         
         if master_df is None:
             master_df = chunk
@@ -235,9 +319,9 @@ def run(configs, engine, start_date=None, end_date=None):
             master_df = pd.concat([master_df, chunk], ignore_index=True)
             
         total_rows += len(chunk)
-        print(f"  Batch {i+1}: {total_rows} rows accumulated...", end='\r')
+        print(f"  Batch {i+1}: {total_rows} rows accumulated...", end="\r")
         
-    print() # Newline
+    print()  # Newline
     
     if master_df is None or master_df.empty:
         logger.error("Query returned no data! Check database population.")
@@ -245,21 +329,21 @@ def run(configs, engine, start_date=None, end_date=None):
 
     logger.info(f"Final Matrix Shape: {master_df.shape}")
     
-    # 7. Save
+    # 8. Save
     master_df.to_parquet(out_path, index=False)
     logger.info(f"Saved to {out_path}")
     
-    # 8. Save Meta
-    import json
+    # 9. Save Meta
     meta = {
         "start": str(start_date),
         "end": str(end_date),
         "rows": len(master_df),
         "features": req_feats,
-        "horizons": [h["name"] for h in horizons]
+        "horizons": [h["name"] for h in horizons],
     }
-    with open(PATHS["data_proc"] / "matrix_meta.json", 'w') as f:
+    with open(PATHS["data_proc"] / "matrix_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
+
 
 if __name__ == "__main__":
     try:
@@ -268,11 +352,12 @@ if __name__ == "__main__":
         if isinstance(cfg, tuple):
             configs = {"data": cfg[0], "features": cfg[1], "models": cfg[2]}
         else:
-            configs = cfg # Assuming dict
+            configs = cfg  # Assuming dict
             
         engine = get_db_engine()
         run(configs, engine)
     except Exception as e:
         logger.error(f"Matrix Build Failed: {e}", exc_info=True)
     finally:
-        if 'engine' in locals(): engine.dispose()
+        if "engine" in locals():
+            engine.dispose()

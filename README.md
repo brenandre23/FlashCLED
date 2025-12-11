@@ -18,7 +18,7 @@ The system ingests multi-source data (satellite, economic, political), engineers
 - Builds an **H3 grid** + static geography layers (terrain, rivers, roads, settlements)
 - Ingests dynamic time-series data (ACLED, GDELT, IODA, WorldPop, GEE, FEWS NET)
 - Runs **master feature engineering** on a **14-day temporal spine** (anomalies, shocks, staleness/decay, spatial diffusion)
-- Trains an **XGBoost ensemble** (classifier + regressor)
+- Trains an **XGBoost ensemble OR LGB** (classifier + regressor)
 
 ---
 
@@ -138,10 +138,10 @@ python main.py --skip-static --skip-dynamic --skip-features
 
 This system uses a **two-stage hurdle model**:
 
-1) **Binary classifier (XGBoost)**  
+1) **Binary classifier (XGBoost OR LGB)**  
    Predicts probability of conflict (e.g., `fatalities > 0`).
 
-2) **Regressor (XGBoost)**  
+2) **Regressor (XGBoost OR LGB)**  
    Predicts fatalities conditional on conflict occurring.
 
 **Output:**  

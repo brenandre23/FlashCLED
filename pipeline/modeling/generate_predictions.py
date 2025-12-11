@@ -14,19 +14,18 @@ This script:
 
 import sys
 from pathlib import Path
+from typing import Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
 import joblib
+from sqlalchemy.engine import Engine as SqlEngine
 
 # Make sure root is on path so we can import utils
 file_path = Path(__file__).resolve()
 sys.path.insert(0, str(file_path.parent.parent.parent))  # adjust if needed
 
-from utils import logger, PATHS, get_db_engine, load_configs  # noqa: E402
-
-# Keep consistent with build_feature_matrix.py
-SCHEMA = "car_cewp"
+from utils import logger, PATHS, get_db_engine, load_configs, SCHEMA  # noqa: E402
 
 
 def load_feature_matrix() -> pd.DataFrame:
@@ -39,16 +38,15 @@ def load_feature_matrix() -> pd.DataFrame:
         )
     logger.info(f"Loading feature matrix from: {feature_matrix_path}")
     df = pd.read_parquet(feature_matrix_path)
+    
+    # Fixed: Removed redundant empty checks (P3-1)
     if df.empty:
-        logger.warning('df is empty - downstream features may be missing')
-    if df.empty:
-        logger.warning('df is empty - downstream features may be missing')
-    if df.empty:
-        logger.warning('df is empty - downstream features may be missing')
+        logger.warning('Feature matrix is empty - downstream features may be missing')
+        
     return df
 
 
-def apply_pca_if_needed(df: pd.DataFrame, bundle: dict) -> pd.DataFrame:
+def apply_pca_if_needed(df: pd.DataFrame, bundle: Dict[str, Any]) -> pd.DataFrame:
     """
     If the model bundle contains PCA information, recreate the PCA components
     on the new feature matrix.
@@ -183,7 +181,6 @@ def main() -> None:
         logger.info("DB write complete.")
 
     logger.info("=== PREDICTION GENERATION COMPLETE ===")
-
 
 
 if __name__ == "__main__":

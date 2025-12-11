@@ -2,10 +2,7 @@
 train_models.py
 ===============
 Trains the Two-Stage Hurdle Ensemble for each defined horizon.
-Refactored for Phase 5:
-- Uses step-based horizons (target_X_step)
-- Respects train/test splits from config
-- Implements PCA "Broad" theme logic
+Updated for Multi-Learner Benchmarking (XGBoost vs LightGBM).
 """
 
 import sys
@@ -23,9 +20,19 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from utils import logger, PATHS, load_configs
-# Import the TwoStageEnsemble class (unchanged, just imported)
 from pipeline.modeling.two_stage_ensemble import TwoStageEnsemble
-import xgboost as xgb
+
+# Optional imports for learner factories
+try:
+    import xgboost as xgb
+except ImportError:
+    xgb = None
+
+try:
+    import lightgbm as lgb
+except ImportError:
+    lgb = None
+
 
 def get_train_test_split(df, train_cutoff):
     """Splits matrix based on date cutoff."""
@@ -37,19 +44,42 @@ def get_train_test_split(df, train_cutoff):
     test = df[df['date'] > cutoff].copy()
     return train, test
 
-def build_theme_models(models_cfg):
+
+def get_learner_constructors(model_type):
+    """Factory function to get the correct class constructors."""
+    if model_type == "xgboost":
+        if xgb is None: raise ImportError("XGBoost not installed.")
+        return xgb.XGBClassifier, xgb.XGBRegressor
+    elif model_type == "lightgbm":
+        if lgb is None: raise ImportError("LightGBM not installed.")
+        return lgb.LGBMClassifier, lgb.LGBMRegressor
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
+
+def build_theme_models(submodels_cfg, learner_cfg):
     """
-    Constructs the base learners for the ensemble based on submodels config.
+    Constructs base learners using the specific learner config.
     """
     theme_models = []
-    base_params = models_cfg["base_learner"]["xgb_params"]
+    model_type = learner_cfg["type"]
+    params = learner_cfg["params"]
     
-    for name, cfg in models_cfg["submodels"].items():
+    # Get the correct classes (XGB or LGB)
+    ClsClassifier, ClsRegressor = get_learner_constructors(model_type)
+    
+    for name, cfg in submodels_cfg.items():
         if not cfg["enabled"]: continue
         
-        # Instantiate fresh models for this theme
-        clf = xgb.XGBClassifier(**base_params, objective='binary:logistic')
-        reg = xgb.XGBRegressor(**base_params, objective='reg:squarederror')
+        # Instantiate specific model type
+        # Note: XGB uses objective='binary:logistic', LGB uses objective='binary'
+        if model_type == "xgboost":
+            clf = ClsClassifier(**params, objective='binary:logistic')
+            reg = ClsRegressor(**params, objective='reg:squarederror')
+        else:
+            # LightGBM objectives
+            clf = ClsClassifier(**params, objective='binary')
+            reg = ClsRegressor(**params, objective='regression')
         
         theme_models.append({
             "name": name,
@@ -60,9 +90,10 @@ def build_theme_models(models_cfg):
         
     return theme_models
 
+
 def run():
     logger.info("="*60)
-    logger.info("MODEL TRAINING (Phase 5)")
+    logger.info("MODEL TRAINING BENCHMARK (XGBoost vs LightGBM)")
     logger.info("="*60)
     
     # 1. Load Data & Configs
@@ -88,7 +119,7 @@ def run():
     # PRE-PROCESSING: Handle PCA / "Broad" Theme Logic
     # (Moved OUTSIDE the loop to avoid re-calculating per horizon)
     # =========================================================
-    pca_bundle = {} # Store objects to save later
+    pca_bundle = {} 
     pca_config = models_cfg["submodels"].get("broad_pca")
     
     if pca_config and pca_config.get("enabled"):
@@ -140,66 +171,92 @@ def run():
             "pca_component_names": pca_cols
         }
 
-    # 3. Iterate Horizons
-    horizons = models_cfg["horizons"] 
+    # 3. Iterate Horizons AND Learners
+    horizons = models_cfg["horizons"]
+    
+    # Fallback if 'learners' is missing (backward compatibility)
+    if "learners" not in models_cfg:
+        logger.warning("'learners' not found in models.yaml. Using 'base_learner' as 'xgboost' default.")
+        learners = {
+            "xgboost": {
+                "type": models_cfg["base_learner"]["model_type"],
+                "params": models_cfg["base_learner"]["xgb_params"]
+            }
+        }
+    else:
+        learners = models_cfg["learners"]
+    
     model_dir = PATHS["models"]
     model_dir.mkdir(exist_ok=True)
     
+    # Store results for comparison
+    results = []
+
     for h in horizons:
         name = h["name"]
         steps = h["steps"]
         target_col = f"target_{steps}_step"
         
-        logger.info(f"\n--- Training Horizon: {name} (Steps: {steps}) ---")
+        logger.info(f"\n=== Horizon: {name} ===")
         
-        # Prepare Target Vectors
+        # Prepare Data
         train_h = train_df.dropna(subset=[target_col])
+        if train_h.empty: continue
         
-        if train_h.empty:
-            logger.warning(f"No training data for {name} (check target column names).")
-            continue
-
-        X_train = train_h 
+        X_train = train_h
         y_raw = train_h[target_col]
         y_binary = (y_raw > 0).astype(int)
-        y_reg = y_raw 
+        y_reg = y_raw
         
         if y_binary.sum() < 10:
-            logger.warning("Too few positive cases. Skipping.")
+            logger.warning(f"Too few positive cases for {name}. Skipping.")
             continue
+        
+        # --- LOOP THROUGH LEARNERS ---
+        for learner_name, learner_cfg in learners.items():
+            logger.info(f"  Training {learner_name}...")
             
-        # Build Ensemble
-        themes = build_theme_models(models_cfg)
-        ensemble = TwoStageEnsemble(
-            theme_models=themes,
-            n_folds=5
-        )
-        
-        # Fit
-        ensemble.fit(X_train, y_binary, y_reg)
-        
-        # Save Bundle (Ensemble + PCA objects)
-        out_file = model_dir / f"two_stage_ensemble_{name}.pkl"
-        
-        full_bundle = {
-            "ensemble": ensemble,
-            **pca_bundle  # Unpack PCA objects into the file
-        }
-        
-        joblib.dump(full_bundle, out_file)
-        logger.info(f"Saved model bundle to {out_file}")
-        
-        # Quick Evaluation on Test Set
-        test_h = test_df.dropna(subset=[target_col])
-        if not test_h.empty:
-            probs, preds = ensemble.predict(test_h)
             try:
-                auc = roc_auc_score((test_h[target_col]>0).astype(int), probs)
-                logger.info(f"Test AUC: {auc:.4f}")
-            except Exception:
-                logger.info("Could not calc AUC")
+                # Build Theme Models for THIS learner
+                themes = build_theme_models(models_cfg["submodels"], learner_cfg)
+                
+                # Initialize Ensemble
+                ensemble = TwoStageEnsemble(theme_models=themes, n_folds=5)
+                
+                # Fit
+                ensemble.fit(X_train, y_binary, y_reg)
+                
+                # Save with learner name in filename
+                # e.g., two_stage_ensemble_14d_xgboost.pkl
+                out_file = model_dir / f"two_stage_ensemble_{name}_{learner_name}.pkl"
+                
+                full_bundle = {"ensemble": ensemble, **pca_bundle}
+                joblib.dump(full_bundle, out_file)
+                
+                # Evaluate on Test Set
+                test_h = test_df.dropna(subset=[target_col])
+                if not test_h.empty:
+                    probs, preds = ensemble.predict(test_h)
+                    try:
+                        auc = roc_auc_score((test_h[target_col] > 0).astype(int), probs)
+                        logger.info(f"    {learner_name} Test AUC: {auc:.4f}")
+                        results.append({
+                            "horizon": name,
+                            "learner": learner_name,
+                            "auc": auc
+                        })
+                    except Exception as e:
+                        logger.warning(f"AUC Calc failed: {e}")
+            
+            except Exception as e:
+                logger.error(f"Failed to train {learner_name}: {e}")
 
-    logger.info("\nTraining Complete.")
+    # Print Summary Table
+    if results:
+        logger.info("\n=== BENCHMARK RESULTS ===")
+        res_df = pd.DataFrame(results)
+        if not res_df.empty:
+            print(res_df.pivot(index="horizon", columns="learner", values="auc"))
 
 if __name__ == "__main__":
     run()

@@ -5,7 +5,7 @@
 
 feature_matrix:
   build_start_date: "2000-01-01"
-  build_end_date: "2025-12-31" # Updated to 2025
+  build_end_date: "2025-12-31"
   chunk_size: "yearly"
 
 experiment:
@@ -26,13 +26,25 @@ hurdle_params:
   regressor_loss_function: "huber"
   regressor_huber_delta: 1.0
 
-base_learner:
-  model_type: "xgboost"
-  xgb_params:
-    n_estimators: 300
-    max_depth: 6
-    learning_rate: 0.05
-    tree_method: "hist"
+learners:
+  xgboost:
+    type: "xgboost"
+    params:
+      n_estimators: 300
+      max_depth: 6
+      learning_rate: 0.05
+      tree_method: "hist"
+      n_jobs: -1
+      
+  lightgbm:
+    type: "lightgbm"
+    params:
+      n_estimators: 300
+      num_leaves: 31
+      learning_rate: 0.05
+      max_depth: -1
+      n_jobs: -1
+      verbose: -1
 
 # --- FEATURE SUBSETS ---
 submodels:
@@ -55,8 +67,9 @@ submodels:
       - dist_to_capital
       - terrain_ruggedness_index
       - dist_to_road
-      - water_coverage_lag1
-      - water_presence_lag1 
+      # Water features mapped from JRC_Landsat (see features.yaml)
+      - water_coverage_lag1 
+      - water_presence_lag1
 
   resources_economy:
     enabled: true
@@ -72,10 +85,9 @@ submodels:
       - iom_displacement_count_lag1
       - ipc_phase_class_lag1
 
-  # NEW: Broad PCA Model
   broad_pca:
     enabled: true
     type: "pca"
     variance_retention: 0.90
     features:
-      - all_candidates # Handled dynamically in train_models.py
+      - all_candidates

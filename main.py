@@ -25,7 +25,10 @@ ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from utils import logger, load_configs, get_db_engine
+from utils import (
+    logger, load_configs, get_db_engine,
+    validate_pipeline_prerequisites, validate_all_phases
+)
 
 # --- Init ---
 import init_db
@@ -152,10 +155,40 @@ class CEWPPipeline:
         if missing:
             raise RuntimeError(f"Missing required tables in {schema}: {missing}")
 
+    def _validate_phase(self, phase: str, will_create: bool = False) -> bool:
+        """
+        Validate prerequisites for a phase.
+        
+        Args:
+            phase: Phase name
+            will_create: If True, this phase will create the required resources,
+                        so we only warn instead of failing.
+        
+        Returns:
+            True if validation passed or was skipped, False otherwise.
+        """
+        result = validate_pipeline_prerequisites(self.engine, phase)
+        
+        if not result.passed:
+            if will_create:
+                # Phase will create its own prerequisites - just warn
+                logger.warning(f"Prerequisites missing but phase '{phase}' will create them.")
+                return True
+            else:
+                # Hard failure
+                logger.error(result.get_error_message())
+                return False
+        
+        return True
+
     def run_static_phase(self):
         if self.args.skip_static:
             logger.info("Skipping Phase 1: Static Ingestion")
             return
+
+        # Validate - static phase creates its own resources
+        if not self._validate_phase("static", will_create=True):
+            raise RuntimeError("Static phase validation failed.")
 
         with pipeline_stage("PHASE 1: STATIC INGESTION"):
             # Grid & Pop
@@ -185,6 +218,15 @@ class CEWPPipeline:
             logger.info("Skipping Phase 2: Dynamic Ingestion")
             return
 
+        # Validate - requires static phase output
+        # If static phase is NOT skipped, it will create the prerequisites
+        will_create = not self.args.skip_static
+        if not self._validate_phase("dynamic", will_create=will_create):
+            raise RuntimeError(
+                "Dynamic phase validation failed. "
+                "Run static phase first or use --skip-dynamic to skip."
+            )
+
         with pipeline_stage("PHASE 2: DYNAMIC INGESTION"):
             # Conflict Events
             fetch_acled.run(self.configs, self.engine)
@@ -192,8 +234,8 @@ class CEWPPipeline:
 
             # Socio-Economic
             ingest_food_security.run(self.configs, self.engine)
-            ingest_economy.main()  # Uses main() wrapper in source
-            fetch_iom.main()       # Uses main() wrapper in source
+            ingest_economy.main()
+            fetch_iom.main()
 
             # Spatial Disaggregation
             logger.info(">> Spatial Disaggregation (Admin -> H3)")
@@ -207,6 +249,15 @@ class CEWPPipeline:
             logger.info("Skipping Phase 3: Feature Engineering")
             return
 
+        # Validate - requires static and dynamic phase outputs
+        # Prerequisites will be created if earlier phases are not skipped
+        will_create = not (self.args.skip_static and self.args.skip_dynamic)
+        if not self._validate_phase("feature_engineering", will_create=will_create):
+            raise RuntimeError(
+                "Feature engineering phase validation failed. "
+                "Run static and dynamic phases first or use --skip-features to skip."
+            )
+
         with pipeline_stage("PHASE 3: FEATURE ENGINEERING"):
             # 3.1 Master Feature Script
             master_fe.run()
@@ -218,6 +269,14 @@ class CEWPPipeline:
         if self.args.skip_modeling:
             logger.info("Skipping Phase 4: Modeling")
             return
+
+        # Validate - requires all previous phases
+        will_create = not self.args.skip_features
+        if not self._validate_phase("modeling", will_create=will_create):
+            raise RuntimeError(
+                "Modeling phase validation failed. "
+                "Run feature engineering phase first or use --skip-modeling to skip."
+            )
 
         with pipeline_stage("PHASE 4: MODELING"):
             # 4.1 Build ABT
@@ -236,13 +295,59 @@ class CEWPPipeline:
             for h in horizons:
                 horizon_name = h["name"]
                 logger.info(f"   > Predicting Horizon: {horizon_name}")
-                # Hack: generate_predictions expects args via sys.argv
                 sys.argv = ["generate_predictions.py", horizon_name]
                 generate_predictions.main()
+
+    def run_validation_only(self):
+        """Run validation for all phases without executing pipeline."""
+        logger.info("=" * 60)
+        logger.info("VALIDATION-ONLY MODE")
+        logger.info("=" * 60)
+        
+        results = validate_all_phases(self.engine)
+        
+        # Determine exit code based on what would be run
+        phases_to_run = []
+        if not self.args.skip_static:
+            phases_to_run.append("static")
+        if not self.args.skip_dynamic:
+            phases_to_run.append("dynamic")
+        if not self.args.skip_features:
+            phases_to_run.append("feature_engineering")
+        if not self.args.skip_modeling:
+            phases_to_run.append("modeling")
+        
+        # Check if all phases that would run are valid
+        # Note: Each phase creates prerequisites for the next
+        all_valid = True
+        for i, phase in enumerate(phases_to_run):
+            # First phase only needs extensions
+            if i == 0:
+                if not results.get("static", results.get(phase)).passed:
+                    # Check only extensions for first phase
+                    if results.get(phase) and results[phase].missing_extensions:
+                        all_valid = False
+                        break
+            else:
+                # Later phases need previous phase outputs
+                prev_phase = phases_to_run[i-1] if i > 0 else None
+                if prev_phase and not results.get(prev_phase, results.get(phase)).passed:
+                    logger.warning(f"Phase '{phase}' may fail due to missing prerequisites from '{prev_phase}'")
+        
+        if all_valid:
+            logger.info("\n✅ Validation passed for planned execution path.")
+            return 0
+        else:
+            logger.error("\n❌ Validation failed. See details above.")
+            return 1
 
     def execute(self):
         try:
             self.setup()
+            
+            # Handle validation-only mode
+            if self.args.validate_only:
+                return self.run_validation_only()
             
             logger.info("=" * 60)
             logger.info("   ORCHESTRATING CEWP PIPELINE")
@@ -287,9 +392,19 @@ def parse_args():
     parser.add_argument("--skip-features", action="store_true", help="Skip feature engineering.")
     parser.add_argument("--skip-modeling", action="store_true", help="Skip modeling & predictions.")
     
+    # Validation
+    parser.add_argument(
+        "--validate-only", 
+        action="store_true", 
+        help="Run pre-flight validation without executing pipeline."
+    )
+    
     return parser.parse_args()
+
 
 if __name__ == "__main__":
     args = parse_args()
     pipeline = CEWPPipeline(args)
-    pipeline.execute()
+    exit_code = pipeline.execute()
+    if exit_code is not None:
+        sys.exit(exit_code)

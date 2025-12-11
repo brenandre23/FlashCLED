@@ -4,14 +4,12 @@ pipeline/processing/feature_engineering.py
 Master Feature Engineering Pipeline (Phase 5).
 CONFIG-DRIVEN: Controlled strictly by configs/features.yaml.
 
-LOGIC:
-1. SPINAL: Generates Master Spine based on config frequency.
-2. REGISTRY: Only processes features explicitly defined in features.yaml registry.
-3. TRANSFORMS: Dynamic mapping of 'anomaly', 'decay', 'lag' keywords to vector logic.
-4. ROBUSTNESS: Checks for table existence; Casts types before merges.
-
-OUTPUT:
-- car_cewp.temporal_features (Target for EPR injection and Modeling)
+FIXES APPLIED:
+1. SQL FIX: corrected 'displacement_count' -> 'iom_displacement_sum' in process_social_data.
+2. IDEMPOTENCY FIX: Replaced DROP+REPLACE with upsert using upload_to_postgis helper.
+3. PATH FIX: Corrected ROOT_DIR to parents[2].
+4. SCHEMA EVOLUTION: Added support for adding new columns to existing tables.
+5. POPULATION FIX: Added process_demographics to handle WorldPop log1p transformation.
 """
 
 import sys
@@ -24,19 +22,25 @@ from sqlalchemy import text, inspect
 from scipy.spatial import cKDTree
 
 # --- Import Utils ---
-ROOT_DIR = Path(__file__).resolve().parents[3]
+# Path: pipeline/processing/feature_engineering.py
+# parents[0] = processing/, parents[1] = pipeline/, parents[2] = root/
+ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from utils import logger, get_db_engine, load_configs
+from utils import logger, get_db_engine, load_configs, upload_to_postgis
 
 # --- Constants ---
 SCHEMA = "car_cewp"
 OUTPUT_TABLE = "temporal_features"
+PRIMARY_KEYS = ['h3_index', 'date']  # For upsert operations
+CHUNK_SIZE = 50000  # For chunked uploads
+
 
 def get_h3_centroids(h3_indices):
     """Vectorized conversion of H3 Index -> Lat/Lon Centroid."""
     return np.array([h3.cell_to_latlng(x) for x in h3_indices])
+
 
 def parse_registry(features_config):
     """
@@ -47,14 +51,16 @@ def parse_registry(features_config):
         'environmental': [],
         'conflict': [],
         'economic': [],
-        'social': []
+        'social': [],
+        'demographic': []  # Added for WorldPop
     }
     
     source_map = {
         'CHIRPS': 'environmental', 'ERA5': 'environmental', 
         'MODIS': 'environmental', 'VIIRS': 'environmental', 'JRC_Landsat': 'environmental',
         'ACLED': 'conflict', 'GDELT': 'conflict',
-        'YahooFinance': 'economic', 'FEWS_NET': 'social', 'IOM_DTM': 'social'
+        'YahooFinance': 'economic', 'FEWS_NET': 'social', 'IOM_DTM': 'social',
+        'WorldPop': 'demographic'  # Added mapping
     }
 
     for item in registry:
@@ -64,6 +70,26 @@ def parse_registry(features_config):
             specs[category].append(item)
             
     return specs
+
+
+def _infer_sql_type(dtype_str):
+    """
+    Infer SQL type from pandas dtype string.
+    """
+    dtype_str = str(dtype_str).lower()
+    if 'int64' in dtype_str or 'int32' in dtype_str:
+        return 'BIGINT'
+    elif 'float' in dtype_str:
+        return 'DOUBLE PRECISION'
+    elif 'datetime64' in dtype_str:
+        return 'TIMESTAMP'
+    elif 'date' in dtype_str:
+        return 'DATE'
+    elif 'bool' in dtype_str:
+        return 'BOOLEAN'
+    else:
+        return 'TEXT'
+
 
 # ==============================================================================
 # PHASE 1: SPINE & INFRASTRUCTURE
@@ -93,6 +119,70 @@ def create_master_spine(engine, start_date, end_date, step_days):
     spine.drop(columns=['year'], inplace=True)
     
     return spine
+
+
+def ensure_output_table_schema(engine, spine_sample):
+    """
+    Ensure the output table exists with the correct schema.
+    Creates the table if it doesn't exist, or adds missing columns if it does.
+    """
+    inspector = inspect(engine)
+    
+    with engine.begin() as conn:
+        # Ensure schema exists
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}"))
+        
+        if not inspector.has_table(OUTPUT_TABLE, schema=SCHEMA):
+            # --- CREATE NEW TABLE ---
+            logger.info(f"Creating new table {SCHEMA}.{OUTPUT_TABLE}...")
+            
+            col_defs = []
+            for col in spine_sample.columns:
+                sql_type = _infer_sql_type(spine_sample[col].dtype)
+                col_defs.append(f'"{col}" {sql_type}')
+            
+            pk_clause = ', '.join([f'"{pk}"' for pk in PRIMARY_KEYS])
+            create_sql = f"""
+                CREATE TABLE {SCHEMA}.{OUTPUT_TABLE} (
+                    {', '.join(col_defs)},
+                    PRIMARY KEY ({pk_clause})
+                )
+            """
+            conn.execute(text(create_sql))
+            logger.info(f"  Created table with {len(col_defs)} columns.")
+            
+        else:
+            # --- ADD MISSING COLUMNS TO EXISTING TABLE ---
+            logger.info(f"Table {SCHEMA}.{OUTPUT_TABLE} exists. Checking for new columns...")
+            
+            existing_cols = {c['name'] for c in inspector.get_columns(OUTPUT_TABLE, schema=SCHEMA)}
+            new_cols_added = 0
+            
+            for col in spine_sample.columns:
+                if col not in existing_cols:
+                    sql_type = _infer_sql_type(spine_sample[col].dtype)
+                    alter_sql = f'ALTER TABLE {SCHEMA}.{OUTPUT_TABLE} ADD COLUMN IF NOT EXISTS "{col}" {sql_type}'
+                    conn.execute(text(alter_sql))
+                    new_cols_added += 1
+                    logger.info(f"  Added new column: {col} ({sql_type})")
+            
+            if new_cols_added == 0:
+                logger.info("  No new columns needed.")
+            else:
+                logger.info(f"  Added {new_cols_added} new columns.")
+        
+        # Create indexes for performance
+        conn.execute(text(f"""
+            CREATE INDEX IF NOT EXISTS idx_{OUTPUT_TABLE}_date 
+            ON {SCHEMA}.{OUTPUT_TABLE} (date)
+        """))
+        conn.execute(text(f"""
+            CREATE INDEX IF NOT EXISTS idx_{OUTPUT_TABLE}_h3 
+            ON {SCHEMA}.{OUTPUT_TABLE} (h3_index)
+        """))
+    
+    logger.info(f"✓ Table schema verified: {SCHEMA}.{OUTPUT_TABLE}")
+
 
 # ==============================================================================
 # PHASE 2: ECONOMIC & FOOD SECURITY (Hybrid: Config + Base Logic)
@@ -128,6 +218,8 @@ def process_economy_and_food(engine, spine, econ_specs, social_specs):
                 spine[out_col] = spine['commodity_gold_price_usd']
         else:
             logger.warning(f"  ⚠️ Table {SCHEMA}.economic_drivers not found. Skipping Gold data.")
+            if gold_spec.get('output_col'):
+                spine[gold_spec['output_col']] = 0
 
     # --- 2B. Local Food Prices (Spatial Broadcast) ---
     logger.info("  Processing Local Food Prices (Spatial Voronoi)...")
@@ -168,7 +260,18 @@ def process_economy_and_food(engine, spine, econ_specs, social_specs):
     else:
         logger.warning("  ⚠️ Market tables not found. Skipping Food Security features.")
     
-    # --- 2C. Social (IPC / IOM) ---
+    return spine
+
+
+# ==============================================================================
+# PHASE 2B: SOCIAL DATA (IPC & IOM)
+# ==============================================================================
+def process_social_data(engine, spine, social_specs):
+    """Process social data including IPC and IOM displacement data."""
+    logger.info("PHASE 2B: Processing Social Data (IPC & IOM)...")
+    inspector = inspect(engine)
+    
+    # --- IPC Data ---
     ipc_spec = next((x for x in social_specs if 'ipc' in x['raw']), None)
     if ipc_spec:
         if inspector.has_table("ipc_h3", schema=SCHEMA):
@@ -185,8 +288,84 @@ def process_economy_and_food(engine, spine, econ_specs, social_specs):
             logger.warning(f"  ⚠️ Table {SCHEMA}.ipc_h3 not found. Skipping IPC integration (filling 0).")
             if ipc_spec.get('output_col'):
                 spine[ipc_spec['output_col']] = 0
-
+    
+    # --- IOM Displacement Data ---
+    iom_spec = next((x for x in social_specs if 'iom_displacement_sum' in x['raw']), None)
+    if iom_spec:
+        if inspector.has_table("iom_displacement_h3", schema=SCHEMA):
+            logger.info("  Merging IOM Displacement Data...")
+            # [FIXED] Correct column name is iom_displacement_sum, not displacement_count
+            iom_df = pd.read_sql(
+                f"SELECT h3_index, date, iom_displacement_sum FROM {SCHEMA}.iom_displacement_h3", 
+                engine
+            )
+            iom_df['date'] = pd.to_datetime(iom_df['date'])
+            
+            # Merge onto spine
+            spine = spine.merge(iom_df, on=['h3_index', 'date'], how='left')
+            spine['iom_displacement_sum'] = spine['iom_displacement_sum'].fillna(0)
+            
+            # Apply lag transformation
+            if 'lag' in iom_spec.get('transformation', ''):
+                spine[iom_spec['output_col']] = spine.groupby('h3_index')['iom_displacement_sum'].shift(1)
+        else:
+            logger.warning(f"  ⚠️ Table {SCHEMA}.iom_displacement_h3 not found. Skipping IOM integration (filling 0).")
+            if iom_spec.get('output_col'):
+                spine[iom_spec['output_col']] = 0
+    
     return spine
+
+
+# ==============================================================================
+# PHASE 2C: DEMOGRAPHICS (WorldPop)
+# ==============================================================================
+def process_demographics(engine, spine, demo_specs):
+    """
+    Merges annual population data and applies transformations (e.g., log1p).
+    """
+    logger.info("PHASE 2C: Processing Demographics (WorldPop)...")
+    inspector = inspect(engine)
+    
+    # Check if we need to process population
+    pop_spec = next((x for x in demo_specs if x['raw'] == 'pop_count'), None)
+    
+    if pop_spec and inspector.has_table("population_h3", schema=SCHEMA):
+        logger.info("  Merging Population Data (Annual)...")
+        
+        # 1. Load Population Data
+        pop_df = pd.read_sql(
+            f"SELECT h3_index, year, pop_count FROM {SCHEMA}.population_h3", 
+            engine
+        )
+        
+        # 2. Merge on H3 + Year (Spine already has 'year' temporarily, or we re-derive it)
+        spine['year'] = spine['date'].dt.year
+        spine = spine.merge(pop_df, on=['h3_index', 'year'], how='left')
+        
+        # 3. Handle Missing Years (Forward Fill then Fill 0)
+        # Sort to ensure fill works chronologically
+        spine = spine.sort_values(['h3_index', 'date'])
+        spine['pop_count'] = spine.groupby('h3_index')['pop_count'].ffill().fillna(0)
+        
+        # 4. Apply Transformations
+        trans = pop_spec.get('transformation', '')
+        out_col = pop_spec.get('output_col')
+        
+        if 'log1p' in trans:
+            spine[out_col] = np.log1p(spine['pop_count'])
+        else:
+            spine[out_col] = spine['pop_count']
+            
+        # Cleanup
+        spine.drop(columns=['year', 'pop_count'], inplace=True)
+        
+    elif pop_spec:
+        logger.warning(f"  ⚠️ Table {SCHEMA}.population_h3 not found. Filling {pop_spec['output_col']} with 0.")
+        if pop_spec.get('output_col'):
+            spine[pop_spec['output_col']] = 0.0
+            
+    return spine
+
 
 # ==============================================================================
 # PHASE 3: ENVIRONMENTAL DATA (Config-Driven Anomalies)
@@ -194,10 +373,19 @@ def process_economy_and_food(engine, spine, econ_specs, social_specs):
 def process_environment(engine, spine, env_specs):
     logger.info("PHASE 3: Processing Environmental Features (Config-Driven)...")
     
-    if not env_specs: return spine
+    if not env_specs:
+        return spine
 
     # 1. Identify Columns to Load
     raw_cols = list(set([item['raw'] for item in env_specs]))
+    
+    # Ensure water features are included if in specs
+    water_specs = [spec for spec in env_specs if 'water_' in spec['raw']]
+    if water_specs:
+        water_raws = [spec['raw'] for spec in water_specs]
+        raw_cols.extend(water_raws)
+        raw_cols = list(set(raw_cols))
+    
     db_cols = ', '.join(raw_cols)
     
     # 2. Load Raw Data
@@ -209,26 +397,33 @@ def process_environment(engine, spine, env_specs):
     
     spine = spine.merge(env_df, on=['h3_index', 'date'], how='left')
     
-    # 3. Calculate Climatology (Baselines)
-    env_df['year'] = env_df['date'].dt.year
-    env_df['epoch'] = env_df.groupby('year')['date'].rank(method='dense').astype(int)
-    
-    for col in raw_cols:
-        subset = env_df
-        if 'ntl' in col:
-            subset = env_df[env_df['year'] >= 2012]
+    # 3. Calculate Climatology (Baselines) - for anomaly features only
+    anomaly_specs = [spec for spec in env_specs if 'anomaly' in spec.get('transformation', '')]
+    if anomaly_specs:
+        env_df['year'] = env_df['date'].dt.year
+        env_df['epoch'] = env_df.groupby('year')['date'].rank(method='dense').astype(int)
+        
+        anomaly_raws = list(set([spec['raw'] for spec in anomaly_specs]))
+        for col in anomaly_raws:
+            subset = env_df
+            if 'ntl' in col:
+                subset = env_df[env_df['year'] >= 2012]
+                
+            stats = subset.groupby(['h3_index', 'epoch'])[col].agg(['mean', 'std']).reset_index()
+            stats.columns = ['h3_index', 'epoch', f"{col}_mean", f"{col}_std"]
             
-        stats = subset.groupby(['h3_index', 'epoch'])[col].agg(['mean', 'std']).reset_index()
-        stats.columns = ['h3_index', 'epoch', f"{col}_mean", f"{col}_std"]
-        
-        spine = spine.merge(stats, on=['h3_index', 'epoch'], how='left')
-        
-    # 4. Apply Transformations from Registry
+            spine = spine.merge(stats, on=['h3_index', 'epoch'], how='left')
+    
+    # 4. Apply Transformations from Registry (with forward-fill)
     for spec in env_specs:
         raw = spec['raw']
         trans = spec['transformation']
         out = spec['output_col']
         
+        if raw not in spine.columns:
+            spine[raw] = np.nan
+            
+        # Apply forward-fill (limit=4) as specified in imputation config
         spine[raw] = spine.groupby('h3_index')[raw].ffill(limit=4)
         
         if 'anomaly' in trans:
@@ -237,18 +432,24 @@ def process_environment(engine, spine, env_specs):
             spine[out] = spine[anom_col]
             
         elif 'lag' in trans:
-             spine[out] = spine.groupby('h3_index')[raw].shift(1)
+            spine[out] = spine.groupby('h3_index')[raw].shift(1)
              
         else:
-             spine[out] = spine[raw]
+            spine[out] = spine[raw]
+            
+        # Fill NaN values after transformation
+        spine[out] = spine[out].fillna(0)
 
-    # Cleanup
-    drop_cols = [c for c in spine.columns if c.endswith('_mean') or c.endswith('_std')]
+    # Cleanup intermediate columns
+    drop_cols = [c for c in spine.columns if c.endswith('_mean') or c.endswith('_std') or c.endswith('_anom')]
     drop_cols = [c for c in drop_cols if 'market_price' not in c]
-    spine.drop(columns=drop_cols, inplace=True)
+    spine.drop(columns=[c for c in drop_cols if c in spine.columns], inplace=True)
     
-    spine.drop(columns=['epoch'], inplace=True)
+    if 'epoch' in spine.columns:
+        spine.drop(columns=['epoch'], inplace=True)
+    
     return spine
+
 
 # ==============================================================================
 # PHASE 4: CONFLICT DATA (Config-Driven Decay)
@@ -256,12 +457,14 @@ def process_environment(engine, spine, env_specs):
 def process_conflict(engine, spine, conflict_specs, temporal_config):
     logger.info("PHASE 4: Processing Conflict (Config-Driven)...")
     
-    if not conflict_specs: return spine
+    if not conflict_specs:
+        return spine
 
-    # 1. Load ACLED
+    # 1. Load ACLED - Split Protest and Riots (P1-2)
     acled_query = f"""
         SELECT h3_index, event_date AS date, fatalities, 
-               CASE WHEN event_type IN ('Protests', 'Riots') THEN 1 ELSE 0 END as protest_riot
+               CASE WHEN event_type = 'Protests' THEN 1 ELSE 0 END as protest_flag,
+               CASE WHEN event_type = 'Riots' THEN 1 ELSE 0 END as riot_flag
         FROM {SCHEMA}.acled_events
     """
     acled_raw = pd.read_sql(acled_query, engine)
@@ -271,26 +474,50 @@ def process_conflict(engine, spine, conflict_specs, temporal_config):
     dates = sorted(spine['date'].unique())
     acled_raw['spine_date'] = pd.cut(acled_raw['date'], bins=dates, labels=dates[1:], right=True)
     
-    # [FIXED] Use observed=True and explicit cast to datetime
+    # Aggregate with split counts (P1-2)
     acled_agg = acled_raw.groupby(['h3_index', 'spine_date'], observed=True).agg({
-        'fatalities': 'sum', 'protest_riot': 'sum'
-    }).reset_index().rename(columns={'spine_date': 'date', 'protest_riot': 'protest_count'})
+        'fatalities': 'sum',
+        'protest_flag': 'sum',
+        'riot_flag': 'sum'
+    }).reset_index().rename(columns={
+        'spine_date': 'date',
+        'protest_flag': 'protest_count',
+        'riot_flag': 'riot_count'
+    })
     acled_agg['date'] = pd.to_datetime(acled_agg['date'])
     
     # 2. Load GDELT
-    gdelt_raw = pd.read_sql(f"SELECT h3_index, date, value FROM {SCHEMA}.features_dynamic_daily WHERE variable = 'gdelt_event_count'", engine)
+    gdelt_raw = pd.read_sql(
+        f"SELECT h3_index, date, value FROM {SCHEMA}.features_dynamic_daily WHERE variable = 'gdelt_event_count'", 
+        engine
+    )
     gdelt_raw['date'] = pd.to_datetime(gdelt_raw['date'])
     gdelt_raw['spine_date'] = pd.cut(gdelt_raw['date'], bins=dates, labels=dates[1:], right=True)
     
-    # [FIXED] Use observed=True and explicit cast to datetime
-    gdelt_agg = gdelt_raw.groupby(['h3_index', 'spine_date'], observed=True)['value'].sum().reset_index().rename(columns={'spine_date': 'date', 'value': 'gdelt_event_count'})
+    gdelt_agg = gdelt_raw.groupby(['h3_index', 'spine_date'], observed=True)['value'].sum().reset_index()
+    gdelt_agg = gdelt_agg.rename(columns={'spine_date': 'date', 'value': 'gdelt_event_count'})
     gdelt_agg['date'] = pd.to_datetime(gdelt_agg['date'])
 
     # 3. Merge onto Spine
     spine = spine.merge(acled_agg, on=['h3_index', 'date'], how='left')
     spine = spine.merge(gdelt_agg, on=['h3_index', 'date'], how='left')
     
-    # 4. Apply Registry Transformations
+    # 4. Initialize missing conflict columns with 0 and apply forward-fill
+    conflict_raws = list(set([spec['raw'] for spec in conflict_specs]))
+    for raw in conflict_raws:
+        if raw not in spine.columns:
+            spine[raw] = 0
+    
+    # Fill missing values and apply forward-fill (limit=4)
+    for col in ['fatalities', 'protest_count', 'riot_count', 'gdelt_event_count']:
+        if col in spine.columns:
+            spine[col] = spine[col].fillna(0)
+            spine[col] = spine.groupby('h3_index')[col].ffill(limit=4)
+    
+    # 5. Create fatalities_14d_sum (P0-2) - This is the simple sum for the baseline model
+    spine['fatalities_14d_sum'] = spine['fatalities']
+    
+    # 6. Apply Registry Transformations
     decays = temporal_config.get('decays', {})
     
     for spec in conflict_specs:
@@ -298,10 +525,6 @@ def process_conflict(engine, spine, conflict_specs, temporal_config):
         trans = spec['transformation']
         out = spec['output_col']
         
-        if raw not in spine.columns:
-            spine[raw] = 0
-        spine[raw] = spine[raw].fillna(0)
-
         if 'decay' in trans:
             decay_key = f"half_life_{trans.split('_')[1]}"
             steps = decays.get(decay_key, {}).get('steps', 2.14)
@@ -312,15 +535,19 @@ def process_conflict(engine, spine, conflict_specs, temporal_config):
             
         elif 'lag' in trans:
             spine[out] = spine.groupby('h3_index')[raw].shift(1).fillna(0)
+            
+        # Fill NaN values after transformation
+        spine[out] = spine[out].fillna(0)
 
     return spine
+
 
 # ==============================================================================
 # MAIN PIPELINE
 # ==============================================================================
 def run():
     logger.info("=" * 60)
-    logger.info("MASTER FEATURE ENGINEERING (Config-Driven)")
+    logger.info("MASTER FEATURE ENGINEERING (Config-Driven + Idempotent)")
     logger.info("=" * 60)
     
     engine = get_db_engine()
@@ -338,11 +565,18 @@ def run():
         
         specs = parse_registry(feat_cfg)
         
-        # Execution
+        # --- Execution ---
         spine = create_master_spine(engine, start_date, end_date, step_days)
         gc.collect()
         
         spine = process_economy_and_food(engine, spine, specs['economic'], specs['social'])
+        gc.collect()
+        
+        spine = process_social_data(engine, spine, specs['social'])
+        gc.collect()
+        
+        # New call for Demographics
+        spine = process_demographics(engine, spine, specs['demographic'])
         gc.collect()
         
         spine = process_environment(engine, spine, specs['environmental'])
@@ -351,33 +585,45 @@ def run():
         spine = process_conflict(engine, spine, specs['conflict'], feat_cfg['temporal'])
         gc.collect()
         
-        # Final Save
-        logger.info("Optimization & Upload...")
+        # --- Final Optimization ---
+        logger.info("Optimizing data types...")
         fcols = spine.select_dtypes('float64').columns
         spine[fcols] = spine[fcols].astype('float32')
         spine['h3_index'] = spine['h3_index'].astype('int64')
         
-        if 'level_0' in spine.columns: spine.drop(columns=['level_0'], inplace=True)
+        # Clean up any spurious columns
+        if 'level_0' in spine.columns: 
+            spine.drop(columns=['level_0'], inplace=True)
         
-        with engine.begin() as conn:
-            conn.execute(text(f"DROP TABLE IF EXISTS {SCHEMA}.{OUTPUT_TABLE}"))
-            
-        spine.to_sql(
-            OUTPUT_TABLE, engine, schema=SCHEMA, if_exists='replace', index=False, 
-            chunksize=10000, method='multi'
-        )
+        # --- Ensure Table Schema ---
+        ensure_output_table_schema(engine, spine)
         
-        with engine.begin() as conn:
-            conn.execute(text(f"ALTER TABLE {SCHEMA}.{OUTPUT_TABLE} ADD PRIMARY KEY (h3_index, date)"))
-            conn.execute(text(f"CREATE INDEX idx_temp_date ON {SCHEMA}.{OUTPUT_TABLE} (date)"))
+        # --- Upload in Chunks using Upsert (IDEMPOTENT) ---
+        total_rows = len(spine)
+        num_chunks = (total_rows + CHUNK_SIZE - 1) // CHUNK_SIZE
+        
+        logger.info(f"Uploading {total_rows:,} rows in {num_chunks} chunks of {CHUNK_SIZE:,}...")
+        
+        for chunk_num, start_idx in enumerate(range(0, total_rows, CHUNK_SIZE), start=1):
+            end_idx = min(start_idx + CHUNK_SIZE, total_rows)
+            chunk = spine.iloc[start_idx:end_idx].copy()
             
-        logger.info(f"✅ FEATURE ENGINEERING COMPLETE. Saved to {SCHEMA}.{OUTPUT_TABLE}")
+            logger.info(f"  Chunk {chunk_num}/{num_chunks}: rows {start_idx+1:,} to {end_idx:,}")
+            
+            upload_to_postgis(engine, chunk, OUTPUT_TABLE, SCHEMA, PRIMARY_KEYS)
+            
+            # Free memory
+            del chunk
+            gc.collect()
+        
+        logger.info(f"✅ FEATURE ENGINEERING COMPLETE. Upserted {total_rows:,} rows to {SCHEMA}.{OUTPUT_TABLE}")
         
     except Exception as e:
         logger.critical(f"Pipeline Failed: {e}", exc_info=True)
         sys.exit(1)
     finally:
         engine.dispose()
+
 
 if __name__ == "__main__":
     run()

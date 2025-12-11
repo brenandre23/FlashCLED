@@ -3,378 +3,341 @@ calculate_epr_features.py
 ========================
 Purpose: TIME-VARYING EPR features mapped onto the 14-day modeling spine.
 
-FIXES APPLIED:
-- [CRITICAL-1] Fixed config loading (data_cfg vs features_cfg).
-- [MINOR-3] Replaced deprecated h3.polyfill with h3.polygon_to_cells.
-- Uses correct table name 'epr_core'.
+LOGIC CHANGES:
+1. UMBRELLA EXCLUSION: Explicitly filters out "Northern groups" and other umbrella terms
+   to prevent double-counting with disaggregated subgroups (e.g., Runga, Goula).
+2. TEMPORAL FILTER: Excludes groups that ceased to exist before 2000.
+3. EFFICIENCY: Calculates stats at (H3, Year) level before broadcasting to 14-day spine.
+4. ROBUSTNESS: Strict Int64 H3 typing and IDEMPOTENT upserts.
 """
 
 import sys
-import math
-from pathlib import Path
-
-import pandas as pd
 import numpy as np
+import pandas as pd
 import geopandas as gpd
 import h3.api.basic_int as h3
-from h3 import LatLngPoly 
+from h3 import LatLngPoly
 from sqlalchemy import text
+from pathlib import Path
 
 # --- Import Utilities ---
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from utils import logger, get_db_engine, load_configs, upload_to_postgis
+from utils import logger, get_db_engine, load_configs, upload_to_postgis, ensure_h3_int64
 
+# --- Configuration & Constants ---
 SCHEMA = "car_cewp"
 POLY_TABLE = "geoepr_polygons"
 CORE_TABLE = "epr_core"
 TARGET_TABLE = "temporal_features"
 
-CACHE_DIR = ROOT_DIR / "data" / "cache"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# Groups to exclude entirely to prevent double-counting/multicollinearity
+EXCLUDED_GROUP_NAMES = [
+    "Northern groups",  # Major umbrella group in CAR, overlaps with Runga/Goula/etc.
+    "Muslims",          # Religious umbrella, often redundant with ethnic markers
+]
 
+# Numeric mapping for Mean Status calculation
+# Based on political power access
+STATUS_SCORES = {
+    'DOMINANT': 4,
+    'SENIOR PARTNER': 3,
+    'JUNIOR PARTNER': 2,
+    'POWERLESS': 1,
+    'DISCRIMINATED': 0,
+    'SELF-EXCLUSION': 1, # Treated similar to powerless in terms of access
+    'IRRELEVANT': -2     # Special case, often filtered out or treated as noise
+}
 
 # -------------------------------------------------------------
-# Helpers
+# 1. Data Loading & Filtering
 # -------------------------------------------------------------
-def _mode_or_unknown(series: pd.Series, unknown: str = "UNKNOWN") -> str:
-    if series is None or series.empty:
-        return unknown
-    m = series.mode(dropna=True)
-    if m is None or m.empty:
-        return unknown
-    return str(m.iloc[0])
 
-
-def _shannon_entropy(values: pd.Series) -> float:
+def load_and_filter_polygons(engine):
     """
-    Normalized Shannon entropy for categorical values.
-    Returns 0.0 when there is 0/1 category present.
+    Loads ethnic polygons and applies UMBRELLA EXCLUSION logic.
     """
-    if values is None or values.empty:
-        return 0.0
-    counts = values.value_counts(dropna=True)
-    if len(counts) <= 1:
-        return 0.0
-    p = counts / counts.sum()
-    ent = -(p * np.log(p)).sum()
-    return float(ent / np.log(len(counts)))
-
-
-def ensure_columns(engine, schema: str, table: str, cols: dict):
-    with engine.begin() as conn:
-        for col, sql_type in cols.items():
-            conn.execute(text(f'ALTER TABLE "{schema}"."{table}" '
-                              f'ADD COLUMN IF NOT EXISTS "{col}" {sql_type};'))
-    logger.info(f"✓ Ensured {len(cols)} EPR columns exist in {schema}.{table}")
-
-
-# -------------------------------------------------------------
-# Load data with logging
-# -------------------------------------------------------------
-# In pipeline/processing/calculate_epr_features.py
-
-def load_geoepr_polygons(engine) -> gpd.GeoDataFrame:
-    logger.info("=" * 60)
     logger.info("Loading GeoEPR polygons...")
     
-    # 1. Inspect table columns to handle naming variations
-    insp = text("""
-        SELECT column_name 
-        FROM information_schema.columns 
-        WHERE table_schema = :schema AND table_name = :table
-    """)
-    with engine.connect() as conn:
-        cols = pd.read_sql(insp, conn, params={"schema": SCHEMA, "table": POLY_TABLE})['column_name'].tolist()
+    # Handle column naming variations (group_name vs group)
+    try:
+        q_cols = text(f"SELECT * FROM {SCHEMA}.{POLY_TABLE} LIMIT 0")
+        with engine.connect() as conn:
+            cols = pd.read_sql(q_cols, conn).columns
+        
+        name_col = 'group_name' if 'group_name' in cols else '"group"'
+        
+        query = f"""
+            SELECT gwgroupid, {name_col} as group_name, geometry, "to" as to_year
+            FROM {SCHEMA}.{POLY_TABLE}
+            WHERE geometry IS NOT NULL
+        """
+        gdf = gpd.read_postgis(query, engine, geom_col="geometry")
+        
+    except Exception as e:
+        logger.error(f"Failed to load polygons: {e}")
+        raise
+
+    initial_count = len(gdf)
     
-    # 2. Determine Group Name column
-    # Priority: group_name -> group -> name
-    if 'group_name' in cols:
-        name_col = 'group_name'
-    elif 'group' in cols:
-        name_col = 'group'
-    else:
-        logger.warning("Could not find 'group_name' or 'group' column. Using 'gwgroupid' as label.")
-        name_col = 'gwgroupid::text as group_name' # Fallback
+    # --- LOGIC 1: Exclude Umbrella Groups ---
+    # Filter by name
+    gdf = gdf[~gdf['group_name'].isin(EXCLUDED_GROUP_NAMES)].copy()
+    
+    # --- LOGIC 2: Temporal Validity ---
+    # Exclude groups that ceased existing before the study period (2000)
+    # "to_year" in GeoEPR indicates when the polygon validity ends.
+    gdf = gdf[gdf['to_year'] >= 2000].copy()
+    
+    logger.info(f"✓ Filtered Polygons: {len(gdf)}/{initial_count} kept.")
+    logger.info(f"  (Removed 'Northern groups', 'Muslims', and pre-2000 entities)")
+    
+    return gdf.to_crs(epsg=4326)
 
-    # 3. Determine Group ID column
-    # Priority: gwgroupid -> groupid
-    id_col = 'gwgroupid' if 'gwgroupid' in cols else 'groupid'
 
-    logger.info(f"  Using columns: ID='{id_col}', Name='{name_col}'")
-
-    q = f"""
-        SELECT
-            {id_col}::bigint AS gwgroupid,
-            {name_col} AS group_name,
-            geometry
-        FROM {SCHEMA}.{POLY_TABLE}
-        WHERE geometry IS NOT NULL
+def load_epr_core_status(engine, start_year=2000, end_year=2025):
     """
+    Loads yearly status data for the modeling window.
+    """
+    logger.info(f"Loading EPR Core status ({start_year}-{end_year})...")
     
-    gdf = gpd.read_postgis(q, engine, geom_col="geometry")
-    
-    if gdf.empty:
-        raise RuntimeError(f"No GeoEPR polygons found in {SCHEMA}.{POLY_TABLE}")
-    
-    logger.info(f"✓ Loaded {len(gdf):,} GeoEPR polygon groups")
-    
-    if gdf.crs is not None and str(gdf.crs).lower() not in ("epsg:4326", "wgs84"):
-        logger.info(f"  Converting CRS from {gdf.crs} to EPSG:4326...")
-        gdf = gdf.to_crs(epsg=4326)
-    
-    return gdf
-
-
-def load_epr_core(engine, min_year: int, max_year: int) -> pd.DataFrame:
-    logger.info("=" * 60)
-    logger.info(f"Loading EPR core data (years {min_year}-{max_year})...")
-    
-    q = f"""
-        SELECT
-            gwgroupid::bigint AS gwgroupid,
-            year::int AS year,
-            status::text AS status,
-            status_numeric::int AS status_numeric,
-            COALESCE(is_excluded, 0)::int AS is_excluded,
-            COALESCE(is_included, 0)::int AS is_included,
-            COALESCE(is_discriminated, 0)::int AS is_discriminated,
-            COALESCE(has_autonomy, 0)::int AS has_autonomy
+    query = f"""
+        SELECT gwgroupid, year, status, status_numeric
         FROM {SCHEMA}.{CORE_TABLE}
-        WHERE year BETWEEN {int(min_year)} AND {int(max_year)}
+        WHERE year BETWEEN {start_year} AND {end_year}
     """
-    df = pd.read_sql(q, engine)
-    
-    if df.empty:
-        raise RuntimeError(f"No EPR core data found in {SCHEMA}.{CORE_TABLE}")
-    
-    logger.info(f"✓ Loaded {len(df):,} EPR group-year records")
+    df = pd.read_sql(query, engine)
     return df
 
 
-def load_temporal_keys(engine, start_date: str, end_date: str) -> pd.DataFrame:
-    logger.info("=" * 60)
-    logger.info(f"Loading temporal spine keys from {SCHEMA}.{TARGET_TABLE}...")
-    
-    q = f"""
-        SELECT h3_index::bigint AS h3_index, date::date AS date
+def load_temporal_spine_keys(engine, start_date, end_date):
+    """
+    Get unique (h3_index, date) pairs to broadcast features onto.
+    """
+    logger.info("Loading target temporal spine keys...")
+    query = f"""
+        SELECT h3_index, date 
         FROM {SCHEMA}.{TARGET_TABLE}
         WHERE date BETWEEN '{start_date}' AND '{end_date}'
     """
-    df = pd.read_sql(q, engine)
+    df = pd.read_sql(query, engine)
     
-    if df.empty:
-        raise RuntimeError(
-            f"temporal_features has no rows in {start_date} to {end_date}. "
-            "Run calculate_temporal_features first."
-        )
-    
+    # Ensure H3 Types
+    df["h3_index"] = df["h3_index"].apply(ensure_h3_int64).astype("int64")
     df["date"] = pd.to_datetime(df["date"])
-    df["year"] = df["date"].dt.year.astype(int)
+    df["year"] = df["date"].dt.year
     
     return df
 
-
 # -------------------------------------------------------------
-# Spatial membership (cached)
+# 2. Spatial Mapping (Polygon -> H3)
 # -------------------------------------------------------------
-def build_group_h3_membership(gdf_poly: gpd.GeoDataFrame, resolution: int) -> pd.DataFrame:
+
+def map_groups_to_h3(gdf, resolution=5):
     """
-    Returns DataFrame: [gwgroupid, h3_index]
+    Performs H3 Polyfill to map each ethnic group to H3 cells.
+    Returns: DataFrame [gwgroupid, h3_index]
     """
-    cache_path = CACHE_DIR / f"geoepr_group_h3_membership_res{resolution}.parquet"
-
-    if cache_path.exists():
-        logger.info(f"Loading cached GeoEPR membership: {cache_path}")
-        df = pd.read_parquet(cache_path)
-        df["gwgroupid"] = df["gwgroupid"].astype("int64")
-        df["h3_index"] = df["h3_index"].astype("int64")
-        return df
-
-    logger.info("=" * 60)
-    logger.info(f"Building GeoEPR -> H3 membership (resolution={resolution})...")
-
-    rows = []
+    logger.info(f"Mapping ethnic polygons to H3 (Res {resolution})...")
     
-    for idx, r in gdf_poly.iterrows():
-        gid = int(r["gwgroupid"])
-        geom = r["geometry"]
-        if geom is None:
-            continue
-
+    mapping_rows = []
+    
+    for _, row in gdf.iterrows():
+        gid = row['gwgroupid']
+        geom = row['geometry']
+        
         try:
             cells = set()
-            geom_type = getattr(geom, "geom_type", None)
-
-            # [MINOR-3 FIX] Use polygon_to_cells instead of polyfill
-            if geom_type == "Polygon":
+            if geom.geom_type == 'Polygon':
                 exterior = [(y, x) for x, y in geom.exterior.coords]
-                holes = [[(y, x) for x, y in interior.coords] for interior in geom.interiors]
-                cells |= set(h3.polygon_to_cells(LatLngPoly(exterior, *holes), resolution))
-            elif geom_type == "MultiPolygon":
-                for part in geom.geoms:
-                    exterior = [(y, x) for x, y in part.exterior.coords]
-                    holes = [[(y, x) for x, y in interior.coords] for interior in part.interiors]
-                    cells |= set(h3.polygon_to_cells(LatLngPoly(exterior, *holes), resolution))
+                holes = [[(y, x) for x, y in i.coords] for i in geom.interiors]
+                cells.update(h3.polygon_to_cells(LatLngPoly(exterior, *holes), resolution))
+            elif geom.geom_type == 'MultiPolygon':
+                for poly in geom.geoms:
+                    exterior = [(y, x) for x, y in poly.exterior.coords]
+                    holes = [[(y, x) for x, y in i.coords] for i in poly.interiors]
+                    cells.update(h3.polygon_to_cells(LatLngPoly(exterior, *holes), resolution))
             
-            for c in cells:
-                rows.append({"gwgroupid": gid, "h3_index": int(c)})
+            for cell in cells:
+                # Ensure signed int64
+                h3_int = ensure_h3_int64(cell)
+                if h3_int is not None:
+                    mapping_rows.append({'gwgroupid': gid, 'h3_index': h3_int})
+                    
         except Exception as e:
-            logger.warning(f"  Failed to polyfill group {gid}: {e}")
             continue
 
-    if not rows:
-        raise RuntimeError("Failed to polyfill any GeoEPR polygons.")
-
-    df = pd.DataFrame(rows).drop_duplicates()
-    df["gwgroupid"] = df["gwgroupid"].astype("int64")
-    df["h3_index"] = df["h3_index"].astype("int64")
-
-    df.to_parquet(cache_path, index=False)
-    logger.info(f"✓ Built and cached {len(df):,} group-cell memberships")
+    if not mapping_rows:
+        raise RuntimeError("No H3 cells mapped from Ethnic Polygons.")
+        
+    df_map = pd.DataFrame(mapping_rows)
+    df_map['gwgroupid'] = df_map['gwgroupid'].astype(int)
+    df_map['h3_index'] = df_map['h3_index'].astype('int64')
     
-    return df
-
+    logger.info(f"✓ Mapped {len(gdf)} groups to {len(df_map)} cell-group pairs.")
+    return df_map
 
 # -------------------------------------------------------------
-# Feature aggregation (h3, year)
+# 3. Aggregation Logic
 # -------------------------------------------------------------
-def aggregate_epr_by_h3_year(membership: pd.DataFrame, epr_core: pd.DataFrame) -> pd.DataFrame:
-    logger.info("Aggregating EPR features to (h3_index, year)...")
 
-    df = membership.merge(epr_core, on="gwgroupid", how="inner")
+def calculate_shannon_entropy(status_series):
+    """Calculates Shannon Entropy (diversity) of status codes."""
+    if status_series.empty:
+        return 0.0
+    counts = status_series.value_counts()
+    if len(counts) <= 1:
+        return 0.0
+    probs = counts / counts.sum()
+    entropy = -np.sum(probs * np.log(probs))
+    # Normalize by log(N) to get 0-1 range if desired, 
+    # but standard Shannon entropy is standard.
+    # Here we return raw entropy as "Diversity" metric.
+    return float(entropy)
+
+def compute_yearly_h3_stats(df_map, df_status):
+    """
+    Joins Spatial Map with Temporal Status and aggregates by (H3, Year).
+    """
+    logger.info("Computing EPR statistics per (H3, Year)...")
     
-    if df.empty:
-        raise RuntimeError("Membership x EPR core join produced 0 rows.")
+    # Join: (H3, Group) x (Group, Year, Status) -> (H3, Group, Year, Status)
+    merged = df_map.merge(df_status, on='gwgroupid', how='inner')
+    
+    if merged.empty:
+        logger.warning("No overlap between spatial groups and status data.")
+        return pd.DataFrame()
 
-    g = df.groupby(["h3_index", "year"], as_index=False)
+    # Pre-calculate boolean flags for fast summing
+    merged['is_excluded'] = merged['status'].isin(['DISCRIMINATED', 'POWERLESS']).astype(int)
+    merged['is_discriminated'] = (merged['status'] == 'DISCRIMINATED').astype(int)
+    
+    # Map status to numeric score
+    merged['status_score'] = merged['status'].map(STATUS_SCORES).fillna(-2)
 
-    out = g.agg(
-        ethnic_group_count=("gwgroupid", "nunique"),
-        epr_excluded_groups_count=("is_excluded", "sum"),
-        epr_included_groups_count=("is_included", "sum"),
-        epr_discriminated_groups_count=("is_discriminated", "sum"),
-        epr_autonomy_groups_count=("has_autonomy", "sum"),
-        epr_status_mean=("status_numeric", "mean"),
-    )
+    # Aggregation
+    grouped = merged.groupby(['h3_index', 'year'])
+    
+    stats = grouped.agg(
+        ethnic_group_count=('gwgroupid', 'nunique'),
+        epr_excluded_groups_count=('is_excluded', 'sum'),
+        epr_discriminated_groups_count=('is_discriminated', 'sum'),
+        epr_status_mean=('status_score', 'mean')
+    ).reset_index()
 
-    out["epr_power_status_mode"] = g["status"].apply(_mode_or_unknown).values
-    out["epr_status_entropy"] = g["status"].apply(_shannon_entropy).values
-    out["epr_horizontal_inequality"] = out["epr_status_entropy"]
+    # Calculate Entropy (slower, apply separately)
+    # We group by [h3, year] and apply entropy to 'status'
+    entropy_df = grouped['status'].apply(calculate_shannon_entropy).reset_index(name='epr_status_entropy')
+    
+    # Merge entropy back
+    stats = stats.merge(entropy_df, on=['h3_index', 'year'])
+    
+    # Alias for interpretability
+    stats['epr_horizontal_inequality'] = stats['epr_status_entropy']
 
-    out["h3_index"] = out["h3_index"].astype("int64")
-    out["year"] = out["year"].astype(int)
-
-    return out
-
+    return stats
 
 # -------------------------------------------------------------
-# Upsert into temporal_features
+# 4. Main Execution
 # -------------------------------------------------------------
-def upsert_into_temporal_features(engine, temporal_keys: pd.DataFrame, epr_by_year: pd.DataFrame):
-    logger.info("Merging EPR features onto temporal spine...")
 
-    merged = temporal_keys.merge(
-        epr_by_year,
-        on=["h3_index", "year"],
-        how="left"
-    )
-
-    fill_zero_cols = [
-        "ethnic_group_count",
-        "epr_excluded_groups_count",
-        "epr_included_groups_count",
-        "epr_discriminated_groups_count",
-        "epr_autonomy_groups_count",
-    ]
-    for c in fill_zero_cols:
-        merged[c] = merged[c].fillna(0).astype(int)
-
-    merged["epr_status_mean"] = merged["epr_status_mean"].fillna(0.0).astype(float)
-    merged["epr_status_entropy"] = merged["epr_status_entropy"].fillna(0.0).astype(float)
-    merged["epr_horizontal_inequality"] = merged["epr_horizontal_inequality"].fillna(0.0).astype(float)
-    merged["epr_power_status_mode"] = merged["epr_power_status_mode"].fillna("UNKNOWN").astype(str)
-
-    out_cols = [
-        "h3_index",
-        "date",
-        "ethnic_group_count",
-        "epr_excluded_groups_count",
-        "epr_included_groups_count",
-        "epr_discriminated_groups_count",
-        "epr_autonomy_groups_count",
-        "epr_power_status_mode",
-        "epr_status_mean",
-        "epr_status_entropy",
-        "epr_horizontal_inequality",
-    ]
-    out = merged[out_cols].copy()
-
-    logger.info("  Ensuring EPR columns exist in database...")
-    ensure_columns(engine, SCHEMA, TARGET_TABLE, {
-        "ethnic_group_count": "INTEGER",
-        "epr_excluded_groups_count": "INTEGER",
-        "epr_included_groups_count": "INTEGER",
-        "epr_discriminated_groups_count": "INTEGER",
-        "epr_autonomy_groups_count": "INTEGER",
-        "epr_power_status_mode": "TEXT",
-        "epr_status_mean": "DOUBLE PRECISION",
-        "epr_status_entropy": "DOUBLE PRECISION",
-        "epr_horizontal_inequality": "DOUBLE PRECISION",
-    })
-
-    logger.info(f"  Upserting {len(out):,} rows into {SCHEMA}.{TARGET_TABLE}...")
-    chunk_size = 250_000
-    for i in range(0, len(out), chunk_size):
-        chunk = out.iloc[i:i + chunk_size].copy()
-        upload_to_postgis(engine, chunk, TARGET_TABLE, SCHEMA, ["h3_index", "date"])
-
-    logger.info("✅ EPR features successfully upserted into temporal_features")
-
-
-def main():
-    logger.info("STEP 3.3: EPR FEATURE ENGINEERING (TIME-VARYING)")
+def run():
+    logger.info("="*60)
+    logger.info("EPR FEATURE ENGINEERING (Robust Umbrella Exclusion)")
+    logger.info("="*60)
+    
     engine = None
     try:
-        # [CRITICAL-1 FIX] Correct config loading (features_cfg)
-        data_cfg, features_cfg, _ = load_configs()
+        data_cfg, feat_cfg, _ = load_configs()
         engine = get_db_engine()
-
+        
+        # 1. Config
         start_date = data_cfg["global_date_window"]["start_date"]
         end_date = data_cfg["global_date_window"]["end_date"]
-        min_year = int(start_date[:4])
-        max_year = int(end_date[:4])
+        start_year = int(start_date[:4])
+        end_year = int(end_date[:4])
+        resolution = feat_cfg["spatial"]["h3_resolution"]
+        
+        # 2. Load Inputs
+        gdf_poly = load_and_filter_polygons(engine)
+        df_status = load_epr_core_status(engine, start_year, end_year)
+        
+        # 3. Spatial Map
+        df_map = map_groups_to_h3(gdf_poly, resolution)
+        
+        # 4. Compute Yearly Stats
+        df_yearly = compute_yearly_h3_stats(df_map, df_status)
+        
+        if df_yearly.empty:
+            logger.warning("No yearly stats computed. Exiting.")
+            return
 
-        # [CRITICAL-1 FIX] Load resolution from features config
-        resolution = int(features_cfg["spatial"]["h3_resolution"])
-
-        # 1) Load keys
-        temporal_keys = load_temporal_keys(engine, start_date, end_date)
-
-        # 2) Load polygons + core
-        gdf_poly = load_geoepr_polygons(engine)
-        df_core = load_epr_core(engine, min_year=min_year, max_year=max_year)
-
-        # 3) Build or load cached membership
-        membership = build_group_h3_membership(gdf_poly, resolution)
-
-        # 4) Aggregate per (h3, year)
-        epr_by_year = aggregate_epr_by_h3_year(membership, df_core)
-
-        # 5) Upsert
-        upsert_into_temporal_features(engine, temporal_keys, epr_by_year)
-
-        logger.info("✅ EPR FEATURE CALCULATION COMPLETE")
+        # 5. Broadcast to 14-Day Spine
+        logger.info("Broadcasting yearly stats to 14-day temporal spine...")
+        df_spine = load_temporal_spine_keys(engine, start_date, end_date)
+        
+        # Merge on (h3_index, year)
+        # We use a LEFT JOIN on the spine to ensure every target row gets data
+        # Fill NA with 0 for counts, and neutral values for others
+        final_df = df_spine.merge(df_yearly, on=['h3_index', 'year'], how='left')
+        
+        # Fill NaNs (Cells with no ethnic groups mapped)
+        fill_values = {
+            'ethnic_group_count': 0,
+            'epr_excluded_groups_count': 0,
+            'epr_discriminated_groups_count': 0,
+            'epr_status_mean': -2.0,       # Irrelevant
+            'epr_status_entropy': 0.0,
+            'epr_horizontal_inequality': 0.0
+        }
+        final_df.fillna(fill_values, inplace=True)
+        
+        # 6. Database Upsert
+        # Ensure schema
+        cols_to_upload = [
+            'h3_index', 'date', 
+            'ethnic_group_count', 'epr_excluded_groups_count', 
+            'epr_discriminated_groups_count', 'epr_status_mean', 
+            'epr_status_entropy', 'epr_horizontal_inequality'
+        ]
+        
+        # Create columns if missing (Schema Evolution)
+        with engine.begin() as conn:
+            for col in cols_to_upload[2:]: # Skip keys
+                dtype = 'INTEGER' if 'count' in col else 'FLOAT'
+                conn.execute(text(f"""
+                    ALTER TABLE {SCHEMA}.{TARGET_TABLE} 
+                    ADD COLUMN IF NOT EXISTS {col} {dtype}
+                """))
+        
+        logger.info(f"Upserting {len(final_df):,} rows to {SCHEMA}.{TARGET_TABLE}...")
+        
+        # Chunked upload for memory safety
+        chunk_size = 100000
+        total = len(final_df)
+        for i in range(0, total, chunk_size):
+            chunk = final_df[cols_to_upload].iloc[i:i+chunk_size]
+            upload_to_postgis(
+                engine, 
+                chunk, 
+                TARGET_TABLE, 
+                SCHEMA, 
+                primary_keys=['h3_index', 'date']
+            )
+            print(f"  Processed {min(i+chunk_size, total)}/{total}", end='\r')
+            
+        logger.info("\n✅ EPR Features Calculation Complete.")
 
     except Exception as e:
-        logger.error(f"❌ EPR Calculation Failed: {e}", exc_info=True)
-        raise
+        logger.critical(f"EPR Pipeline Failed: {e}", exc_info=True)
+        sys.exit(1)
     finally:
-        if engine:
-            engine.dispose()
+        if engine: engine.dispose()
 
+def main():
+    run()
 
 if __name__ == "__main__":
     main()
