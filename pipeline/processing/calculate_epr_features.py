@@ -170,7 +170,9 @@ def map_groups_to_h3(gdf, resolution=5):
             continue
 
     if not mapping_rows:
-        raise RuntimeError("No H3 cells mapped from Ethnic Polygons.")
+        # It's possible no polygons map if they are small or outside boundaries
+        logger.warning("No H3 cells mapped from Ethnic Polygons.")
+        return pd.DataFrame(columns=['gwgroupid', 'h3_index'])
         
     df_map = pd.DataFrame(mapping_rows)
     df_map['gwgroupid'] = df_map['gwgroupid'].astype(int)
@@ -192,9 +194,6 @@ def calculate_shannon_entropy(status_series):
         return 0.0
     probs = counts / counts.sum()
     entropy = -np.sum(probs * np.log(probs))
-    # Normalize by log(N) to get 0-1 range if desired, 
-    # but standard Shannon entropy is standard.
-    # Here we return raw entropy as "Diversity" metric.
     return float(entropy)
 
 def compute_yearly_h3_stats(df_map, df_status):
@@ -203,6 +202,9 @@ def compute_yearly_h3_stats(df_map, df_status):
     """
     logger.info("Computing EPR statistics per (H3, Year)...")
     
+    if df_map.empty:
+        return pd.DataFrame()
+
     # Join: (H3, Group) x (Group, Year, Status) -> (H3, Group, Year, Status)
     merged = df_map.merge(df_status, on='gwgroupid', how='inner')
     
@@ -279,8 +281,6 @@ def run():
         df_spine = load_temporal_spine_keys(engine, start_date, end_date)
         
         # Merge on (h3_index, year)
-        # We use a LEFT JOIN on the spine to ensure every target row gets data
-        # Fill NA with 0 for counts, and neutral values for others
         final_df = df_spine.merge(df_yearly, on=['h3_index', 'year'], how='left')
         
         # Fill NaNs (Cells with no ethnic groups mapped)
@@ -294,6 +294,15 @@ def run():
         }
         final_df.fillna(fill_values, inplace=True)
         
+        # --- FIX: Explicitly cast count columns to Integer to avoid "0.0" error ---
+        int_cols = [
+            'ethnic_group_count', 
+            'epr_excluded_groups_count', 
+            'epr_discriminated_groups_count'
+        ]
+        for c in int_cols:
+            final_df[c] = final_df[c].astype(int)
+
         # 6. Database Upsert
         # Ensure schema
         cols_to_upload = [

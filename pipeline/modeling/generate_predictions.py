@@ -10,6 +10,9 @@ This script:
 - Reconstructs PCA features if required
 - Generates predictions (probability, magnitude, risk)
 - Saves results to CSV and to Postgres (predictions_latest)
+
+FIXES:
+- Automatically detects learner suffix (e.g. _xgboost, _lightgbm) to match train_models.py output.
 """
 
 import sys
@@ -23,9 +26,9 @@ from sqlalchemy.engine import Engine as SqlEngine
 
 # Make sure root is on path so we can import utils
 file_path = Path(__file__).resolve()
-sys.path.insert(0, str(file_path.parent.parent.parent))  # adjust if needed
+sys.path.insert(0, str(file_path.parent.parent.parent))
 
-from utils import logger, PATHS, get_db_engine, load_configs, SCHEMA  # noqa: E402
+from utils import logger, PATHS, get_db_engine, load_configs, SCHEMA
 
 
 def load_feature_matrix() -> pd.DataFrame:
@@ -39,7 +42,6 @@ def load_feature_matrix() -> pd.DataFrame:
     logger.info(f"Loading feature matrix from: {feature_matrix_path}")
     df = pd.read_parquet(feature_matrix_path)
     
-    # Fixed: Removed redundant empty checks (P3-1)
     if df.empty:
         logger.warning('Feature matrix is empty - downstream features may be missing')
         
@@ -48,14 +50,7 @@ def load_feature_matrix() -> pd.DataFrame:
 
 def apply_pca_if_needed(df: pd.DataFrame, bundle: Dict[str, Any]) -> pd.DataFrame:
     """
-    If the model bundle contains PCA information, recreate the PCA components
-    on the new feature matrix.
-
-    Expects bundle keys:
-        - 'pca': fitted PCA object (or None)
-        - 'pca_scaler': fitted scaler used before PCA
-        - 'pca_input_features': list of original feature names for PCA
-        - 'pca_component_names': names used for PCA component columns
+    If the model bundle contains PCA information, recreate the PCA components.
     """
     pca = bundle.get("pca")
     scaler = bundle.get("pca_scaler")
@@ -70,9 +65,10 @@ def apply_pca_if_needed(df: pd.DataFrame, bundle: Dict[str, Any]) -> pd.DataFram
 
     missing = [c for c in input_features if c not in df.columns]
     if missing:
-        raise ValueError(
-            f"Missing PCA input features in feature matrix: {missing}"
-        )
+        # Fill missing PCA inputs with 0 to prevent crash during prediction
+        logger.warning(f"Missing PCA inputs: {missing}. Filling with 0.")
+        for c in missing:
+            df[c] = 0.0
 
     X_input = df[input_features].fillna(0.0)
     X_scaled = scaler.transform(X_input)
@@ -80,7 +76,6 @@ def apply_pca_if_needed(df: pd.DataFrame, bundle: Dict[str, Any]) -> pd.DataFram
 
     n_components = X_pca.shape[1]
     if not component_names or len(component_names) != n_components:
-        # Fallback: name components generically if names are missing/mismatched
         component_names = [f"pca_{i+1}" for i in range(n_components)]
 
     df_out = df.copy()
@@ -91,6 +86,34 @@ def apply_pca_if_needed(df: pd.DataFrame, bundle: Dict[str, Any]) -> pd.DataFram
     return df_out
 
 
+def resolve_model_path(horizon: str) -> Path:
+    """
+    Finds the model file, handling the learner suffix (xgboost/lightgbm).
+    Prioritizes XGBoost if both exist.
+    """
+    model_dir = PATHS["root"] / "models"
+    
+    # 1. Try XGBoost (Default preference)
+    p_xgb = model_dir / f"two_stage_ensemble_{horizon}_xgboost.pkl"
+    if p_xgb.exists():
+        return p_xgb
+        
+    # 2. Try LightGBM
+    p_lgb = model_dir / f"two_stage_ensemble_{horizon}_lightgbm.pkl"
+    if p_lgb.exists():
+        return p_lgb
+        
+    # 3. Try legacy generic name
+    p_generic = model_dir / f"two_stage_ensemble_{horizon}.pkl"
+    if p_generic.exists():
+        return p_generic
+        
+    raise FileNotFoundError(
+        f"Could not find model for horizon '{horizon}' in {model_dir}. "
+        f"Checked: {p_xgb.name}, {p_lgb.name}, {p_generic.name}"
+    )
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         logger.error("Usage: python generate_predictions.py <horizon> (e.g., 14d, 1m, 3m)")
@@ -98,14 +121,6 @@ def main() -> None:
 
     horizon = sys.argv[1]
     logger.info(f"=== GENERATING PREDICTIONS FOR HORIZON: {horizon} ===")
-
-    # Load configs (if you want to use them later, e.g., thresholds)
-    try:
-        data_config, features_config, models_config = load_configs()
-    except Exception:
-        # If load_configs returns a single dict in your version, adapt as needed
-        logger.warning("load_configs() signature differs; not using configs directly.")
-        data_config = features_config = models_config = None
 
     # Load feature matrix
     df = load_feature_matrix()
@@ -115,16 +130,8 @@ def main() -> None:
         if col not in df.columns:
             raise ValueError(f"Feature matrix is missing required column: {col}")
 
-    # Load model bundle
-    model_dir = PATHS["root"] / "models"
-    model_path = model_dir / f"two_stage_ensemble_{horizon}.pkl"
-
-    if not model_path.exists():
-        raise FileNotFoundError(
-            f"Model bundle not found at {model_path}. "
-            f"Make sure train_models.py saved two_stage_ensemble_{horizon}.pkl"
-        )
-
+    # Load model bundle (Auto-resolving learner name)
+    model_path = resolve_model_path(horizon)
     logger.info(f"Loading model bundle from: {model_path}")
     bundle = joblib.load(model_path)
 
@@ -138,8 +145,6 @@ def main() -> None:
     # Rebuild PCA features if the model uses PCA
     df_features = apply_pca_if_needed(df, bundle)
 
-    # For prediction, we can just pass the full feature frame; TwoStageEnsemble
-    # will slice the needed columns via theme['features'] internally.
     X = df_features
 
     logger.info("Running ensemble.predict() on feature matrix...")
@@ -171,6 +176,9 @@ def main() -> None:
         logger.error(f"Failed to obtain DB engine, skipping DB write: {e}")
     else:
         logger.info(f"Writing predictions to {SCHEMA}.predictions_latest (replace)...")
+        # Ensure H3 is BigInt
+        pred_df["h3_index"] = pred_df["h3_index"].astype("int64")
+        
         pred_df.to_sql(
             "predictions_latest",
             engine,
