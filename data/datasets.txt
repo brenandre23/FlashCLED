@@ -1,0 +1,23 @@
+Data Source,Time Range,Update Frequency / Granularity,Confidence
+World Bank Admin-0 Boundaries,Static (current; latest release 2025),Irregular (static dataset),Medium
+WorldPop Population (Global 1 & 2),2000–2020 & 2015–2030 (annual estimates),Annual (yearly) updates,High
+Copernicus Global DEM (90m),Data acquired 2011–2015 (released 2019; maintained through 2026),Static (one-time release),High
+OSM (roads, built-up) & SIGCAF Settlements,OSM: 2004–present; SIGCAF (CAR settlements): 2014–2018,OSM: continuous (near-daily extracts); SIGCAF: static (no updates),Medium
+GRIP4 (Global Roads Inventory),2018 (release year),Static (no updates),Low
+HydroRIVERS (HydroSHEDS),Static (SRTM-based rivers compiled around 2019),Static (no updates),Medium
+IPIS CAR Mines,2019 (survey),Static (no updates),Medium
+Brent Oil Price (EIA PET.RBRTE.D),1987–present (daily),Daily (Mon–Fri) prices,High
+VIIRS Nightlights (NASA VNP46A2),2012-01-19–present,Daily (nightly composites),High
+WFP VAM Market Prices,2000s–present (monthly data),Monthly,Medium
+FEWS NET Food Data Warehouse (prices),1995–present (monthly),Monthly,Medium
+FAOSTAT CPI (All items),2000–present,Quarterly releases (monthly indices),High
+IPC (Acute Food Insecurity, FEWS/IP),2016–present,Irregular (periodic IPC analyses and reports),Low
+EPR (Ethnic Power Relations),1946–2021,Static (annual data up to 2021),High
+IOM DTM (Displacement Tracking),2000s–present,Continuous (typically monthly or periodic updates),Medium
+GDELT Event Database,1979–present,Every 15 minutes (near real-time),High
+IODA (Internet Outages),2016–present,Continuous (real-time updates),Low
+ERA5 Reanalysis,1940–present,Daily updates with about 5-day latency,High
+ESA CCI Soil Moisture,1978–2023,Annual releases (v09.1 covers to 2023),Medium
+CHIRPS Precipitation,1981–present,About 3 times per month (pentadal updates) plus monthly products,High
+Vegetation Health Index (NOAA/STAR),1982–present,Weekly composites,Medium
+NASA FIRMS Fire (MODIS, VIIRS),MODIS: 2000–present; VIIRS: 2012–present,Daily / near real-time active fire detections,High

@@ -33,7 +33,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if "utils" not in sys.modules:
     sys.path.append(str(ROOT_DIR))
 
-from utils import logger, PATHS, get_db_engine, load_configs, SCHEMA, ensure_h3_int64
+from utils import logger, PATHS, get_db_engine, load_configs, SCHEMA, ensure_h3_int64, validate_h3_types
 
 
 def get_required_features(models_cfg: Dict[str, Any]) -> List[str]:
@@ -240,6 +240,8 @@ def run(
     logger.info("=" * 60)
     logger.info("BUILDING FEATURE MATRIX (Fixed Dynamic Version)")
     logger.info("=" * 60)
+
+    validate_h3_types(engine)
     
     data_cfg = configs["data"]
     models_cfg = configs["models"]
@@ -326,6 +328,25 @@ def run(
     if master_df is None or master_df.empty:
         logger.error("Query returned no data! Check database population.")
         sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # TYPE SAFETY: Distance features must be numeric (not object) to
+    # avoid model crashes when columns are entirely null/empty (e.g.,
+    # dist_to_controlled_mine when no roadblocks exist).
+    # ------------------------------------------------------------------
+    dist_cols = [c for c in master_df.columns if c.startswith("dist_")]
+    if dist_cols:
+        logger.info(f"Enforcing numeric types for distance columns: {dist_cols}")
+        MAX_DISTANCE_KM = 500.0
+        for col in dist_cols:
+            master_df[col] = pd.to_numeric(master_df[col], errors="coerce")
+            null_pct = master_df[col].isna().mean()
+            if null_pct == 1.0:
+                logger.warning(f"  ⚠ {col} is 100% null — filling with sentinel {MAX_DISTANCE_KM} km.")
+                master_df[col] = MAX_DISTANCE_KM
+            elif null_pct > 0.5:
+                logger.warning(f"  ⚠ {col} has {null_pct:.1%} nulls.")
+            master_df[col] = master_df[col].astype("float32")
 
     logger.info(f"Final Matrix Shape: {master_df.shape}")
     

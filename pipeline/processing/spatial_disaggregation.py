@@ -1,305 +1,360 @@
 """
-spatial_disaggregation.py
-=========================
-Distributes Admin-Level Data (IOM DTM + IPC) to H3 Grid Cells.
+pipeline/processing/spatial_disaggregation.py
+=============================================
+Spatial disaggregation from admin boundaries to H3 grid.
 
-FIXES APPLIED:
-- [CRITICAL] Replaces "CREATE IF NOT EXISTS" with "DROP + CREATE" to enforce 
-  Primary Key constraints required for ON CONFLICT upserts.
-- [MAJOR] Includes IPC disaggregation logic.
+UPDATES:
+1. IOM FIX: Reads from 'iom_dtm_raw' (was iom_displacement).
+2. COLUMN FIX: Maps 'individuals' -> displacement_sum, 'reporting_date' -> date.
+3. IPC REMOVED: Removed all food security disaggregation logic.
+4. ADMIN MAPPING: Preserves IOM Admin2 -> WBG Admin3 mapping logic.
 """
 
 import sys
-import re
-import unicodedata
-from pathlib import Path
-import geopandas as gpd
 import pandas as pd
-from sqlalchemy import text
+import geopandas as gpd
+import numpy as np
+from pathlib import Path
+from sqlalchemy import text, inspect
+from typing import Dict, List, Optional, Tuple
 
-# --- Import Utils ---
+# --- Setup paths ---
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from utils import logger, PATHS, get_db_engine, load_configs, upload_to_postgis
+from utils import logger, get_db_engine, load_configs, upload_to_postgis, SCHEMA
 
-SCHEMA = "car_cewp"
+# --- Constants ---
+POPULATION_TABLE = "population_h3"
+IOM_SOURCE_TABLE = "iom_dtm_raw"  # Updated to match fetch_iom.py
 
-# ---------------------------------------------------------------------
-# 1. HELPER: NORMALIZATION & MAPPING
-# ---------------------------------------------------------------------
-def normalize_name(name):
-    """Standardizes Admin Names (lowercase, no accents, no suffixes)."""
-    if pd.isna(name) or str(name).lower() in ["nan", "none", ""]:
-        return "none"
+
+def _infer_pcode_col(gdf: gpd.GeoDataFrame, level: str) -> Optional[str]:
+    """Infer the p-code column name from a GeoDataFrame."""
+    candidates = []
+    
+    if level == "admin1":
+        candidates = ["ADM1_PCODE", "adm1_pcode", "PCODE", "pcode", "ADM1_CODE"]
+    elif level == "admin2":
+        candidates = ["ADM2_PCODE", "adm2_pcode", "PCODE", "pcode", "ADM2_CODE"]
+    elif level == "admin3":
+        # CRITICAL: Admin3 often uses adm2_pcode in WBG data due to naming inconsistencies
+        candidates = ["adm2_pcode", "ADM3_PCODE", "adm3_pcode", "PCODE", "pcode", "ADM3_CODE"]
+    
+    for col in candidates:
+        if col in gdf.columns:
+            logger.info(f"  Using p-code column: {col}")
+            return col
+    return None
+
+
+def _infer_name_col(gdf: gpd.GeoDataFrame, level: str) -> Optional[str]:
+    """Infer the admin name column from a GeoDataFrame."""
+    candidates = []
+    
+    if level == "admin1":
+        candidates = ["ADM1_REF", "ADM1_NAME", "adm1_name", "NAME_1", "NAM_1", "name"]
+    elif level == "admin2":
+        candidates = ["ADM2_REF", "ADM2_NAME", "adm2_name", "NAME_2", "NAM_2", "name"]
+    elif level == "admin3":
+        # CRITICAL: Admin3 often uses adm2_ref_name or adm2_name in WBG data
+        candidates = ["adm2_ref_name", "adm2_name", "ADM3_REF", "ADM3_NAME", "adm3_name", "NAME_3", "NAM_3", "name"]
+    
+    for col in candidates:
+        if col in gdf.columns:
+            logger.info(f"  Using name column: {col}")
+            return col
+    return None
+
+
+def normalize_name(name: str) -> str:
+    """Normalize admin unit names for fuzzy matching."""
+    if pd.isna(name):
+        return ""
+    
+    name = str(name).lower().strip()
+    
+    # Remove common prefixes
+    prefixes = ["prefecture de ", "prefecture ", "sous-prefecture de ", "sous-prefecture "]
+    for prefix in prefixes:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    
+    # Remove accents
+    accent_map = {
+        'é': 'e', 'è': 'e', 'ê': 'e', 'ë': 'e',
+        'à': 'a', 'â': 'a', 'ä': 'a',
+        'ô': 'o', 'ö': 'o',
+        'û': 'u', 'ü': 'u',
+        'ç': 'c', 'î': 'i', 'ï': 'i'
+    }
+    for accented, plain in accent_map.items():
+        name = name.replace(accented, plain)
+    
+    # Remove punctuation and extra spaces
+    name = ''.join(c if c.isalnum() else ' ' for c in name)
+    name = ' '.join(name.split())
+    
+    return name
+
+
+def build_admin_h3_map(engine, data_cfg: Dict, features_cfg: Dict) -> Dict[str, Dict]:
+    """
+    Build mapping from admin units (admin1, admin2, admin3) to H3 cells.
+    Includes admin3 support for IOM sub-prefecture mapping.
+    """
+    logger.info("Building Admin→H3 mapping...")
+    
+    admin_map = {
+        "admin1": {"by_pcode": {}, "by_name": {}},
+        "admin2": {"by_pcode": {}, "by_name": {}},
+        "admin3": {"by_pcode": {}, "by_name": {}}
+    }
+    
+    # Load H3 grid
+    h3_gdf = gpd.read_postgis(
+        f"SELECT h3_index, geometry FROM {SCHEMA}.features_static",
+        engine,
+        geom_col="geometry"
+    )
+    h3_gdf["h3_index"] = h3_gdf["h3_index"].astype("int64")
+    
+    # Load population data for weighting
+    inspector = inspect(engine)
+    if inspector.has_table(POPULATION_TABLE, schema=SCHEMA):
+        pop_df = pd.read_sql(
+            f"SELECT h3_index, year, pop_count FROM {SCHEMA}.{POPULATION_TABLE}",
+            engine
+        )
+        pop_df["h3_index"] = pop_df["h3_index"].astype("int64")
         
-    s = str(name).lower().strip()
-    s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("utf-8")
-    s = re.sub(r"[-_]", " ", s)
-    s = s.replace("sub prefecture", "").replace("prefecture", "")
-    s = re.sub(r"[^\w\s]", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-SUBPREFECTURE_MAPPING = {
-    "kaga bandoro": "kaga bandoro", "mbres": "mbres", "ndele": "ndele",
-    "bamingui": "bamingui", "bossangoa": "bossangoa", "markounda": "markounda",
-    "nana bakassa": "nana bakassa", "nanga boguila": "nanga boguila",
-    "bouca": "bouca", "batangafo": "batangafo", "kabo": "kabo",
-    "bozum": "bozoum", "bozoum": "bozoum", "bocaranga": "bocaranga",
-    "koui": "koui", "paoua": "paoua", "ngaoundaye": "ngaoundaye",
-    "bimbo": "bimbo", "begoua": "begoua", "boali": "boali", "damara": "damara",
-    "bogangolo": "bogangolo", "yaloke": "yaloke", "bossembele": "bossembele",
-    "mbaiki": "mbaiki", "boda": "boda", "mongoumba": "mongoumba",
-    "boganangone": "boganangone", "boganda": "boganda", "berberati": "berberati",
-    "gamboula": "gamboula", "dede makouba": "dede makouba", "carnot": "carnot",
-    "amada gaza": "amada gaza", "gadzi": "gadzi", "bouar": "bouar",
-    "baboua": "baboua", "baoro": "baoro", "abba": "abba", "nola": "nola",
-    "bambio": "bambio", "bayanga": "bayanga", "sibut": "sibut", "dekoa": "dekoa",
-    "mala": "mala", "ndjoukou": "ndjoukou", "bambari": "bambari",
-    "grimari": "grimari", "kouango": "kouango", "ippy": "ippy", "bakala": "bakala",
-    "mobaye": "mobaye", "alindao": "alindao", "kembe": "kembe",
-    "mingala": "mingala", "satema": "satema", "zangba": "zangba", "bria": "bria",
-    "ouadda": "ouadda", "yalinga": "yalinga", "bangassou": "bangassou",
-    "rafai": "rafai", "gambo": "gambo", "ouango": "ouango", "bakouma": "bakouma",
-    "obo": "obo", "zemio": "zemio", "bambouti": "bambouti", "djema": "djehma",
-    "djemah": "djehma", "birao": "birao", "ouanda djalle": "ouanda djalle",
-    "bangui centre": "bangui", "bangui fleuve": "bangui", "bangui kagas": "bangui",
-    "bangui rapide": "bangui", "bangui rapides": "bangui",
-    "sido": "kabo", "nana outa": "nana bakassa",
-    "ndim": "ngaoundaye", "taley": "paoua", "tale": "paoua",
-    "ouandja": "ouadda", "ouandja kotto": "ouadda", "sam ouandja": "ouadda"
-}
-
-def _apply_mappings(df, col_name):
-    if col_name in df.columns:
-        df[col_name] = df[col_name].replace(SUBPREFECTURE_MAPPING)
-    return df
-
-# ---------------------------------------------------------------------
-# 2. DATA LOADING
-# ---------------------------------------------------------------------
-def load_admin_boundaries(data_config, target_crs):
-    admin_cfg = data_config.get("admin_boundaries", {})
-    
-    path1 = ROOT_DIR / admin_cfg.get("admin1_path", "data/raw/wbgCAFadmin1.geojson")
-    if not path1.exists(): raise FileNotFoundError(f"Admin 1 not found: {path1}")
-    
-    gdf1 = gpd.read_file(path1)
-    col1 = next((c for c in gdf1.columns if c.lower() in ["adm1_name", "nam_1", "name_1", "admin1name"]), None)
-    if not col1: raise ValueError(f"No Admin 1 name column found in {path1}")
-    
-    gdf1['admin1_key'] = gdf1[col1].apply(normalize_name)
-    gdf1 = gdf1[['admin1_key', 'geometry']].to_crs(target_crs)
-    gdf1['admin_level'] = 1
-
-    path_sub = ROOT_DIR / "data/raw/wbgCAFadmin3.geojson"
-    if not path_sub.exists(): raise FileNotFoundError(f"Sub-prefecture file not found: {path_sub}")
-    
-    gdf_sub = gpd.read_file(path_sub)
-    col_sub = "adm2_name"
-    if col_sub not in gdf_sub.columns:
-        col_sub = next((c for c in gdf_sub.columns if c.lower() in ["nam_2", "name_2", "adm2_name"]), None)
-    
-    gdf_sub['admin2_key'] = gdf_sub[col_sub].apply(normalize_name)
-    gdf_sub = gdf_sub[['admin2_key', 'geometry']].to_crs(target_crs)
-    gdf_sub['admin_level'] = 2 
-    
-    return gdf1, gdf_sub
-
-def load_h3_grid(engine, target_crs):
-    query = f"SELECT h3_index, geometry FROM {SCHEMA}.features_static"
-    gdf = gpd.read_postgis(query, engine, geom_col="geometry")
-    return gdf.to_crs(target_crs)
-
-def load_iom_data():
-    path = PATHS['data_proc'] / "iom_displacement_data.csv"
-    if not path.exists(): return None
-    
-    df = pd.read_csv(path)
-    col_a1 = next((c for c in df.columns if "admin1" in c.lower()), None)
-    col_a2 = next((c for c in df.columns if "admin2" in c.lower()), None)
-    
-    if not col_a1 or not col_a2: return None
-
-    df['admin1_key'] = df[col_a1].apply(normalize_name)
-    df['admin2_key'] = df[col_a2].apply(normalize_name)
-    df = _apply_mappings(df, 'admin2_key')
-    df['date'] = pd.to_datetime(df['date']).dt.date
-    return df
-
-# ---------------------------------------------------------------------
-# 3. SPATIAL DISAGGREGATION LOGIC
-# ---------------------------------------------------------------------
-def distribute_iom(engine, data_config, features_config):
-    target_crs = features_config.get('spatial', {}).get('crs', {}).get('metric', 'EPSG:32634')
-    logger.info(f"Starting IOM Disaggregation using {target_crs}...")
-    
-    # Load Data
-    gdf_pref, gdf_subpref = load_admin_boundaries(data_config, target_crs)
-    df_iom = load_iom_data()
-    gdf_h3 = load_h3_grid(engine, target_crs)
-    
-    if df_iom is None: 
-        logger.warning("No IOM data found.")
-        return
-
-    # Calculate Area for Density Checks
-    gdf_h3['h3_area'] = gdf_h3.geometry.area
-
-    dates = sorted(df_iom['date'].unique())
-    logger.info(f"Processing {len(dates)} dates...")
-    
-    all_results = []
-    unmatched_subpref = set()
-
-    for d in dates:
-        day_data = df_iom[df_iom['date'] == d].copy()
-        
-        # --- ATTEMPT 1: Match IOM Admin 2 -> Sub-prefecture Shapefile ---
-        merged_sub = gdf_subpref.merge(day_data, on='admin2_key', how='inner')
-        
-        # Track what failed
-        matched_keys = set(merged_sub['admin2_key'].unique())
-        failed_rows = day_data[~day_data['admin2_key'].isin(matched_keys)].copy()
-        unmatched_subpref.update(failed_rows['admin2_key'].unique())
-
-        # --- ATTEMPT 2: Fallback to Prefecture (Admin 1) ---
-        fallback_data = []
-        if not failed_rows.empty:
-            grp = failed_rows.groupby('admin1_key')['individuals'].sum().reset_index()
-            merged_pref = gdf_pref.merge(grp, on='admin1_key', how='inner')
-            fallback_data = [merged_pref]
-
-        # Combine streams
-        to_process = [merged_sub] + fallback_data
-        combined_poly = pd.concat(to_process, ignore_index=True)
-        
-        if combined_poly.empty:
-            continue
-
-        # --- SPATIAL INTERSECTION ---
-        # 1. Density = People / Polygon Area
-        combined_poly['poly_area'] = combined_poly.geometry.area
-        combined_poly['density'] = combined_poly['individuals'] / combined_poly['poly_area']
-        
-        # 2. Overlay H3 on Polygons
-        intersection = gpd.overlay(gdf_h3, combined_poly, how='intersection')
-        
-        # 3. Fragment Pop = Density * Fragment Area
-        intersection['frag_pop'] = intersection['density'] * intersection.geometry.area
-        
-        # 4. Sum up fragments per H3 cell
-        daily_h3 = intersection.groupby('h3_index')['frag_pop'].sum().reset_index()
-        daily_h3['date'] = d
-        
-        all_results.append(daily_h3)
-
-    if unmatched_subpref:
-        logger.warning(f"FALLBACK: {len(unmatched_subpref)} IOM Sub-prefectures mapped to Prefecture level.")
-
-    if all_results:
-        final_df = pd.concat(all_results, ignore_index=True)
-        final_df.rename(columns={'frag_pop': 'iom_displacement_sum'}, inplace=True)
-        final_df['source'] = 'IOM_DTM'
-        
-        logger.info(f"Generated {len(final_df)} H3 records. Uploading...")
-        
-        # [CRITICAL FIX] Drop table to guarantee Primary Key creation
-        with engine.begin() as conn:
-            conn.execute(text(f"DROP TABLE IF EXISTS {SCHEMA}.iom_displacement_h3"))
-            conn.execute(text(f"""
-                CREATE TABLE {SCHEMA}.iom_displacement_h3 (
-                    h3_index BIGINT, 
-                    date DATE, 
-                    iom_displacement_sum FLOAT, 
-                    source TEXT, 
-                    PRIMARY KEY (h3_index, date)
-                )
-            """))
-            
-        upload_to_postgis(engine, final_df, "iom_displacement_h3", SCHEMA, ["h3_index", "date"])
-        logger.info("IOM Disaggregation Complete.")
+        # Use most recent year's population
+        latest_year = pop_df["year"].max()
+        pop_latest = pop_df[pop_df["year"] == latest_year][["h3_index", "pop_count"]]
+        h3_gdf = h3_gdf.merge(pop_latest, on="h3_index", how="left")
+        h3_gdf["pop_count"] = h3_gdf["pop_count"].fillna(0)
     else:
-        logger.warning("No spatial data generated.")
-
-# ---------------------------------------------------------------------
-# [MAJOR-1 FIX] NEW: IPC DISAGGREGATION
-# ---------------------------------------------------------------------
-def disaggregate_ipc_to_h3(engine, data_config, features_config):
-    logger.info("Starting IPC (Admin 1 -> H3) Disaggregation...")
-    target_crs = features_config.get('spatial', {}).get('crs', {}).get('metric', 'EPSG:32634')
+        logger.warning(f"Population table {SCHEMA}.{POPULATION_TABLE} not found. Using uniform weights.")
+        h3_gdf["pop_count"] = 1.0
     
-    # 1. Load Data
-    gdf_pref, _ = load_admin_boundaries(data_config, target_crs)
-    gdf_h3 = load_h3_grid(engine, target_crs)
+    geodetic_crs = features_cfg["spatial"]["crs"]["geodetic"]
+    h3_gdf = h3_gdf.to_crs(geodetic_crs)
     
-    # Load IPC Data from DB
-    ipc_query = f"SELECT date, admin1, phase FROM {SCHEMA}.ipc_phases"
-    try:
-        df_ipc = pd.read_sql(ipc_query, engine)
-    except Exception as e:
-        logger.warning(f"Could not load IPC data: {e}. Skipping IPC disaggregation.")
-        return
-
-    if df_ipc.empty:
-        logger.warning("IPC table empty. Skipping.")
-        return
-
-    df_ipc['admin1_key'] = df_ipc['admin1'].apply(normalize_name)
+    # Process each admin level
+    admin_levels = ["admin1", "admin2", "admin3"]
     
-    # 2. Join IPC to Admin Boundaries
-    merged = gdf_pref.merge(df_ipc, on='admin1_key', how='inner')
+    for level in admin_levels:
+        path_key = f"{level}_path"
+        admin_path = Path(data_cfg["admin_boundaries"][path_key])
+        
+        if not admin_path.exists():
+            logger.warning(f"  {level} boundary file not found: {admin_path}")
+            continue
+        
+        logger.info(f"  Loading {level} boundaries from {admin_path.name}...")
+        admin_gdf = gpd.read_file(admin_path)
+        admin_gdf = admin_gdf.to_crs(geodetic_crs)
+        
+        pcode_col = _infer_pcode_col(admin_gdf, level)
+        name_col = _infer_name_col(admin_gdf, level)
+        
+        if not pcode_col and not name_col:
+            logger.error(f"  Cannot identify pcode or name columns for {level}. Skipping.")
+            continue
+        
+        # Spatial join
+        joined = gpd.sjoin(
+            h3_gdf[["h3_index", "pop_count", "geometry"]],
+            admin_gdf,
+            how="inner",
+            predicate="intersects"
+        )
+        
+        if pcode_col:
+            for pcode, group in joined.groupby(pcode_col):
+                admin_map[level]["by_pcode"][str(pcode)] = group["h3_index"].tolist()
+        
+        if name_col:
+            for name, group in joined.groupby(name_col):
+                normalized = normalize_name(name)
+                admin_map[level]["by_name"][normalized] = group["h3_index"].tolist()
+        
+        logger.info(f"  Mapped {level}: {len(admin_map[level]['by_pcode'])} pcodes")
     
-    if merged.empty:
-        logger.warning("No matches between IPC Admin names and Shapefile.")
-        return
-
-    # 3. Spatial Intersection
-    logger.info("Performing spatial overlay (H3 x Admin1)...")
-    intersection = gpd.overlay(gdf_h3, merged[['geometry', 'date', 'phase', 'admin1_key']], how='intersection')
-    
-    # 4. Aggregation (Max Phase per Cell)
-    logger.info("Aggregating to H3...")
-    final_df = intersection.groupby(['h3_index', 'date'])['phase'].max().reset_index()
-    final_df.rename(columns={'phase': 'ipc_phase_class'}, inplace=True)
-    
-    # 5. Upload
-    logger.info(f"Generated {len(final_df)} IPC H3 records. Uploading to 'ipc_h3'...")
-    
-    # [CRITICAL FIX] Drop table to guarantee Primary Key creation
-    with engine.begin() as conn:
-        conn.execute(text(f"DROP TABLE IF EXISTS {SCHEMA}.ipc_h3"))
-        conn.execute(text(f"""
-            CREATE TABLE {SCHEMA}.ipc_h3 (
-                h3_index BIGINT, 
-                date DATE, 
-                ipc_phase_class INTEGER, 
-                PRIMARY KEY (h3_index, date)
-            )
-        """))
-    
-    upload_to_postgis(engine, final_df, "ipc_h3", SCHEMA, ["h3_index", "date"])
-    logger.info("IPC Disaggregation Complete.")
+    return admin_map
 
 
-def run(configs, engine):
-    distribute_iom(engine, configs['data'], configs['features'])
-    disaggregate_ipc_to_h3(engine, configs['data'], configs['features'])
-
-def main():
-    try:
-        cfgs = load_configs()
-        if isinstance(cfgs, tuple):
-            configs = {"data": cfgs[0], "features": cfgs[1], "models": cfgs[2]}
+def distribute_iom(engine, admin_map: Dict[str, Dict], start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Disaggregate IOM DTM data from 'iom_dtm_raw' to H3 grid.
+    
+    UPDATES:
+    - Reads from iom_dtm_raw (fetch_iom.py output)
+    - Maps 'reporting_date' -> date
+    - Maps 'individuals' -> iom_displacement_sum
+    """
+    logger.info(f"Disaggregating IOM data from {IOM_SOURCE_TABLE}...")
+    
+    inspector = inspect(engine)
+    if not inspector.has_table(IOM_SOURCE_TABLE, schema=SCHEMA):
+        logger.warning(f"Table {SCHEMA}.{IOM_SOURCE_TABLE} not found. Skipping IOM.")
+        return pd.DataFrame()
+    
+    # Query adapted to new schema from fetch_iom.py
+    query = f"""
+        SELECT 
+            reporting_date as date,
+            admin1_pcode,
+            admin1_name,
+            admin2_pcode,
+            admin2_name,
+            individuals as count
+        FROM {SCHEMA}.{IOM_SOURCE_TABLE}
+        WHERE reporting_date BETWEEN '{start_date}' AND '{end_date}'
+          AND individuals > 0
+    """
+    
+    iom_df = pd.read_sql(query, engine)
+    
+    if iom_df.empty:
+        logger.warning("No IOM records found in date range.")
+        return pd.DataFrame()
+    
+    logger.info(f"  Loaded {len(iom_df):,} IOM records")
+    
+    # Load population weights for distribution
+    pop_df = pd.read_sql(
+        f"SELECT h3_index, year, pop_count FROM {SCHEMA}.{POPULATION_TABLE}",
+        engine
+    )
+    latest_year = pop_df["year"].max()
+    pop_weights = pop_df[pop_df["year"] == latest_year].set_index("h3_index")["pop_count"].to_dict()
+    
+    def _get_h3_list(level: str, pcode: str, name: str) -> List[int]:
+        if pd.notna(pcode) and str(pcode) in admin_map[level]["by_pcode"]:
+            return admin_map[level]["by_pcode"][str(pcode)]
+        if pd.notna(name):
+            normalized = normalize_name(name)
+            if normalized in admin_map[level]["by_name"]:
+                return admin_map[level]["by_name"][normalized]
+        return []
+    
+    disagg_records = []
+    unmapped_count = 0
+    
+    for _, row in iom_df.iterrows():
+        date = row["date"]
+        count = row["count"]
+        
+        # MAPPING STRATEGY:
+        # IOM "admin2" (sub-prefecture) -> Maps to WBG "admin3"
+        # IOM "admin1" (prefecture) -> Maps to WBG "admin2"
+        
+        h3_list = []
+        
+        # Try Admin 2 (Sub-Prefecture) first
+        if pd.notna(row["admin2_pcode"]) or pd.notna(row["admin2_name"]):
+            h3_list = _get_h3_list("admin3", row["admin2_pcode"], row["admin2_name"])
+            
+        # Fallback to Admin 1 (Prefecture)
+        if not h3_list and (pd.notna(row["admin1_pcode"]) or pd.notna(row["admin1_name"])):
+            h3_list = _get_h3_list("admin2", row["admin1_pcode"], row["admin1_name"])
+            
+        if not h3_list:
+            unmapped_count += 1
+            continue
+            
+        # Population weighting
+        h3_pops = {h3: pop_weights.get(h3, 1.0) for h3 in h3_list}
+        total_pop = sum(h3_pops.values())
+        
+        if total_pop > 0:
+            for h3_idx, pop in h3_pops.items():
+                disagg_records.append({
+                    "h3_index": h3_idx,
+                    "date": date,
+                    "iom_displacement_sum": count * (pop / total_pop)
+                })
         else:
-            configs = cfgs
-        engine = get_db_engine()
-        run(configs, engine)
+            # Uniform fallback
+            weight = 1.0 / len(h3_list)
+            for h3_idx in h3_list:
+                disagg_records.append({
+                    "h3_index": h3_idx,
+                    "date": date,
+                    "iom_displacement_sum": count * weight
+                })
+
+    if unmapped_count > 0:
+        logger.warning(f"  Could not map {unmapped_count:,} IOM records to H3.")
+
+    if not disagg_records:
+        return pd.DataFrame()
+
+    # Aggregate by Cell + Date
+    result_df = pd.DataFrame(disagg_records)
+    result_df = result_df.groupby(["h3_index", "date"], as_index=False)["iom_displacement_sum"].sum()
+    result_df["h3_index"] = result_df["h3_index"].astype("int64")
+    result_df["date"] = pd.to_datetime(result_df["date"])
+    
+    logger.info(f"  Disaggregated to {len(result_df):,} H3-date records")
+    return result_df
+
+
+def run(configs: Dict, engine):
+    """
+    Execute spatial disaggregation pipeline.
+    ONLY runs IOM disaggregation. IPC has been removed.
+    """
+    logger.info("=" * 60)
+    logger.info("SPATIAL DISAGGREGATION (IOM → H3)")
+    logger.info("=" * 60)
+    
+    if isinstance(configs, tuple):
+        data_cfg, features_cfg = configs[0], configs[1]
+    else:
+        data_cfg = configs.get("data", configs)
+        features_cfg = configs.get("features", configs)
+    
+    start_date = data_cfg["global_date_window"]["start_date"]
+    end_date = data_cfg["global_date_window"]["end_date"]
+    
+    try:
+        # 1. Build Map
+        admin_map = build_admin_h3_map(engine, data_cfg, features_cfg)
+        
+        # 2. Disaggregate IOM
+        iom_h3 = distribute_iom(engine, admin_map, start_date, end_date)
+        
+        if not iom_h3.empty:
+            logger.info(f"Uploading {len(iom_h3):,} IOM H3 records...")
+            upload_to_postgis(
+                engine,
+                iom_h3,
+                "iom_displacement_h3",
+                SCHEMA,
+                primary_keys=["h3_index", "date"]
+            )
+        else:
+            logger.warning("No IOM data produced.")
+        
+        logger.info("=" * 60)
+        logger.info("✓ DISAGGREGATION COMPLETE")
+        logger.info("=" * 60)
+        
     except Exception as e:
-        logger.error(f"Failed: {e}")
-        sys.exit(1)
+        logger.error(f"Spatial disaggregation failed: {e}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
-    main()
+    try:
+        cfg = load_configs()
+        engine = get_db_engine()
+        run(cfg, engine)
+    except Exception as e:
+        logger.critical(f"Pipeline failed: {e}", exc_info=True)
+        sys.exit(1)
+    finally:
+        if "engine" in locals():
+            engine.dispose()

@@ -6,6 +6,79 @@ The system ingests multi-source data (satellite, economic, political), engineers
 
 ---
 
+## 🚀 Quick Start
+
+Get the CEWP pipeline running in under 10 minutes.
+
+### Prerequisites
+- Python 3.10 or 3.11
+- PostgreSQL 13+ with PostGIS and H3 extensions
+- Google Earth Engine account (for satellite data)
+- 16GB+ RAM recommended for full pipeline
+
+### Installation
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/CEWP-CAR.git
+   cd CEWP-CAR
+   ```
+
+2. **Create and activate virtual environment:**
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
+
+3. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Set up database:**
+   ```bash
+   # Create database
+   createdb car_cewp
+   
+   # Enable extensions
+   psql -d car_cewp -c "CREATE EXTENSION postgis; CREATE EXTENSION h3; CREATE EXTENSION h3_postgis;"
+   ```
+
+5. **Configure credentials:**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your database credentials and API keys
+   ```
+
+### First Run
+
+Run the initialization and a small test:
+
+```bash
+# Initialize database schema
+python init_db.py
+
+# Run static phase only (fastest test)
+python main.py --start-date 2020-01-01 --end-date 2020-12-31 --skip-dynamic --skip-features --skip-modeling
+```
+
+### Expected Output
+
+You should see:
+```
+=============================================================
+   ORCHESTRATING CEWP PIPELINE
+   Window: 2020-01-01 -> 2020-12-31
+=============================================================
+▶ STARTING: PHASE 1: STATIC INGESTION
+✔ COMPLETED: PHASE 1: STATIC INGESTION (45.2s)
+✅ PIPELINE EXECUTION SUCCESSFUL
+```
+
+**Next Steps:** See [INSTALL.md](INSTALL.md) for complete setup including Google Earth Engine authentication and data source configuration.
+
+---
+
 ## 📄 Key documents (PDF)
 
 - **Thesis overview:** [`docs/CEWP_Thesis_Overview.pdf`](docs/CEWP_Thesis_Overview.pdf)
@@ -32,79 +105,6 @@ Orchestrated by `main.py`:
 | **2. Dynamic ingestion** | Fetch time-series data from APIs (ACLED, GDELT, IODA, WorldPop, GEE, FEWS NET). | `fetch_acled`, `fetch_dynamic_event`, `ingest_food_security` |
 | **3. Processing** | Master feature engineering: 14-day spine, climatological anomalies, price shocks, conflict decay, spatial diffusion. | `pipeline/processing/feature_engineering.py`, `calculate_epr_features` |
 | **4. Modeling** | Build ABT + train the two-stage model (classifier + regressor). | `build_feature_matrix`, `train_models` |
-
----
-
-## 🚀 Quick start
-
-### 1) Prerequisites
-- **Python 3.10+** (Conda recommended)
-- **PostgreSQL 13+** with **PostGIS** enabled
-- **GDAL** (required for terrain processing)  
-  - Ubuntu: `sudo apt-get install gdal-bin`  
-  - Windows: install via OSGeo4W or Conda (`conda install gdal`)
-
-### 2) Install
-```bash
-git clone https://github.com/brenandre23/FlashCLED.git
-cd FlashCLED
-pip install -e .
-```
-
-### 3) Configure secrets
-Create a `.env` file in the root fplder
-
-```ini
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=car_cewp
-DB_USER=postgres
-DB_PASS=yourpassword
-
-ACLED_EMAIL=your_email
-# ... (see data instructions for full list)
-```
-
-### 4) Manual data prerequisites (required)
-⚠️ Due to licensing/auth restrictions, a few files must be downloaded manually and placed in `data/raw/` before running.
-
-Expected directory:
-```text
-data/
-└── raw/
-    ├── acled.csv
-    ├── EPR-2021.csv
-    ├── wbgCAFadmin1.geojson
-    └── wbgCAFadmin3.geojson
-```
-
-#### Administrative boundaries (World Bank vs OCHA “Admin 3” naming fix)
-**Key mismatch:**
-- In the **World Bank / GADM-style** hierarchy: **Admin 1 = Region**, **Admin 2 = Prefecture**
-- In **OCHA/HDX COD**: **Admin 1 = Prefecture**, **Admin 2 = Sub-prefecture**
-
-**Compatibility hack used by this pipeline:**  
-We take **OCHA Admin 2 (Sub-prefectures)** and store it under the filename the pipeline expects for “Admin 3”.
-
-**Action:**
-1) Download **OCHA Admin 1 (Prefectures)** → convert to GeoJSON if needed → save as **`wbgCAFadmin1.geojson`**  
-2) Download **OCHA Admin 2 (Sub-prefectures)** → convert to GeoJSON if needed → save/rename as **`wbgCAFadmin3.geojson`**
-
-> Note: If you download Shapefiles (`.shp`), convert them to GeoJSON before saving/renaming.
-
-### 5) Run the full pipeline
-```bash
-python main.py
-```
-
-Optional: partial runs (debug)
-```bash
-# Skip static data (if grid/rivers already exist)
-python main.py --skip-static
-
-# Run ONLY modeling (assumes database is populated)
-python main.py --skip-static --skip-dynamic --skip-features
-```
 
 ---
 

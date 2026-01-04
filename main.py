@@ -61,13 +61,27 @@ from pipeline.processing import (
     calculate_epr_features,
 )
 
-
 # --- Modeling ---
 from pipeline.modeling import (
     build_feature_matrix,
     train_models,
     generate_predictions,
 )
+
+# --- Analysis (NEW) ---
+try:
+    from pipeline.analysis import (
+        analyze_feature_importance,
+        analyze_subtheme_shap,
+        analyze_predictions,
+        analyze_model_selection,
+        analyze_sensitivity,
+        analyze_spatial_residuals
+    )
+    ANALYSIS_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Analysis scripts not found or import failed: {e}")
+    ANALYSIS_AVAILABLE = False
 
 
 # ---------------------------------------------------------
@@ -219,7 +233,6 @@ class CEWPPipeline:
             return
 
         # Validate - requires static phase output
-        # If static phase is NOT skipped, it will create the prerequisites
         will_create = not self.args.skip_static
         if not self._validate_phase("dynamic", will_create=will_create):
             raise RuntimeError(
@@ -250,7 +263,6 @@ class CEWPPipeline:
             return
 
         # Validate - requires static and dynamic phase outputs
-        # Prerequisites will be created if earlier phases are not skipped
         will_create = not (self.args.skip_static and self.args.skip_dynamic)
         if not self._validate_phase("feature_engineering", will_create=will_create):
             raise RuntimeError(
@@ -298,6 +310,42 @@ class CEWPPipeline:
                 sys.argv = ["generate_predictions.py", horizon_name]
                 generate_predictions.main()
 
+    def run_analysis_phase(self):
+        """Executes the automated analysis & visualization suite."""
+        if self.args.skip_analysis:
+            logger.info("Skipping Phase 5: Analysis")
+            return
+
+        if not ANALYSIS_AVAILABLE:
+            logger.warning("Skipping Phase 5: Analysis scripts not available or import failed.")
+            return
+
+        # Assuming modeling has run or models exist
+        with pipeline_stage("PHASE 5: AUTOMATED ANALYSIS"):
+            try:
+                logger.info("   > Running Feature Importance (Macro/Micro)...")
+                analyze_feature_importance.main()
+
+                logger.info("   > Running Sub-theme SHAP (Deep Dive)...")
+                analyze_subtheme_shap.main()
+                
+                logger.info("   > Running Model Selection Analysis...")
+                analyze_model_selection.main()
+                
+                logger.info("   > Running Sensitivity Analysis...")
+                analyze_sensitivity.main()
+
+                logger.info("   > Running Spatial Residuals Map...")
+                analyze_spatial_residuals.main()
+
+                logger.info("   > Running General Prediction Analytics...")
+                analyze_predictions.main()
+                
+                logger.info("   ✓ Analysis complete. Check 'analysis/' folder for plots.")
+                
+            except Exception as e:
+                logger.error(f"Error during analysis phase: {e}", exc_info=True)
+
     def run_validation_only(self):
         """Run validation for all phases without executing pipeline."""
         logger.info("=" * 60)
@@ -308,28 +356,19 @@ class CEWPPipeline:
         
         # Determine exit code based on what would be run
         phases_to_run = []
-        if not self.args.skip_static:
-            phases_to_run.append("static")
-        if not self.args.skip_dynamic:
-            phases_to_run.append("dynamic")
-        if not self.args.skip_features:
-            phases_to_run.append("feature_engineering")
-        if not self.args.skip_modeling:
-            phases_to_run.append("modeling")
+        if not self.args.skip_static: phases_to_run.append("static")
+        if not self.args.skip_dynamic: phases_to_run.append("dynamic")
+        if not self.args.skip_features: phases_to_run.append("feature_engineering")
+        if not self.args.skip_modeling: phases_to_run.append("modeling")
         
-        # Check if all phases that would run are valid
-        # Note: Each phase creates prerequisites for the next
         all_valid = True
         for i, phase in enumerate(phases_to_run):
-            # First phase only needs extensions
             if i == 0:
                 if not results.get("static", results.get(phase)).passed:
-                    # Check only extensions for first phase
                     if results.get(phase) and results[phase].missing_extensions:
                         all_valid = False
                         break
             else:
-                # Later phases need previous phase outputs
                 prev_phase = phases_to_run[i-1] if i > 0 else None
                 if prev_phase and not results.get(prev_phase, results.get(phase)).passed:
                     logger.warning(f"Phase '{phase}' may fail due to missing prerequisites from '{prev_phase}'")
@@ -358,6 +397,7 @@ class CEWPPipeline:
             self.run_dynamic_phase()
             self.run_feature_engineering_phase()
             self.run_modeling_phase()
+            self.run_analysis_phase()
 
             logger.info("\n" + "=" * 60)
             logger.info("✅ PIPELINE EXECUTION SUCCESSFUL")
@@ -391,6 +431,7 @@ def parse_args():
     parser.add_argument("--skip-dynamic", action="store_true", help="Skip dynamic ingestion.")
     parser.add_argument("--skip-features", action="store_true", help="Skip feature engineering.")
     parser.add_argument("--skip-modeling", action="store_true", help="Skip modeling & predictions.")
+    parser.add_argument("--skip-analysis", action="store_true", help="Skip post-run analysis.")
     
     # Validation
     parser.add_argument(

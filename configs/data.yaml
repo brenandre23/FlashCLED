@@ -50,11 +50,12 @@ epr:
   core_url: "https://icr.ethz.ch/data/epr/core/EPR-2021.csv"
 
 iom_dtm:
-  api_endpoint: "https://api.dtm.iom.int/v3"
   country_name: "Central African Republic"
+  base_url: "https://dtmapi.iom.int/v3"
+  local_file: "data/raw/iom_manual.csv"
+
 
 fews_net:
-  ipc_url: "https://fdw.fews.net/api/ipcphase/"
   iso2: "CF"
   iso3: "CAF"
   markets_geojson_url: "https://fdw.fews.net/api/feature/?format=geojson&unit_set_version=3380"

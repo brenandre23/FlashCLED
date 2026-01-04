@@ -54,8 +54,9 @@ def apply_pca_if_needed(df: pd.DataFrame, bundle: Dict[str, Any]) -> pd.DataFram
     """
     pca = bundle.get("pca")
     scaler = bundle.get("pca_scaler")
-    input_features = bundle.get("pca_input_features")
-    component_names = bundle.get("pca_component_names")
+    # Accept both new and legacy keys for backward compatibility
+    input_features = bundle.get("pca_input_features") or bundle.get("pca_input")
+    component_names = bundle.get("pca_component_names") or bundle.get("pca_cols")
 
     if pca is None or scaler is None or not input_features:
         logger.info("No PCA configuration in bundle – skipping PCA reconstruction.")

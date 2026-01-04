@@ -4,10 +4,8 @@ fetch_gee_server_side.py
 Purpose: Server-side environmental data aggregation.
 
 UPDATES:
-- DYNAMIC END DATE: Automatically queries ERA5-Land to find the "real" last available date.
-  It trims the processing spine to this date, preventing "No Bands" crashes for future dates.
-- PARALLEL PROCESSING: Keeps the 3-worker logic.
-- ROBUST RETRIES: Keeps the 429/500 handling.
+- Uses centralized 'init_gee' from utils.py for silent Service Account auth.
+- DYNAMIC END DATE: Automatically trims query to data availability.
 """
 
 import sys
@@ -26,7 +24,8 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from utils import logger, get_db_engine, load_configs, upload_to_postgis, ensure_h3_int64
+# Import centralized auth function
+from utils import logger, get_db_engine, load_configs, upload_to_postgis, ensure_h3_int64, init_gee
 
 # --- Constants ---
 SCHEMA = "car_cewp"
@@ -43,18 +42,6 @@ BATCH_SLEEP = 1
 # 1. DATABASE & TYPE HELPERS
 # -------------------------------------------------------------------------
 
-def h3_hex_to_signed_int64(h3_hex_str):
-    try:
-        if pd.isna(h3_hex_str) or h3_hex_str is None:
-            return None
-        clean = str(h3_hex_str).replace('0x', '').strip()
-        val = int(clean, 16)
-        if val > 0x7FFFFFFFFFFFFFFF:
-            val = int(val - 0x10000000000000000)
-        return val
-    except (ValueError, TypeError):
-        return None
-
 def ensure_environmental_table_exists(engine, schema="car_cewp"):
     from sqlalchemy import text
     create_sql = text(f"""
@@ -62,12 +49,12 @@ def ensure_environmental_table_exists(engine, schema="car_cewp"):
     CREATE TABLE IF NOT EXISTS {schema}.environmental_features (
         h3_index BIGINT NOT NULL,
         date DATE NOT NULL,
-        precip_mean_depth_mm FLOAT,  -- Renamed to match QGIS checks
+        precip_mean_depth_mm FLOAT,
         chirps_precip_anomaly FLOAT,
-        temp_mean FLOAT,             -- Renamed to match
-        dew_mean FLOAT,              -- Renamed to match
-        soil_moisture_mean FLOAT,    -- Renamed to match
-        ndvi_max FLOAT,              -- Corrected from ndvi_mean
+        temp_mean FLOAT,
+        dew_mean FLOAT,
+        soil_moisture_mean FLOAT,
+        ndvi_max FLOAT,
         ntl_mean FLOAT,
         water_local_mean FLOAT,
         water_local_max FLOAT,
@@ -78,15 +65,6 @@ def ensure_environmental_table_exists(engine, schema="car_cewp"):
     with engine.begin() as conn:
         conn.execute(create_sql)
     logger.info(f"✓ Table {schema}.environmental_features is ready.")
-
-def init_gee(project_id: str) -> None:
-    try:
-        ee.Initialize(project=project_id)
-        logger.info(f"GEE Initialized (Project: {project_id})")
-    except Exception as e:
-        logger.warning(f"GEE init failed ({e}); attempting Authenticate()...")
-        ee.Authenticate()
-        ee.Initialize(project=project_id)
 
 def get_h3_grid_data(engine):
     logger.info("Loading H3 Grid from PostGIS...")
@@ -107,12 +85,9 @@ def make_ee_feature_collection(grid_subset):
 def get_collection_last_date(collection_id):
     """Queries GEE to find the absolute last available date for a collection."""
     try:
-        # Sort by time descending, get first image
         last_img = ee.ImageCollection(collection_id).limit(1, 'system:time_start', False).first()
-        # Get timestamp
         last_ts = last_img.get('system:time_start').getInfo()
         if last_ts:
-            # Convert ms to datetime
             return datetime.fromtimestamp(last_ts / 1000.0, tz=timezone.utc).replace(tzinfo=None)
     except Exception as e:
         logger.warning(f"Could not verify end date for {collection_id}: {e}")
@@ -188,73 +163,28 @@ def process_single_batch(batch_cells, s_str, e_excl_str, collections_cfg, start_
 
     for attempt in range(MAX_RETRIES):
         try:
-            # 1. Coarse (CHIRPS & ERA5)
-            chirps = (
-                ee.ImageCollection(chirps_id)
-                .filterDate(s_str, e_excl_str)
-                .select("precipitation")
-                .sum()
-                .rename("precip_depth_mm")
-            )
-            era5 = (
-                ee.ImageCollection(era5_id)
-                .filterDate(s_str, e_excl_str)
-                .mean()
-                .select(
-                    ["temperature_2m", "dewpoint_temperature_2m", "volumetric_soil_water_layer_1"],
-                    ["temp", "dew", "soil"],
-                )
-            )
-            coarse_res = chirps.addBands(era5).reduceRegions(
-                collection=batch_fc, reducer=ee.Reducer.mean(), scale=5000, tileScale=4
-            )
+            # 1. Coarse
+            chirps = ee.ImageCollection(chirps_id).filterDate(s_str, e_excl_str).select("precipitation").sum().rename("precip_depth_mm")
+            era5 = ee.ImageCollection(era5_id).filterDate(s_str, e_excl_str).mean().select(["temperature_2m", "dewpoint_temperature_2m", "volumetric_soil_water_layer_1"], ["temp", "dew", "soil"])
+            coarse_res = chirps.addBands(era5).reduceRegions(collection=batch_fc, reducer=ee.Reducer.mean(), scale=5000, tileScale=4)
 
-            # 2. Fine resolution features
-            # Night-time lights (VIIRS) only available from 2012 onward.  
-            # For years before 2012, set ntl_mean to zero explicitly.
+            # 2. Fine
             if start_dt.year < 2012:
                 viirs_img = ee.Image.constant(0).rename("ntl_mean")
             else:
-                viirs = (
-                    ee.ImageCollection(viirs_id)
-                    .filterDate(s_str, e_excl_str)
-                    .select("DNB_BRDF_Corrected_NTL")
-                )
-                viirs_img = ee.Image(
-                    ee.Algorithms.If(viirs.size().gt(0), viirs.mean(), ee.Image.constant(0))
-                ).rename("ntl_mean")
+                viirs = ee.ImageCollection(viirs_id).filterDate(s_str, e_excl_str).select("DNB_BRDF_Corrected_NTL")
+                viirs_img = ee.Image(ee.Algorithms.If(viirs.size().gt(0), viirs.mean(), ee.Image.constant(0))).rename("ntl_mean")
 
             def add_ndvi(img):
-                return img.normalizedDifference(
-                    ["Nadir_Reflectance_Band2", "Nadir_Reflectance_Band1"]
-                ).rename("ndvi")
+                return img.normalizedDifference(["Nadir_Reflectance_Band2", "Nadir_Reflectance_Band1"]).rename("ndvi")
 
-            modis = (
-                ee.ImageCollection(modis_id)
-                .filterDate(s_str, e_excl_str)
-                .map(add_ndvi)
-                .select("ndvi")
-            )
-            modis_img = ee.Image(
-                ee.Algorithms.If(modis.size().gt(0), modis.max(), ee.Image.constant(0))
-            ).rename("ndvi_max")
-
+            modis = ee.ImageCollection(modis_id).filterDate(s_str, e_excl_str).map(add_ndvi).select("ndvi")
+            modis_img = ee.Image(ee.Algorithms.If(modis.size().gt(0), modis.max(), ee.Image.constant(0))).rename("ndvi_max")
             water_img = get_water_image(start_dt, end_dt).rename("water_local_mean")
-            fine_res = viirs_img.addBands(modis_img).addBands(water_img).reduceRegions(
-                collection=batch_fc, reducer=ee.Reducer.mean(), scale=100, tileScale=4
-            )
+            fine_res = viirs_img.addBands(modis_img).addBands(water_img).reduceRegions(collection=batch_fc, reducer=ee.Reducer.mean(), scale=100, tileScale=4)
 
             # 3. Water Max
-            water_max_res = (
-                get_water_image(start_dt, end_dt)
-                .rename("water_bin")
-                .reduceRegions(
-                    collection=batch_fc,
-                    reducer=ee.Reducer.max().setOutputs(["water_local_max"]),
-                    scale=30,
-                    tileScale=4,
-                )
-            )
+            water_max_res = get_water_image(start_dt, end_dt).rename("water_bin").reduceRegions(collection=batch_fc, reducer=ee.Reducer.max().setOutputs(["water_local_max"]), scale=30, tileScale=4)
 
             return (coarse_res.getInfo(), fine_res.getInfo(), water_max_res.getInfo())
 
@@ -292,58 +222,34 @@ def process_year_batch(year: int, all_cells: list, collections_cfg: dict, window
             for future in as_completed(future_to_batch):
                 try:
                     c_data, f_data, w_data = future.result()
-                    if not (c_data and f_data and w_data):
-                        continue
+                    if not (c_data and f_data and w_data): continue
 
-                    c_map = {
-                        f["properties"]["h3_index"]: f["properties"]
-                        for f in c_data.get("features", [])
-                    }
-                    w_map = {
-                        f["properties"]["h3_index"]: f["properties"].get("water_local_max")
-                        for f in w_data.get("features", [])
-                    }
+                    c_map = {f["properties"]["h3_index"]: f["properties"] for f in c_data.get("features", [])}
+                    w_map = {f["properties"]["h3_index"]: f["properties"].get("water_local_max") for f in w_data.get("features", [])}
 
                     for feat in f_data.get("features", []):
                         props = feat.get("properties", {})
                         h3_idx = props.get("h3_index")
                         c_props = c_map.get(h3_idx, {})
 
-                        daily_rows.append(
-                            {
-                                "h3_index": h3_idx,
-                                "date": start_dt.strftime("%Y-%m-%d"),
-                                "precip_mean_depth_mm": get_prop(
-                                    c_props, ["precip_depth_mm", "precip_depth_mm_mean"]
-                                ),
-                                "temp_mean": get_prop(c_props, ["temp", "temp_mean"]),
-                                "dew_mean": get_prop(c_props, ["dew", "dew_mean"]),
-                                "soil_moisture_mean": get_prop(
-                                    c_props, ["soil", "soil_mean"]
-                                ),
-                                "ndvi_max": get_prop(
-                                    props, ["ndvi_max", "ndvi_max_mean", "ndvi"]
-                                ),
-                                "ntl_mean": get_prop(
-                                    props, ["ntl_mean", "ntl_mean_mean", "ntl"]
-                                ),
-                                "water_local_mean": get_prop(
-                                    props,
-                                    ["water_local_mean", "water_local_mean_mean", "water"],
-                                ),
-                                "water_local_max": w_map.get(h3_idx),
-                            }
-                        )
+                        daily_rows.append({
+                            "h3_index": h3_idx,
+                            "date": start_dt.strftime("%Y-%m-%d"),
+                            "precip_mean_depth_mm": get_prop(c_props, ["precip_depth_mm", "precip_depth_mm_mean"]),
+                            "temp_mean": get_prop(c_props, ["temp", "temp_mean"]),
+                            "dew_mean": get_prop(c_props, ["dew", "dew_mean"]),
+                            "soil_moisture_mean": get_prop(c_props, ["soil", "soil_mean"]),
+                            "ndvi_max": get_prop(props, ["ndvi_max", "ndvi_max_mean", "ndvi"]),
+                            "ntl_mean": get_prop(props, ["ntl_mean", "ntl_mean_mean", "ntl"]),
+                            "water_local_mean": get_prop(props, ["water_local_mean", "water_local_mean_mean", "water"]),
+                            "water_local_max": w_map.get(h3_idx),
+                        })
                 except Exception as e:
                     logger.error(f"Batch failed: {e}")
 
         if daily_rows:
             df = pd.DataFrame(daily_rows)
-            
-            # --- CRITICAL FIX: Centralized H3 Type Safety ---
-            # Ensures strings/unsigned ints become signed int64 for Postgres compatibility
             df["h3_index"] = df["h3_index"].apply(ensure_h3_int64)
-            
             df = df.dropna(subset=["h3_index"])
             df["h3_index"] = df["h3_index"].astype("int64")
 
@@ -363,17 +269,18 @@ def run(configs, engine):
     g_end = int(data_cfg["global_date_window"]["end_date"][:4])
 
     ensure_environmental_table_exists(engine)
+    
+    # --- AUTHENTICATE ---
+    # This now uses the Service Account method if key is available
     init_gee(project_id)
 
-    # --- NEW: Dynamic End Date Check ---
     era5_id = data_cfg["gee"]["collections"].get("era5", "ECMWF/ERA5_LAND/HOURLY")
     logger.info(f"Checking data availability for {era5_id}...")
     real_end_date = get_collection_last_date(era5_id)
 
     if real_end_date:
         logger.info(f"✓ Latest ERA5 data found: {real_end_date.strftime('%Y-%m-%d')}")
-        # Add buffer of ~5 days to avoid partial ingest
-        cutoff_date = real_end_date - timedelta(days=5)
+        cutoff_date = real_end_date - timedelta(days=0)
     else:
         logger.warning("Could not determine ERA5 end date. Using config dates blindly.")
         cutoff_date = datetime(g_end, 12, 31)
@@ -381,34 +288,23 @@ def run(configs, engine):
     all_cells = get_h3_grid_data(engine)
 
     for year in range(g_start, g_end + 1):
-        # 1. Build spine for the year
         full_spine = build_14day_spine(year, year)
-
-        # 2. FILTER: Remove windows that start AFTER the data ends
         valid_spine = [w for w in full_spine if w[0] <= cutoff_date]
 
         if not valid_spine:
-            logger.info(
-                f"Skipping Year {year} (Beyond available data limit: {cutoff_date.date()})"
-            )
+            logger.info(f"Skipping Year {year} (Beyond available data limit)")
             continue
 
         out_path = DATA_DIR / f"CEWP_Env_Res5_Year_{year}.csv"
         processed = set()
         if out_path.exists():
-            try:
-                processed = set(pd.read_csv(out_path, usecols=["date"])["date"].unique())
-            except:
-                pass
+            try: processed = set(pd.read_csv(out_path, usecols=["date"])["date"].unique())
+            except: pass
 
-        windows_to_run = [
-            w for w in valid_spine if w[0].strftime("%Y-%m-%d") not in processed
-        ]
+        windows_to_run = [w for w in valid_spine if w[0].strftime("%Y-%m-%d") not in processed]
 
         if windows_to_run:
-            process_year_batch(
-                year, all_cells, data_cfg["gee"]["collections"], windows_to_run, engine
-            )
+            process_year_batch(year, all_cells, data_cfg["gee"]["collections"], windows_to_run, engine)
         else:
             logger.info(f"Year {year} complete.")
 

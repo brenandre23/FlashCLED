@@ -1,22 +1,19 @@
 """
 ingest_economy.py
 =================
-Fetches economy data (stock indices, commodities, forex, interest rates).
+Fetches economy data in WIDE format for cleaner modeling.
 
-FIXES APPLIED:
-- [CRITICAL-2] Uploads to 'economic_drivers' table (was 'market_data').
-- [MAJOR-2] Creates 'commodity_gold_price_usd' column for feature registry compatibility.
-- [MAJOR-3] Uses .where() for type-safe NaN handling (avoids object dtype).
-- [FIX] Flattens MultiIndex columns from yfinance.
-- [CRITICAL-FIX] Ensures unique constraint exists on (date, ticker) before upsert.
+RESTRUCTURED (Task 2):
+- Fetches ONLY: GC=F (Gold), CL=F (Oil), ^GSPC (S&P500), EURUSD=X (EUR/USD)
+- Outputs WIDE format: one row per date with columns:
+    date, gold_price_usd, oil_price_usd, sp500_index, eur_usd_rate
+- Uploads to car_cewp.economic_drivers (drop/recreate schema)
 """
 
 import sys
 import pandas as pd
-import numpy as np
 import yfinance as yf
 import time
-from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 from sqlalchemy import text
@@ -29,108 +26,23 @@ if str(ROOT_DIR) not in sys.path:
 from utils import logger, get_db_engine, load_configs, upload_to_postgis
 
 SCHEMA = "car_cewp"
-TARGET_TABLE = "economic_drivers"  # [CRITICAL-2 FIX]
+TARGET_TABLE = "economic_drivers"
 
 # --- Configuration Constants ---
-GOLD_FUTURES_TICKER = "GC=F"
-GOLD_DATA_MIN_DATE = "2000-08-30"
-FALLBACK_YEARS = 5
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 
-TICKERS = {
-    "indices": ["^GSPC", "^IXIC", "^DJI"],
-    "commodities": [GOLD_FUTURES_TICKER, "CL=F"],
-    "forex": ["EURUSD=X", "GBPUSD=X", "JPYUSD=X"],
-    "rates": ["^TNX", "^FVX", "^TYX"]
+# Tickers to fetch and their column mappings
+TICKER_CONFIG = {
+    "GC=F": "gold_price_usd",      # Gold Futures
+    "CL=F": "oil_price_usd",       # Crude Oil Futures
+    "^GSPC": "sp500_index",        # S&P 500 Index
+    "EURUSD=X": "eur_usd_rate",    # EUR/USD Exchange Rate
 }
 
-def ensure_unique_constraint(engine, schema: str, table_name: str) -> None:
-    """
-    Ensure the table has a unique constraint on (date, ticker) columns.
-    Creates the constraint if it doesn't exist.
-    
-    Args:
-        engine: SQLAlchemy engine
-        schema: Schema name
-        table_name: Table name
-    """
-    constraint_name = f"unique_{table_name}_date_ticker"
-    full_table_name = f"{schema}.{table_name}"
-    
-    try:
-        # First check if table exists
-        with engine.connect() as conn:
-            check_table = text(f"""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_schema = :schema 
-                    AND table_name = :table_name
-                );
-            """)
-            table_exists = conn.execute(
-                check_table, {"schema": schema, "table_name": table_name}
-            ).scalar()
-            
-            if not table_exists:
-                logger.warning(f"Table {full_table_name} does not exist. Creating with constraint...")
-                # Create table with constraint
-                create_table = text(f"""
-                    CREATE TABLE {full_table_name} (
-                        date DATE NOT NULL,
-                        ticker TEXT NOT NULL,
-                        category TEXT,
-                        open_price FLOAT,
-                        high_price FLOAT,
-                        low_price FLOAT,
-                        close_price FLOAT,
-                        volume BIGINT,
-                        commodity_gold_price_usd FLOAT,
-                        CONSTRAINT {constraint_name} UNIQUE (date, ticker)
-                    );
-                """)
-                conn.execute(create_table)
-                conn.commit()
-                logger.info(f"Created table {full_table_name} with unique constraint on (date, ticker)")
-                return
-            
-            # Check if constraint already exists
-            check_constraint = text(f"""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.table_constraints 
-                    WHERE constraint_schema = :schema 
-                    AND table_name = :table_name 
-                    AND constraint_name = :constraint_name
-                );
-            """)
-            constraint_exists = conn.execute(
-                check_constraint, 
-                {"schema": schema, "table_name": table_name, "constraint_name": constraint_name}
-            ).scalar()
-            
-            if not constraint_exists:
-                logger.info(f"Adding unique constraint on (date, ticker) to {full_table_name}...")
-                # Add constraint if it doesn't exist
-                add_constraint = text(f"""
-                    ALTER TABLE {full_table_name} 
-                    ADD CONSTRAINT {constraint_name} UNIQUE (date, ticker);
-                """)
-                conn.execute(add_constraint)
-                conn.commit()
-                logger.info(f"Added unique constraint to {full_table_name}")
-            else:
-                logger.debug(f"Unique constraint already exists on {full_table_name}")
-                
-    except Exception as e:
-        # If constraint already exists but with different name, log and continue
-        if "already exists" in str(e).lower() or "duplicate key" in str(e).lower():
-            logger.warning(f"Constraint might already exist with different name: {e}")
-        else:
-            logger.error(f"Failed to ensure unique constraint on {full_table_name}: {e}")
-            raise
 
 def fetch_yahoo_prices(ticker: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
-    """Fetch price data from Yahoo Finance with column flattening fix."""
+    """Fetch price data from Yahoo Finance with robust column handling."""
     for attempt in range(MAX_RETRIES):
         try:
             logger.debug(f"Fetching {ticker} (attempt {attempt+1})")
@@ -138,9 +50,10 @@ def fetch_yahoo_prices(ticker: str, start_date: str, end_date: str) -> Optional[
                 ticker, start=start_date, end=end_date, progress=False, auto_adjust=False
             )
             if df.empty:
+                logger.warning(f"  Empty data for {ticker}")
                 return None
 
-            # Flatten MultiIndex Columns
+            # Flatten MultiIndex Columns if present
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
@@ -153,6 +66,7 @@ def fetch_yahoo_prices(ticker: str, start_date: str, end_date: str) -> Optional[
             if 'date' not in df.columns and 'index' in df.columns:
                 df = df.rename(columns={'index': 'date'})
 
+            # Use 'close' price as the value
             if 'close' not in df.columns:
                 if 'adj_close' in df.columns:
                     df = df.rename(columns={'adj_close': 'close'})
@@ -160,112 +74,141 @@ def fetch_yahoo_prices(ticker: str, start_date: str, end_date: str) -> Optional[
                     logger.warning(f"  Missing 'close' column for {ticker}")
                     return None
 
-            df['ticker'] = ticker
-            return df
+            # Return only date and close
+            df['date'] = pd.to_datetime(df['date']).dt.date
+            return df[['date', 'close']].copy()
 
         except Exception as e:
             logger.warning(f"Attempt {attempt+1} failed for {ticker}: {e}")
             time.sleep(RETRY_DELAY)
+    
     return None
 
-def fetch_gold_prices(start_date: str, end_date: str) -> Optional[pd.DataFrame]:
-    start_dt = pd.to_datetime(start_date)
-    gold_min_dt = pd.to_datetime(GOLD_DATA_MIN_DATE)
-    adjusted_start = GOLD_DATA_MIN_DATE if start_dt < gold_min_dt else start_date
-    df = fetch_yahoo_prices(GOLD_FUTURES_TICKER, adjusted_start, end_date)
 
-    if df is None or df.empty:
-        end_dt_obj = pd.to_datetime(end_date)
-        fallback_start = (end_dt_obj - timedelta(days=FALLBACK_YEARS * 365)).strftime('%Y-%m-%d')
-        if pd.to_datetime(fallback_start) < gold_min_dt:
-            fallback_start = GOLD_DATA_MIN_DATE
-        df = fetch_yahoo_prices(GOLD_FUTURES_TICKER, fallback_start, end_date)
-    return df
-
-def fetch_market_category(category: str, start_date: str, end_date: str) -> pd.DataFrame:
-    all_data = []
-    for ticker in TICKERS.get(category, []):
-        df = fetch_gold_prices(start_date, end_date) if ticker == GOLD_FUTURES_TICKER else \
-             fetch_yahoo_prices(ticker, start_date, end_date)
+def fetch_all_tickers(start_date: str, end_date: str) -> pd.DataFrame:
+    """Fetch all configured tickers and pivot to wide format."""
+    logger.info(f"Fetching {len(TICKER_CONFIG)} economic indicators...")
+    
+    all_dfs = []
+    
+    for ticker, col_name in TICKER_CONFIG.items():
+        df = fetch_yahoo_prices(ticker, start_date, end_date)
+        
         if df is not None and not df.empty:
-            df['category'] = category
-            all_data.append(df)
-
-    if not all_data:
+            df = df.rename(columns={'close': col_name})
+            all_dfs.append(df)
+            logger.info(f"  ✓ {ticker} -> {col_name}: {len(df)} rows")
+        else:
+            logger.warning(f"  ✗ {ticker}: No data fetched")
+    
+    if not all_dfs:
+        logger.error("No economic data fetched from any ticker!")
         return pd.DataFrame()
+    
+    # Merge all DataFrames on date (wide format)
+    result = all_dfs[0]
+    for df in all_dfs[1:]:
+        result = pd.merge(result, df, on='date', how='outer')
+    
+    # Sort by date and reset index
+    result = result.sort_values('date').reset_index(drop=True)
+    
+    # Convert date to proper datetime for DB
+    result['date'] = pd.to_datetime(result['date'])
+    
+    logger.info(f"Combined Wide DataFrame: {len(result)} rows, {len(result.columns)} columns")
+    
+    return result
 
-    combined = pd.concat(all_data, ignore_index=True)
-    return combined
 
-def upload_to_database(df: pd.DataFrame, table_name: str, engine):
-    """
-    Upload the processed economic data frame to PostGIS using an upsert
-    based on primary keys.  This prevents data loss by avoiding table
-    replacement on each run.
-    """
+def recreate_table(engine):
+    """Drop and recreate the economic_drivers table with new wide schema."""
+    logger.info(f"Recreating {SCHEMA}.{TARGET_TABLE} with wide schema...")
+    
+    with engine.begin() as conn:
+        # Create schema if not exists
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA};"))
+        
+        # Drop existing table
+        conn.execute(text(f"DROP TABLE IF EXISTS {SCHEMA}.{TARGET_TABLE};"))
+        
+        # Create new table with wide schema
+        conn.execute(text(f"""
+            CREATE TABLE {SCHEMA}.{TARGET_TABLE} (
+                date DATE PRIMARY KEY,
+                gold_price_usd FLOAT,
+                oil_price_usd FLOAT,
+                sp500_index FLOAT,
+                eur_usd_rate FLOAT
+            );
+        """))
+        
+        # Add index for date queries
+        conn.execute(text(f"""
+            CREATE INDEX IF NOT EXISTS idx_{TARGET_TABLE}_date 
+            ON {SCHEMA}.{TARGET_TABLE} (date);
+        """))
+    
+    logger.info(f"  ✓ Table {SCHEMA}.{TARGET_TABLE} recreated with wide schema")
+
+
+def upload_wide_data(df: pd.DataFrame, engine):
+    """Upload the wide-format DataFrame to PostgreSQL."""
     if df.empty:
+        logger.warning("Empty DataFrame - nothing to upload")
         return
+    
+    # Ensure all columns exist
+    expected_cols = ['date', 'gold_price_usd', 'oil_price_usd', 'sp500_index', 'eur_usd_rate']
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = None
+    
+    # Reorder columns
+    df = df[expected_cols].copy()
+    
+    # Upload using upsert on primary key 'date'
+    upload_to_postgis(engine, df, TARGET_TABLE, SCHEMA, primary_keys=['date'])
+    
+    logger.info(f"  ✓ Uploaded {len(df)} rows to {SCHEMA}.{TARGET_TABLE}")
 
-    # Ensure unique constraint exists before upsert
-    ensure_unique_constraint(engine, SCHEMA, table_name)
-
-    # Ensure dates are parsed
-    if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'])
-
-    # Rename OHLC columns
-    rename_map = {
-        'open': 'open_price',
-        'high': 'high_price',
-        'low': 'low_price',
-        'close': 'close_price'
-    }
-    df = df.rename(columns=rename_map)
-
-    # Use .where() for type-safe NaN assignment
-    if 'ticker' in df.columns:
-        df['commodity_gold_price_usd'] = df['close_price'].where(
-            df['ticker'] == GOLD_FUTURES_TICKER
-        )
-
-    target_cols = [
-        'date', 'ticker', 'category', 'open_price', 'high_price',
-        'low_price', 'close_price', 'volume', 'commodity_gold_price_usd'
-    ]
-
-    # Ensure all target cols exist
-    for c in target_cols:
-        if c not in df.columns:
-            df[c] = None
-
-    # Perform upsert using upload_to_postgis; primary key on date and ticker
-    primary_keys = ['date', 'ticker']
-    upload_to_postgis(
-        engine,
-        df[target_cols],
-        table_name,
-        SCHEMA,
-        primary_keys
-    )
-    logger.info(f"Uploaded {len(df)} rows to {table_name} (upserted)")
 
 def run(configs, engine):
+    """Main execution function."""
+    logger.info("=" * 60)
+    logger.info("ECONOMY INGESTION (Wide Format)")
+    logger.info("=" * 60)
+    
     data_cfg = configs['data']
-    start_date = data_cfg.get('global_date_window', {}).get('start_date', '2017-01-01')
+    start_date = data_cfg.get('global_date_window', {}).get('start_date', '2000-01-01')
     end_date = data_cfg.get('global_date_window', {}).get('end_date', '2025-12-31')
-
-    all_dfs = []
-    for cat in TICKERS.keys():
-        df = fetch_market_category(cat, start_date, end_date)
-        if not df.empty:
-            all_dfs.append(df)
-
-    if not all_dfs:
-        logger.warning("No economy data fetched.")
+    
+    logger.info(f"Date Range: {start_date} to {end_date}")
+    
+    # 1. Recreate table with new schema
+    recreate_table(engine)
+    
+    # 2. Fetch all tickers in wide format
+    df = fetch_all_tickers(start_date, end_date)
+    
+    if df.empty:
+        logger.error("No economy data to upload.")
         return
+    
+    # 3. Upload
+    upload_wide_data(df, engine)
+    
+    # 4. Summary stats
+    logger.info("Summary Statistics:")
+    for col in ['gold_price_usd', 'oil_price_usd', 'sp500_index', 'eur_usd_rate']:
+        if col in df.columns:
+            non_null = df[col].notna().sum()
+            logger.info(f"  {col}: {non_null} non-null values")
+    
+    logger.info("=" * 60)
+    logger.info("✓ ECONOMY INGESTION COMPLETE")
+    logger.info("=" * 60)
 
-    combined = pd.concat(all_dfs, ignore_index=True)
-    upload_to_database(combined, TARGET_TABLE, engine)
 
 def main():
     try:
@@ -277,8 +220,9 @@ def main():
         run(configs, engine)
         engine.dispose()
     except Exception as e:
-        logger.error(f"Economy ingestion failed: {e}")
+        logger.error(f"Economy ingestion failed: {e}", exc_info=True)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

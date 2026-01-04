@@ -308,6 +308,10 @@ def fetch_gdelt_with_fallback(config, start_date, end_date):
     cache_dir = PATHS["cache"] / "gdelt"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / "gdelt_full_cache.parquet"
+    if cache_file.exists():
+        age_days = (datetime.now().date() - datetime.fromtimestamp(cache_file.stat().st_mtime).date()).days
+        if age_days > 7:
+            logger.warning(f"⚠️  GDELT cache {cache_file} is {age_days} days old; refreshing window if needed.")
     
     # Convert dates to datetime.date for consistent comparison
     start_date_date = start_date.date() if isinstance(start_date, datetime) else pd.to_datetime(start_date).date()

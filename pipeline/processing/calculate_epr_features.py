@@ -100,15 +100,29 @@ def load_and_filter_polygons(engine):
 def load_epr_core_status(engine, start_year=2000, end_year=2025):
     """
     Loads yearly status data for the modeling window.
+    
+    TASK 4C FIXES:
+    - Excludes 'has_autonomy' column (not used in modeling)
+    - Fills 'reg_aut' NULLs with FALSE (explicit handling)
+    - FIX: Casts reg_aut to BOOLEAN to prevent SQL type mismatch error.
     """
     logger.info(f"Loading EPR Core status ({start_year}-{end_year})...")
     
+    # Select only needed columns - exclude has_autonomy
+    # FIXED: Added CAST(reg_aut AS BOOLEAN) to fix "text vs boolean" mismatch
     query = f"""
-        SELECT gwgroupid, year, status, status_numeric
+        SELECT gwgroupid, year, status, status_numeric,
+               COALESCE(CAST(reg_aut AS BOOLEAN), FALSE) as reg_aut
         FROM {SCHEMA}.{CORE_TABLE}
         WHERE year BETWEEN {start_year} AND {end_year}
     """
     df = pd.read_sql(query, engine)
+    
+    # Ensure reg_aut is boolean with no NULLs
+    if 'reg_aut' in df.columns:
+        df['reg_aut'] = df['reg_aut'].fillna(False).astype(bool)
+        logger.info(f"  reg_aut: {df['reg_aut'].sum()} groups with regional autonomy")
+    
     return df
 
 

@@ -8,6 +8,7 @@ AUDIT FIX:
 - Replaced to_postgis(replace) with upload_to_postgis(upsert).
 - Added ensure_table_exists.
 - Added retry logic with exponential backoff for network requests.
+- FIXED: Preserve is_diamond, is_gold, has_roadblock, worker_count columns.
 """
 
 import sys
@@ -31,9 +32,12 @@ TABLE_NAME = "mines_h3"
 
 
 def get_mining_config(data_config):
-    if "ipis_mines" in data_config: return data_config["ipis_mines"]
-    elif "mines_h3" in data_config: return data_config["mines_h3"]
-    else: raise KeyError("Could not find 'ipis_mines' in data.yaml")
+    if "ipis_mines" in data_config:
+        return data_config["ipis_mines"]
+    elif "mines_h3" in data_config:
+        return data_config["mines_h3"]
+    else:
+        raise KeyError("Could not find 'ipis_mines' in data.yaml")
 
 
 @retry_request
@@ -81,76 +85,139 @@ def fetch_wfs_data(data_config):
     return gdf
 
 
-def smart_deduplication(gdf, pk_col):
-    logger.info("Applying smart deduplication by H3 Index...")
+def clean_mining_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Clean and standardize mining attribute columns.
+    FIX: Uses numeric conversion to handle '1.0' (float) vs '1' (str).
+    """
+    logger.info("Cleaning mining attribute columns...")
+    gdf = gdf.copy()
     gdf.columns = [c.lower() for c in gdf.columns]
     
-    vid_col = next((c for c in ['id', 'gml_id', 'mine_id', 'pcode'] if c in gdf.columns), None)
-    if not vid_col:
-        gdf['vid'] = range(1, len(gdf) + 1)
-        vid_col = 'vid'
-        
-    company_col = next((c for c in gdf.columns if 'company' in c or 'operator' in c), None) or 'company'
-    mineral_col = next((c for c in gdf.columns if 'mineral' in c or 'commodity' in c), None) or 'mineral'
+    # Helper for boolean conversion
+    def to_bool_int(series):
+        # Coerce to numbers (handles '1', '1.0', 1, 1.0)
+        # Anything that isn't a number becomes NaN
+        numeric = pd.to_numeric(series, errors='coerce').fillna(0)
+        # Return 1 if > 0, else 0
+        return (numeric > 0).astype(int)
+
+    # --- is_diamond ---
+    if 'minerals_diamant' in gdf.columns:
+        gdf['is_diamond'] = to_bool_int(gdf['minerals_diamant'])
+    else:
+        gdf['is_diamond'] = 0
     
-    if company_col not in gdf.columns: gdf[company_col] = 'Unknown'
-    if mineral_col not in gdf.columns: gdf[mineral_col] = 'Unknown'
-
-    def agg_mode(x):
-        m = x.mode()
-        return str(m.iloc[0]) if not m.empty else None
-
-    def agg_set_join(x):
-        vals = {str(v).strip() for v in x if pd.notnull(v) and str(v).strip() != ''}
-        return ", ".join(sorted(vals)) if vals else None
-
-    grouped = gdf.groupby('h3_index')
+    # --- is_gold ---
+    if 'minerals_or' in gdf.columns:
+        gdf['is_gold'] = to_bool_int(gdf['minerals_or'])
+    else:
+        gdf['is_gold'] = 0
     
-    df_agg = grouped.agg({
-        vid_col: 'first',
-        company_col: agg_mode,
-        mineral_col: agg_set_join
-    }).reset_index()
-
-    geom_series = grouped['geometry'].apply(lambda x: x.unary_union)
-    df_agg = df_agg.merge(geom_series.rename('geometry'), on='h3_index')
+    # --- worker_count ---
+    if 'workers_numb' in gdf.columns:
+        gdf['worker_count'] = pd.to_numeric(gdf['workers_numb'], errors='coerce').fillna(0).astype(int)
+    else:
+        gdf['worker_count'] = 0
     
-    df_agg = df_agg.rename(columns={vid_col: 'vid', company_col: 'company', mineral_col: 'mineral'})
-    gdf_final = gpd.GeoDataFrame(df_agg, geometry='geometry', crs=gdf.crs)
+    # --- has_roadblock ---
+    if 'roadblocks' in gdf.columns:
+        # This fixes the specific bug by treating 1.0 and 1 identically
+        gdf['has_roadblock'] = to_bool_int(gdf['roadblocks'])
+    else:
+        logger.warning("Column 'roadblocks' not found. Setting has_roadblock to 0.")
+        gdf['has_roadblock'] = 0
     
-    logger.info(f"Smart aggregation reduced {len(gdf)} rows to {len(gdf_final)} unique H3 cells.")
-    return gdf_final
+    logger.info(f"  is_diamond: {gdf['is_diamond'].sum()} sites")
+    logger.info(f"  is_gold: {gdf['is_gold'].sum()} sites")
+    logger.info(f"  has_roadblock: {gdf['has_roadblock'].sum()} sites")
+    logger.info(f"  worker_count total: {gdf['worker_count'].sum()}")
+    
+    return gdf
 
 
-def process_mines(gdf, resolution):
-    gdf.columns = [c.lower() for c in gdf.columns]
+def smart_aggregation(gdf: gpd.GeoDataFrame, pk_col: str) -> gpd.GeoDataFrame:
+    """
+    Aggregate mines by H3 index with smart aggregation rules.
+    
+    Aggregation dictionary:
+      - is_diamond: max (if any mine in hex is diamond -> 1)
+      - is_gold: max (if any mine in hex is gold -> 1)
+      - has_roadblock: max (if any mine has roadblock -> 1)
+      - worker_count: sum (total workers in hex)
+      - geometry: first (keep representative centroid)
+    """
+    logger.info("Applying smart aggregation by H3 Index...")
+    
+    # Build aggregation dict
+    agg_dict = {
+        'is_diamond': 'max',
+        'is_gold': 'max',
+        'has_roadblock': 'max',
+        'worker_count': 'sum',
+        'geometry': 'first'
+    }
+    
+    # Group and aggregate
+    grouped = gdf.groupby(pk_col, as_index=False).agg(agg_dict)
+    
+    # Convert back to GeoDataFrame
+    gdf_agg = gpd.GeoDataFrame(grouped, geometry='geometry', crs=gdf.crs)
+    
+    logger.info(f"Smart aggregation reduced {len(gdf)} rows to {len(gdf_agg)} unique H3 cells.")
+    logger.info(f"  Aggregated is_diamond: {gdf_agg['is_diamond'].sum()} hexes")
+    logger.info(f"  Aggregated is_gold: {gdf_agg['is_gold'].sum()} hexes")
+    logger.info(f"  Aggregated has_roadblock: {gdf_agg['has_roadblock'].sum()} hexes")
+    logger.info(f"  Aggregated worker_count: {gdf_agg['worker_count'].sum()} total")
+    
+    return gdf_agg
+
+
+def process_mines(gdf: gpd.GeoDataFrame, resolution: int):
+    """
+    Process mining data:
+      1. Clean columns (is_diamond, is_gold, worker_count, has_roadblock)
+      2. Calculate H3 indices
+      3. Aggregate by H3
+    """
     pk_col = 'h3_index'
     
+    # Clean columns first
+    gdf = clean_mining_columns(gdf)
+    
+    # Calculate H3 indices
     logger.info(f"Calculating H3 indices at Resolution {resolution}...")
     gdf['h3_index'] = gdf.geometry.apply(
         lambda geom: h3.latlng_to_cell(geom.y, geom.x, resolution)
     )
     
-    gdf_final = smart_deduplication(gdf, pk_col)
+    # Smart aggregation
+    gdf_final = smart_aggregation(gdf, pk_col)
+    
     return gdf_final, pk_col
 
 
 def ensure_table_exists(engine):
+    """Create the mines_h3 table with proper schema including new columns."""
     with engine.begin() as conn:
         conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA};"))
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS {SCHEMA}.{TABLE_NAME} (
                 h3_index BIGINT PRIMARY KEY,
-                vid TEXT,
-                company TEXT,
-                mineral TEXT,
+                is_diamond INTEGER DEFAULT 0,
+                is_gold INTEGER DEFAULT 0,
+                has_roadblock INTEGER DEFAULT 0,
+                worker_count INTEGER DEFAULT 0,
                 geometry GEOMETRY(Geometry, 4326)
             );
         """))
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_geom ON {SCHEMA}.{TABLE_NAME} USING GIST (geometry);"))
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_diamond ON {SCHEMA}.{TABLE_NAME} (is_diamond);"))
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_gold ON {SCHEMA}.{TABLE_NAME} (is_gold);"))
 
 
-def import_to_postgres(gdf, pk_col, engine):
+def import_to_postgres(gdf: gpd.GeoDataFrame, pk_col: str, engine):
+    """Upload processed mines to PostGIS with upsert."""
     logger.info(f"Uploading {len(gdf)} mines to {SCHEMA}.{TABLE_NAME} (Upsert mode)...")
     
     ensure_table_exists(engine)
@@ -158,8 +225,14 @@ def import_to_postgres(gdf, pk_col, engine):
     df = pd.DataFrame(gdf)
     df['geometry'] = df['geometry'].apply(lambda x: x.wkt)
     df['h3_index'] = df['h3_index'].astype('int64')
+    
+    # Ensure integer types
+    df['is_diamond'] = df['is_diamond'].astype(int)
+    df['is_gold'] = df['is_gold'].astype(int)
+    df['has_roadblock'] = df['has_roadblock'].astype(int)
+    df['worker_count'] = df['worker_count'].astype(int)
 
-    cols = ['h3_index', 'vid', 'company', 'mineral', 'geometry']
+    cols = ['h3_index', 'is_diamond', 'is_gold', 'has_roadblock', 'worker_count', 'geometry']
     upload_to_postgis(engine, df[cols], TABLE_NAME, SCHEMA, primary_keys=[pk_col])
     
     logger.info("IPIS Mines import complete.")
@@ -177,7 +250,9 @@ def main():
         resolution = features_config["spatial"]["h3_resolution"]
 
         gdf = fetch_wfs_data(data_config)
-        if gdf.empty: return
+        if gdf.empty:
+            logger.warning("No mining sites retrieved. Exiting.")
+            return
 
         gdf_processed, pk_col = process_mines(gdf, resolution)
         import_to_postgres(gdf_processed, pk_col, engine)
@@ -186,7 +261,8 @@ def main():
         logger.error(f"IPIS mines import failed: {e}", exc_info=True)
         sys.exit(1)
     finally:
-        if engine: engine.dispose()
+        if engine:
+            engine.dispose()
 
 
 if __name__ == "__main__":

@@ -1,17 +1,10 @@
-# configs/models.yaml
-# =================================================================
-# MODELING EXPERIMENT CONFIGURATION
-# =================================================================
+# ==============================================================================
+# MODEL CONFIGURATION
+# Methodology (Objectives, Metrics) is hardcoded in Python.
+# This file controls Hyperparameters and Feature Selection.
+# ==============================================================================
 
-feature_matrix:
-  build_start_date: "2000-01-01"
-  build_end_date: "2025-12-31"
-  chunk_size: "yearly"
-
-experiment:
-  random_seed: 42
-
-# --- TARGET HORIZONS ---
+# 1. FORECAST HORIZONS
 horizons:
   - name: "14d"
     steps: 1
@@ -20,74 +13,109 @@ horizons:
   - name: "3m"
     steps: 6
 
-# --- LEARNER PARAMETERS ---
+# 2. GLOBAL THESIS PARAMETERS
+# Used by the TwoStageEnsemble logic to weight rare events (~2% positive class)
+# Note: The new script calculates this dynamically, but this acts as a fallback.
 hurdle_params:
-  classifier_scale_pos_weight: "auto"
-  regressor_loss_function: "huber"
-  regressor_huber_delta: 1.0
+  classifier_scale_pos_weight: 35.0
 
+# 3. LEARNERS (Hyperparameters Only)
+# NOTE: Do NOT add 'objective' or 'eval_metric' here. They are handled in train_models.py.
 learners:
   xgboost:
     type: "xgboost"
     params:
-      n_estimators: 300
-      max_depth: 6
+      n_estimators: 1000
       learning_rate: 0.05
-      tree_method: "hist"
-      n_jobs: -1
-      
+      max_depth: 6
+      subsample: 0.8
+      colsample_bytree: 0.8
+      gamma: 1.0
+      reg_alpha: 0.1
+      reg_lambda: 1.0
+
   lightgbm:
     type: "lightgbm"
     params:
-      n_estimators: 300
-      num_leaves: 31
+      n_estimators: 1000
       learning_rate: 0.05
+      num_leaves: 31
       max_depth: -1
-      n_jobs: -1
+      subsample: 0.8
+      colsample_bytree: 0.8
+      reg_alpha: 0.1
+      reg_lambda: 1.0
       verbose: -1
 
-# --- FEATURE SUBSETS ---
+# 4. SUBMODEL THEMES
+# ==============================================================================
+# CRITICAL: Feature names MUST match actual DB column names in either:
+#   - car_cewp.temporal_features (dynamic/time-varying features)
+#   - car_cewp.features_static (static/geographic features)
+# ==============================================================================
 submodels:
-  baseline:
+  conflict_history:
     enabled: true
     features:
-      - fatalities_14d_sum
-      - pop_log
+      - "fatalities_1m_lag"
+      - "events_3m_lag"
+      # - "days_since_last_event"  # Not currently generated
+      - "conflict_density_10km"
+      - "regional_risk_score_lag1"
 
-  conflicthistory:
+  economics:
     enabled: true
     features:
-      - fatalities_decay_30d
-      - protest_count_lag1
-      - riot_count_lag1
+      - "price_maize"
+      - "price_maize_shock"
+      - "price_rice"
+      - "price_rice_shock"
+      - "price_oil"
+      - "price_oil_shock"
+      - "gold_price_usd_lag1"
+      - "dist_to_city"
 
-  geography:
+  environmental:
     enabled: true
     features:
-      - dist_to_capital
-      - terrain_ruggedness_index
-      - dist_to_road
-      # Water features mapped from JRC_Landsat (see features.yaml)
-      - water_coverage_lag1 
-      - water_presence_lag1
+      - "chirps_precip_anomaly"
+      - "era5_temp_anomaly"
+      - "era5_soil_moisture_anomaly"
+      - "ndvi_anomaly"
+      - "nightlights_intensity"
+      - "water_coverage_lag1"
 
-  resources_economy:
+  epr:
     enabled: true
     features:
-      - dist_to_diamond_mine
-      - commodity_gold_price_usd_lag1
-      - viirs_ntl_mean_lag1
+      - "epr_excluded_groups_count"
+      - "epr_horizontal_inequality"
+      - "epr_status_mean"
 
-  sociopolitics:
+  terrain:
     enabled: true
     features:
-      - epr_excluded_groups_count
-      - iom_displacement_count_lag1
-      - ipc_phase_class_lag1
+      - "elevation_mean"
+      - "slope_mean"
+      - "terrain_ruggedness_index"
+      - "dist_to_road"
+      - "dist_to_city"
+      - "dist_to_river"
+      - "dist_to_diamond_mine"
+      - "dist_to_gold_mine"
+      # New Strategic Features
+      - "dist_to_large_mine"
+      - "dist_to_controlled_mine"
+      - "dist_to_large_gold_mine"
 
+  temporal_context:
+    enabled: true
+    features:
+      - "month_sin"
+      - "month_cos"
+      - "is_dry_season"
+
+  # REQUIRED: The script looks for this specific key for dimensionality reduction
   broad_pca:
     enabled: true
-    type: "pca"
     variance_retention: 0.90
-    features:
-      - all_candidates

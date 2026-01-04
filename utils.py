@@ -4,11 +4,8 @@ utils.py
 Core utilities for the CEWP pipeline.
 Handles configuration loading, database connections, and path management.
 
-VERIFIED HYBRID VERSION:
-- Keeps robust 'get_boundary' from original.
-- Includes new 'ensure_h3_int64' for type safety.
-- Includes new CSV-based 'upload_to_postgis' for text safety.
-- Includes pre-flight validation for pipeline phases.
+UPDATES:
+- Added `init_gee`: Robust, silent Google Earth Engine auth using Service Accounts.
 """
 import os
 import sys
@@ -19,13 +16,20 @@ import io as sys_io
 import requests
 import pandas as pd
 import geopandas as gpd
+import subprocess
 from io import StringIO
+import geoalchemy2
 from sqlalchemy import create_engine, text, inspect
 from dotenv import load_dotenv
 from pathlib import Path
 from datetime import datetime
+from geoalchemy2 import Geometry
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from typing import Dict, List, Tuple, Optional
+
+# --- NEW IMPORTS FOR GEE AUTH ---
+import ee
+from google.oauth2 import service_account
 
 # -----------------------------------------------------------------
 # 1. CENTRALIZED PATHS
@@ -90,10 +94,40 @@ def ensure_h3_int64(h3_val):
         return None
 
 # -----------------------------------------------------------------
+# 3b. IMPUTATION & TYPE VALIDATION HELPERS
+# -----------------------------------------------------------------
+def apply_forward_fill(df, col, groupby_col="h3_index", limit=None, config=None):
+    if limit is None:
+        if config:
+            limit = config.get("imputation", {}).get("defaults", {}).get("limit", 4)
+        else:
+            limit = 4
+    return df.groupby(groupby_col)[col].ffill(limit=limit)
+
+
+def validate_h3_types(engine):
+    query = text(
+        """
+        SELECT table_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'car_cewp'
+          AND column_name = 'h3_index'
+          AND data_type NOT IN ('bigint', 'int8')
+        """
+    )
+    with engine.connect() as conn:
+        violations = pd.read_sql(query, conn)
+    if not violations.empty:
+        raise TypeError(
+            "H3 type violations found:\n"
+            f"{violations.to_string(index=False)}\n"
+            "Run init_db.py or fix schemas before proceeding."
+        )
+
+# -----------------------------------------------------------------
 # 4. CONFIGURATION LOADER
 # -----------------------------------------------------------------
 class ConfigBundle:
-    """Config container supporting tuple unpacking and dict access."""
     __slots__ = ("data", "features", "models")
     def __init__(self, data, features, models):
         self.data, self.features, self.models = data or {}, features or {}, models or {}
@@ -126,6 +160,16 @@ def load_configs() -> ConfigBundle:
 def get_secrets() -> dict:
     env_path = PATHS["root"] / ".env"
     load_dotenv(env_path)
+    
+    if os.environ.get("DB_HOST") == "localhost" and "microsoft" in os.uname().release.lower():
+        try:
+            cmd = "ip route show | awk '/default/ {print $3}'"
+            gateway_ip = subprocess.check_output(cmd, shell=True).decode().strip()
+            os.environ["DB_HOST"] = gateway_ip
+            logger.info(f"🔧 WSL Detected: Auto-routed DB connection to Windows Host ({gateway_ip})")
+        except Exception as e:
+            logger.warning(f"Could not auto-resolve WSL host: {e}")
+
     return os.environ
 
 def get_db_engine():
@@ -186,10 +230,6 @@ def get_boundary(data_config: dict, features_config: dict):
 # 8. UPLOAD HELPER (UPSERT + CSV SAFETY)
 # -----------------------------------------------------------------
 def upload_to_postgis(engine, df: pd.DataFrame, table_name: str, schema: str, primary_keys: list):
-    """
-    High-performance Upsert using COPY via CSV format.
-    Handles text delimiters and quoting robustly.
-    """
     if df.empty: return
         
     temp_table = f"temp_{table_name}_{int(time.time())}"
@@ -220,16 +260,51 @@ def upload_to_postgis(engine, df: pd.DataFrame, table_name: str, schema: str, pr
         conn.execute(text(sql))
         logger.info(f"Upserted {len(df)} rows to {schema}.{table_name}")
 
+# -----------------------------------------------------------------
+# 9. GOOGLE EARTH ENGINE AUTH (THE ELEGANT SOLUTION)
+# -----------------------------------------------------------------
+def init_gee(project_id: str):
+    """
+    Initializes Google Earth Engine using a Service Account JSON key if available.
+    Falls back to standard auth if not.
+    """
+    # 1. Try Loading from Environment Variable (Best Practice)
+    key_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    
+    # 2. Hardcoded fallback (For your specific WSL setup)
+    if not key_path:
+        # Check common location
+        candidate = Path("/home/brenan/.config/google_key.json")
+        if candidate.exists():
+            key_path = str(candidate)
+
+    if key_path and os.path.exists(key_path):
+        try:
+            credentials = service_account.Credentials.from_service_account_file(key_path)
+            scoped_credentials = credentials.with_scopes(['https://www.googleapis.com/auth/earthengine'])
+            ee.Initialize(credentials=scoped_credentials, project=project_id)
+            logger.info(f"✓ GEE Authenticated via Service Account: {key_path}")
+            return
+        except Exception as e:
+            logger.warning(f"Service Account auth failed: {e}. Falling back to default.")
+
+    # 3. Fallback to Standard Interactive Auth
+    try:
+        ee.Initialize(project=project_id)
+        logger.info(f"✓ GEE Initialized (Standard Auth)")
+    except Exception as e:
+        logger.warning(f"GEE init failed ({e}); attempting Authenticate()...")
+        ee.Authenticate()
+        ee.Initialize(project=project_id)
+
 
 # -----------------------------------------------------------------
-# 9. PRE-FLIGHT VALIDATION
+# 10. PRE-FLIGHT VALIDATION (Unchanged)
 # -----------------------------------------------------------------
-
-# Phase prerequisites definition
 PHASE_PREREQUISITES = {
     "static": {
         "extensions": ["postgis", "h3", "h3_postgis"],
-        "tables": {},  # No table prerequisites for static phase
+        "tables": {}, 
         "description": "Static phase requires PostgreSQL extensions only."
     },
     "dynamic": {
@@ -237,7 +312,7 @@ PHASE_PREREQUISITES = {
         "tables": {
             "features_static": ["h3_index", "geometry"],
         },
-        "description": "Dynamic phase requires static features table. Run: --skip-dynamic to skip, or run static phase first."
+        "description": "Dynamic phase requires static features table."
     },
     "feature_engineering": {
         "extensions": ["postgis", "h3", "h3_postgis"],
@@ -246,7 +321,7 @@ PHASE_PREREQUISITES = {
             "acled_events": ["h3_index", "event_date", "fatalities"],
             "environmental_features": ["h3_index", "date"],
         },
-        "description": "Feature engineering requires static and dynamic data. Run static and dynamic phases first."
+        "description": "Feature engineering requires static and dynamic data."
     },
     "modeling": {
         "extensions": ["postgis", "h3", "h3_postgis"],
@@ -254,14 +329,11 @@ PHASE_PREREQUISITES = {
             "temporal_features": ["h3_index", "date"],
             "features_static": ["h3_index"],
         },
-        "description": "Modeling phase requires temporal_features table. Run feature engineering phase first."
+        "description": "Modeling phase requires temporal_features table."
     }
 }
 
-
 class ValidationResult:
-    """Container for validation results."""
-    
     def __init__(self, phase: str):
         self.phase = phase
         self.passed = True
@@ -286,150 +358,64 @@ class ValidationResult:
         self.warnings.append(warning)
     
     def get_error_message(self) -> str:
-        """Generate actionable error message."""
-        if self.passed:
-            return f"✓ Phase '{self.phase}' validation passed."
-        
+        if self.passed: return f"✓ Phase '{self.phase}' validation passed."
         lines = [f"❌ Phase '{self.phase}' validation FAILED:"]
-        
         if self.missing_extensions:
             lines.append(f"  Missing PostgreSQL extensions: {', '.join(self.missing_extensions)}")
-            lines.append("    → Run: CREATE EXTENSION <name>;")
-        
         if self.missing_tables:
             lines.append(f"  Missing tables: {', '.join(self.missing_tables)}")
-            prereq = PHASE_PREREQUISITES.get(self.phase, {})
-            lines.append(f"    → {prereq.get('description', 'Run earlier pipeline phases.')}")
-        
         if self.missing_columns:
             for table, cols in self.missing_columns.items():
                 lines.append(f"  Table '{table}' missing columns: {', '.join(cols)}")
-        
         return "\n".join(lines)
     
-    def __bool__(self):
-        return self.passed
-
+    def __bool__(self): return self.passed
 
 def _check_extensions(engine, required: List[str]) -> List[str]:
-    """Check which PostgreSQL extensions are missing."""
     missing = []
     with engine.connect() as conn:
         result = conn.execute(text("SELECT extname FROM pg_extension"))
         installed = {row[0] for row in result}
-        
     for ext in required:
-        if ext not in installed:
-            missing.append(ext)
-    
+        if ext not in installed: missing.append(ext)
     return missing
-
 
 def _check_table_exists(engine, table: str, schema: str = SCHEMA) -> bool:
-    """Check if a table exists."""
-    inspector = inspect(engine)
-    return inspector.has_table(table, schema=schema)
-
+    return inspect(engine).has_table(table, schema=schema)
 
 def _check_columns_exist(engine, table: str, required_cols: List[str], schema: str = SCHEMA) -> List[str]:
-    """Check which columns are missing from a table."""
     inspector = inspect(engine)
-    
-    if not inspector.has_table(table, schema=schema):
-        return required_cols  # All columns missing if table doesn't exist
-    
+    if not inspector.has_table(table, schema=schema): return required_cols
     existing = {col['name'] for col in inspector.get_columns(table, schema=schema)}
-    missing = [col for col in required_cols if col not in existing]
-    
-    return missing
+    return [col for col in required_cols if col not in existing]
 
-
-def validate_pipeline_prerequisites(
-    engine, 
-    phase: str, 
-    schema: str = SCHEMA
-) -> ValidationResult:
-    """
-    Validate that all prerequisites are met for a pipeline phase.
-    
-    Args:
-        engine: SQLAlchemy engine
-        phase: One of 'static', 'dynamic', 'feature_engineering', 'modeling'
-        schema: Database schema name
-    
-    Returns:
-        ValidationResult with pass/fail status and detailed error info
-    """
+def validate_pipeline_prerequisites(engine, phase: str, schema: str = SCHEMA) -> ValidationResult:
     if phase not in PHASE_PREREQUISITES:
-        raise ValueError(f"Unknown phase: {phase}. Valid phases: {list(PHASE_PREREQUISITES.keys())}")
-    
+        raise ValueError(f"Unknown phase: {phase}")
     prereqs = PHASE_PREREQUISITES[phase]
     result = ValidationResult(phase)
-    
     logger.info(f"Validating prerequisites for phase: {phase}")
     
-    # 1. Check extensions
-    required_exts = prereqs.get("extensions", [])
-    if required_exts:
-        missing_exts = _check_extensions(engine, required_exts)
-        for ext in missing_exts:
-            result.add_missing_extension(ext)
-        
-        if missing_exts:
-            logger.warning(f"  ⚠ Missing extensions: {missing_exts}")
-        else:
-            logger.info(f"  ✓ All required extensions present")
+    req_exts = prereqs.get("extensions", [])
+    if req_exts:
+        missing = _check_extensions(engine, req_exts)
+        for ext in missing: result.add_missing_extension(ext)
     
-    # 2. Check tables and columns
-    required_tables = prereqs.get("tables", {})
-    for table, columns in required_tables.items():
+    req_tables = prereqs.get("tables", {})
+    for table, columns in req_tables.items():
         if not _check_table_exists(engine, table, schema):
             result.add_missing_table(table)
-            logger.warning(f"  ⚠ Missing table: {schema}.{table}")
         else:
-            missing_cols = _check_columns_exist(engine, table, columns, schema)
-            if missing_cols:
-                result.add_missing_columns(table, missing_cols)
-                logger.warning(f"  ⚠ Table {table} missing columns: {missing_cols}")
-            else:
-                logger.info(f"  ✓ Table {schema}.{table} OK")
-    
-    # 3. Log result
-    if result.passed:
-        logger.info(f"✓ Phase '{phase}' prerequisites validated successfully")
-    else:
-        logger.error(result.get_error_message())
-    
+            missing = _check_columns_exist(engine, table, columns, schema)
+            if missing: result.add_missing_columns(table, missing)
+            
+    if result.passed: logger.info(f"✓ Phase '{phase}' prerequisites validated successfully")
+    else: logger.error(result.get_error_message())
     return result
 
-
 def validate_all_phases(engine, schema: str = SCHEMA) -> Dict[str, ValidationResult]:
-    """
-    Validate prerequisites for all pipeline phases.
-    
-    Returns:
-        Dict mapping phase name to ValidationResult
-    """
     results = {}
-    
-    logger.info("=" * 60)
     logger.info("FULL PIPELINE VALIDATION")
-    logger.info("=" * 60)
-    
     for phase in PHASE_PREREQUISITES.keys():
         results[phase] = validate_pipeline_prerequisites(engine, phase, schema)
-        logger.info("")  # Blank line between phases
-    
-    # Summary
-    passed = sum(1 for r in results.values() if r.passed)
-    total = len(results)
-    
-    logger.info("=" * 60)
-    logger.info(f"VALIDATION SUMMARY: {passed}/{total} phases ready")
-    logger.info("=" * 60)
-    
-    for phase, result in results.items():
-        status = "✓ READY" if result.passed else "❌ NOT READY"
-        logger.info(f"  {phase}: {status}")
-    
     return results

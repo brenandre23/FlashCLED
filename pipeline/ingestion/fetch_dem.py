@@ -119,8 +119,10 @@ def fetch_copernicus_dem(configs):
     
     boundary = get_boundary(data_config, features_config)
     metric_crs = features_config["spatial"]["crs"]["metric"]
-    # Buffer to ensure coverage for slope calcs at edges
-    boundary_buffered = boundary.to_crs(metric_crs).buffer(5000).to_crs("EPSG:4326")
+    # Buffer = config buffer_km + 15km for DEM edge coverage (slope/TRI calculation needs neighbors)
+    buffer_km = features_config["spatial"]["buffer_km"]
+    dem_buffer_m = (buffer_km + 15) * 1000  # ~23.5km total for grid buffer 8.5km
+    boundary_buffered = boundary.to_crs(metric_crs).buffer(dem_buffer_m).to_crs("EPSG:4326")
     minx, miny, maxx, maxy = boundary_buffered.total_bounds
     
     step = 1.5

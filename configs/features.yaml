@@ -1,4 +1,4 @@
-# configs/features.yaml
+# config/features.yaml (Cleaned & Grouped)
 # =================================================================
 # FEATURE ENGINEERING CONFIGURATION
 # Backbone for pipeline/processing/feature_engineering.py
@@ -10,42 +10,45 @@ spatial:
     metric: "EPSG:32634"  # UTM Zone 34N
     geodetic: "EPSG:4326" # WGS84
   h3_resolution: 5
-  buffer_km: 50
+  buffer_km: 8.5
 
 # --- TEMPORAL DEFINITIONS (The 14-Day Spine) ---
 temporal:
   base_unit: "step"
   step_days: 14           # 1 Step = 14 Days
   alignment_date: "2000-01-01"
-
-  # Decay functions for conflict history (Exponential Weighted Moving Average)
   decays:
-    # 30 days is approx 2.14 steps (30 / 14)
-    half_life_30d:
-      steps: 2.14
-    # 90 days is approx 6.43 steps (90 / 14)
-    half_life_90d:
-      steps: 6.43
+    half_life_30d: { steps: 2.14 }
+    half_life_90d: { steps: 6.43 }
+
+# --- IMPUTATION STRATEGY ---
+imputation:
+  defaults:
+    method: "forward_fill"
+    limit: 4
 
 # --- FEATURE REGISTRY ---
-# The Master Script parses this to determine which columns to keep and transform.
 registry:
-  # --- ENVIRONMENTAL (Phase 3) ---
+
+  # =========================================================
+  # 1. ENVIRONMENTAL FEATURES (Phase 3)
+  # Sources: CHIRPS, ERA5, MODIS, VIIRS
+  # =========================================================
   - raw: "precip_mean_depth_mm"
     source: "CHIRPS"
     transformation: "anomaly"
     output_col: "chirps_precip_anomaly"
-  
+
   - raw: "temp_mean"
     source: "ERA5"
     transformation: "anomaly"
     output_col: "era5_temp_anomaly"
-  
+
   - raw: "soil_moisture_mean"
     source: "ERA5"
     transformation: "anomaly"
     output_col: "era5_soil_moisture_anomaly"
-  
+
   - raw: "ndvi_max"
     source: "MODIS"
     transformation: "anomaly"
@@ -53,13 +56,10 @@ registry:
 
   - raw: "ntl_mean"
     source: "VIIRS"
-    transformation: "lag_1_step"
-    output_col: "viirs_ntl_mean_lag1"
+    transformation: "mean"
+    output_col: "nightlights_intensity"
 
-  # --- WATER FEATURES (JRC Global Surface Water) ---
-  # MAPPING NOTE:
-  # DB Column 'water_local_max' (Binary: 1 if water detected anywhere in cell) maps to 'water_presence_lag1'
-  # DB Column 'water_local_mean' (Float: % area covered by water) maps to 'water_coverage_lag1'
+  # Water (JRC)
   - raw: "water_local_max"
     source: "JRC_Landsat"
     transformation: "lag_1_step"
@@ -70,17 +70,28 @@ registry:
     transformation: "lag_1_step"
     output_col: "water_coverage_lag1"
 
-  # --- CONFLICT (Phase 4) ---
+
+  # =========================================================
+  # 2. CONFLICT FEATURES (Phase 4)
+  # Sources: ACLED, GDELT
+  # =========================================================
+  # ACLED Fatalities
+  - raw: "fatalities"
+    source: "ACLED"
+    transformation: "lag"
+    output_col: "fatalities_1m_lag"
+
   - raw: "fatalities"
     source: "ACLED"
     transformation: "decay_30d"
-    output_col: "fatalities_decay_30d"
+    output_col: "conflict_density_10km"
 
   - raw: "fatalities"
     source: "ACLED"
     transformation: "sum"
     output_col: "fatalities_14d_sum"
 
+  # ACLED Civil Unrest
   - raw: "protest_count"
     source: "ACLED"
     transformation: "lag_1_step"
@@ -91,28 +102,110 @@ registry:
     transformation: "lag_1_step"
     output_col: "riot_count_lag1"
 
+  # GDELT
+  - raw: "gdelt_event_count"
+    source: "GDELT"
+    transformation: "decay_90d"
+    output_col: "events_3m_lag"
+
   - raw: "gdelt_event_count"
     source: "GDELT"
     transformation: "decay_30d"
     output_col: "gdelt_decay_30d"
 
-  # --- ECONOMIC (Phase 2) ---
-  - raw: "commodity_gold_price_usd"
-    source: "YahooFinance"
-    transformation: "lag_1_step"
-    output_col: "commodity_gold_price_usd_lag1"
+  # --- NEW: Stream B Regional Context ---
+  # We lag this by 1 step so the model sees the "Ambient Risk" of the PREVIOUS period
+  # when trying to predict the current period.
+  - source: ACLED
+    raw: regional_risk_score
+    transformation: lag_1_step
+    output_col: regional_risk_score_lag1
 
-  # --- SOCIAL (Phase 2B) ---
-  - raw: "ipc_phase_class"
-    source: "FEWS_NET"
-    transformation: "lag_1_step"
-    output_col: "ipc_phase_class_lag1"
 
+  # =========================================================
+  # 3. MACRO-ECONOMIC FEATURES (Phase 2)
+  # Sources: YahooFinance/Economy
+  # =========================================================
+  - raw: "gold_price_usd"
+    source: "Economy"
+    transformation: "lag_1_step"
+    output_col: "gold_price_usd_lag1"
+
+  - raw: "oil_price_usd"
+    source: "Economy"
+    transformation: "lag_1_step"
+    output_col: "oil_price_usd_lag1"
+
+  - raw: "sp500_index"
+    source: "Economy"
+    transformation: "lag_1_step"
+    output_col: "sp500_index_lag1"
+
+  - raw: "eur_usd_rate"
+    source: "Economy"
+    transformation: "lag_1_step"
+    output_col: "eur_usd_rate_lag1"
+
+
+  # =========================================================
+  # 4. FOOD SECURITY (Phase 2B)
+  # Sources: FEWS NET (Food_Security)
+  # =========================================================
+  # Raw Prices
+  - raw: "price_maize"
+    source: "Food_Security"
+    transformation: "none"
+    output_col: "price_maize"
+
+  - raw: "price_rice"
+    source: "Food_Security"
+    transformation: "none"
+    output_col: "price_rice"
+
+  - raw: "price_oil"
+    source: "Food_Security"
+    transformation: "none"
+    output_col: "price_oil"
+
+  - raw: "price_sorghum"
+    source: "Food_Security"
+    transformation: "none"
+    output_col: "price_sorghum"
+
+  # Price Shocks (Calculated in Python)
+  - raw: "price_maize"
+    source: "Food_Security"
+    transformation: "shock_12m"
+    transformation_params:
+      lookback_months: 12
+    output_col: "price_maize_shock"
+
+  - raw: "price_rice"
+    source: "Food_Security"
+    transformation: "shock_12m"
+    transformation_params:
+      lookback_months: 12
+    output_col: "price_rice_shock"
+
+  - raw: "price_oil"
+    source: "Food_Security"
+    transformation: "shock_12m"
+    transformation_params:
+      lookback_months: 12
+    output_col: "price_oil_shock"
+
+
+  # =========================================================
+  # 5. SOCIAL & DEMOGRAPHIC (Phase 2B/2C)
+  # Sources: IOM, EPR, WorldPop
+  # =========================================================
+  # IOM Displacement
   - raw: "iom_displacement_sum"
     source: "IOM_DTM"
     transformation: "lag_1_step"
     output_col: "iom_displacement_count_lag1"
 
+  # EPR (Ethnic Power Relations)
   - raw: "epr_excluded_groups_count"
     source: "EPR"
     transformation: "none"
@@ -138,16 +231,18 @@ registry:
     transformation: "none"
     output_col: "ethnic_group_count"
 
-  # --- DEMOGRAPHICS ---
+  # Demographics
   - raw: "pop_count"
     source: "WorldPop"
     transformation: "log1p"
     output_col: "pop_log"
 
-# =================================================================
-# STATIC DISTANCE FEATURES (from calculate_static_distances.py)
-# =================================================================
 
+  # =========================================================
+  # 6. STATIC GEOGRAPHY
+  # Computed by calculate_static_distances.py -> features_static
+  # =========================================================
+  # Distances
   - raw: "dist_to_capital"
     source: "Static_Geography"
     transformation: "none"
@@ -163,19 +258,43 @@ registry:
     transformation: "none"
     output_col: "dist_to_road"
 
+  - raw: "dist_to_city"
+    source: "OSM_Settlements"
+    transformation: "none"
+    output_col: "dist_to_city"
+
   - raw: "dist_to_diamond_mine"
     source: "IPIS_Mines"
     transformation: "none"
     output_col: "dist_to_diamond_mine"
 
+  - raw: "dist_to_large_mine"
+    source: "IPIS_Mines"
+    transformation: "none"
+    output_col: "dist_to_large_mine"
+
+  - raw: "dist_to_controlled_mine"
+    source: "IPIS_Mines"
+    transformation: "none"
+    output_col: "dist_to_controlled_mine"
+
+  - raw: "dist_to_large_gold_mine"
+    source: "IPIS_Mines"
+    transformation: "none"
+    output_col: "dist_to_large_gold_mine"
+
+  # Terrain
   - raw: "terrain_ruggedness_index"
     source: "Copernicus_DEM"
     transformation: "none"
     output_col: "terrain_ruggedness_index"
 
+  - raw: "elevation_mean"
+    source: "Copernicus_DEM"
+    transformation: "none"
+    output_col: "elevation_mean"
 
-# --- IMPUTATION STRATEGY ---
-imputation:
-  defaults:
-    method: "forward_fill"
-    limit: 4
+  - raw: "slope_mean"
+    source: "Copernicus_DEM"
+    transformation: "none"
+    output_col: "slope_mean"

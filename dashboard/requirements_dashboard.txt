@@ -1,0 +1,26 @@
+# CEWP Dashboard Requirements
+# Install with: pip install -r requirements_dashboard.txt
+
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# Database
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+geoalchemy2>=0.14.0
+
+# Data Processing
+pandas>=2.0.0
+geopandas>=0.14.0
+numpy>=1.24.0
+shapely>=2.0.0
+
+# H3 Spatial Index
+h3>=3.7.6
+
+# Environment
+python-dotenv>=1.0.0
+
+# Optional: Development
+httpx>=0.26.0  # For testing

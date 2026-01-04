@@ -16,7 +16,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 # Import centralized utils to ensure consistency
-from utils import logger, get_db_engine
+from utils import logger, get_db_engine, validate_h3_types
 
 # Configuration
 SCHEMA = "car_cewp"
@@ -43,7 +43,21 @@ def enforce_h3_standards(conn):
     logger.info("Checking H3 data type consistency...")
     
     # Tables that historically had issues
-    target_tables = ["acled_events", "features_dynamic_daily"]
+    target_tables = [
+        "acled_events",
+        "features_dynamic_daily",
+        "features_static",
+        "grip4_roads_h3",
+        "rivers",
+        "mines_h3",
+        "osm_cities_h3",
+        "geoepr_polygons",
+        "population_h3",
+        "iom_displacement_h3",
+        "ipc_h3",
+        "environmental_features",
+        "temporal_features",
+    ]
     
     inspector = inspect(conn)
     
@@ -93,6 +107,9 @@ def run():
             
             # 2. Repair/Enforce Standards
             enforce_h3_standards(conn)
+        
+        # 3. Validate types post-run
+        validate_h3_types(engine)
 
         logger.info("--- DATABASE INITIALIZATION COMPLETE ---")
         

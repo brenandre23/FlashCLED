@@ -12,7 +12,7 @@ import pandas as pd
 import geopandas as gpd
 import rasterio
 from rasterio import features
-from sqlalchemy import text
+from sqlalchemy import text, inspect
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -24,6 +24,33 @@ from utils import logger, get_db_engine, load_configs, upload_to_postgis, PATHS
 SCHEMA = "car_cewp"
 STATIC_TABLE = "features_static"
 CHUNK_SIZE = 50000  # Process 50k cells at a time
+ZONAL_COLUMNS = ["elevation_mean", "slope_mean", "terrain_ruggedness_index"]
+
+
+def zonal_stats_already_populated(engine) -> bool:
+    """
+    Return True when the target columns exist on features_static and have no NULLs.
+    This lets us skip raster reprocessing when rerunning the pipeline.
+    """
+    inspector = inspect(engine)
+    if not inspector.has_table(STATIC_TABLE, schema=SCHEMA):
+        return False
+
+    existing_cols = {col["name"] for col in inspector.get_columns(STATIC_TABLE, schema=SCHEMA)}
+    missing_cols = [c for c in ZONAL_COLUMNS if c not in existing_cols]
+    if missing_cols:
+        return False
+
+    null_checks = " + ".join([f"SUM(CASE WHEN {c} IS NULL THEN 1 ELSE 0 END)" for c in ZONAL_COLUMNS])
+    query = f"SELECT COUNT(*) AS total_rows, {null_checks} AS null_total FROM {SCHEMA}.{STATIC_TABLE};"
+
+    with engine.connect() as conn:
+        result = conn.execute(text(query)).mappings().first()
+
+    if not result or result["total_rows"] == 0:
+        return False
+
+    return result["null_total"] == 0
 
 def iter_h3_grid_chunks(engine):
     """Yields chunks of the H3 grid."""
@@ -122,10 +149,14 @@ def calculate_chunk_stats(burned, h3_map, raster_inputs):
 
 def calculate_zonal_stats_vectorized(dem_path, slope_path, tri_path, engine):
     logger.info("Calculating Zonal Stats (Memory Safe Chunking)...")
+
+    # Fast exit if we already processed all rows
+    if zonal_stats_already_populated(engine):
+        logger.info("  Zonal stats already populated; skipping raster processing.")
+        return
     
     # Schema check: ONLY add columns, do NOT try to add a Primary Key again.
     with engine.begin() as conn:
-        # REMOVED: conn.execute(text(f"ALTER TABLE {SCHEMA}.{STATIC_TABLE} ADD PRIMARY KEY (h3_index);"))
         conn.execute(text(f"""
             ALTER TABLE {SCHEMA}.{STATIC_TABLE} 
             ADD COLUMN IF NOT EXISTS elevation_mean FLOAT,
