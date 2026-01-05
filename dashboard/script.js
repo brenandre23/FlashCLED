@@ -1,8 +1,13 @@
 /**
- * CEWP Dashboard - Main JavaScript
- * =================================
+ * CEWP Dashboard - Main JavaScript (Optimized)
+ * =============================================
  * Interactive visualization using Deck.gl + MapLibre GL JS
- * Connects to FastAPI backend for prediction data
+ * 
+ * OPTIMIZATIONS:
+ * 1. Geometry/Data Split - Load geometry once, update data separately
+ * 2. Debounced Slider - API calls only fire after user stops dragging
+ * 3. D3 Color Scales - Professional YlOrRd interpolation
+ * 4. Efficient Data Joining - Map lookup for O(1) geometry matching
  */
 
 // =============================================================================
@@ -10,31 +15,26 @@
 // =============================================================================
 
 const CONFIG = {
-    API_BASE: window.location.origin,  // Same origin as served page
-    MAP_CENTER: [20.9, 6.6],           // CAR center [lng, lat]
+    API_BASE: window.location.origin,
+    MAP_CENTER: [20.9, 6.6],
     MAP_ZOOM: 5.5,
     H3_RESOLUTION: 5,
-    TILE_SOURCES: {
-        // Free raster tile sources (no API key required)
-        cartodb_positron: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
-        cartodb_dark: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
-        osm: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-        stamen_terrain: 'https://tiles.stadiamaps.com/tiles/stamen_terrain/{z}/{x}/{y}.png'
-    }
+    DEBOUNCE_MS: 300,
 };
 
-// Application state
 const STATE = {
     currentHorizon: '14d',
     currentDate: null,
     availableDates: [],
-    predictions: null,
+    
+    hexGeometry: null,
+    hexGeometryLookup: new Map(),
+    predictionData: new Map(),
+    
     rivers: null,
     roads: null,
     events: null,
-    hexgrid: null,
     
-    // Layer visibility
     layers: {
         hexagons: true,
         rivers: false,
@@ -42,16 +42,51 @@ const STATE = {
         events: false
     },
     
-    // Map instances
     map: null,
     deckOverlay: null,
-    
-    // Loading state
-    isLoading: true
+    isLoading: true,
+    isUpdatingData: false
 };
 
 // =============================================================================
-// 2. DATA SOURCES (Static Content)
+// 2. D3 COLOR SCALE SETUP
+// =============================================================================
+
+const colorScale = d3.scaleSequential(d3.interpolateYlOrRd).domain([0, 1]);
+
+function probabilityToColor(prob) {
+    const p = Math.max(0, Math.min(1, prob || 0));
+    const color = d3.color(colorScale(p));
+    if (!color) return [128, 128, 128, 150];
+    return [Math.round(color.r), Math.round(color.g), Math.round(color.b), 180];
+}
+
+function generateLegendGradient() {
+    const stops = [];
+    for (let i = 0; i <= 10; i++) {
+        stops.push(colorScale(i / 10));
+    }
+    return `linear-gradient(to right, ${stops.join(', ')})`;
+}
+
+// =============================================================================
+// 3. DEBOUNCE UTILITY
+// =============================================================================
+
+function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+        const later = () => {
+            clearTimeout(timeout);
+            func(...args);
+        };
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+    };
+}
+
+// =============================================================================
+// 4. STATIC DATA
 // =============================================================================
 
 const dataSources = {
@@ -70,34 +105,20 @@ const modelPerformance = {
 };
 
 const phaseDetails = {
-    'static': { 
-        title: 'Static Ingestion', 
-        desc: 'Processes invariant geography. Generates the H3 Grid (3,407 cells), computes distances to roads/rivers, and generates terrain derivatives (Slope/TRI) from Copernicus DEM.' 
-    },
-    'dynamic': { 
-        title: 'Dynamic Ingestion', 
-        desc: 'Fetches time-series data. Handles API logic for ACLED, GDELT (BigQuery), and GEE. Performs spatial disaggregation to map administrative data (like IPC phases) onto the grid.' 
-    },
-    'engineering': { 
-        title: 'Feature Engineering', 
-        desc: 'The core transformation engine. Computes 14-day temporal lags, exponential decays (30d/90d), and environmental anomalies relative to a rolling baseline. Integrates EPR status entropy.' 
-    },
-    'modeling': { 
-        title: 'Modeling Strategy', 
-        desc: 'Trains a Two-Stage Hurdle Ensemble. Stage 1 trains thematic sub-models (Geography, Socio-Political, etc.). Stage 2 stacks them using Meta-Learners (Logistic & Ridge) to calibrate probability and intensity.' 
-    }
+    'static': { title: 'Static Ingestion', desc: 'Processes invariant geography. Generates the H3 Grid (3,407 cells), computes distances to roads/rivers, and generates terrain derivatives (Slope/TRI) from Copernicus DEM.' },
+    'dynamic': { title: 'Dynamic Ingestion', desc: 'Fetches time-series data. Handles API logic for ACLED, GDELT (BigQuery), and GEE. Performs spatial disaggregation to map administrative data (like IPC phases) onto the grid.' },
+    'engineering': { title: 'Feature Engineering', desc: 'The core transformation engine. Computes 14-day temporal lags, exponential decays (30d/90d), and environmental anomalies relative to a rolling baseline. Integrates EPR status entropy.' },
+    'modeling': { title: 'Modeling Strategy', desc: 'Trains a Two-Stage Hurdle Ensemble. Stage 1 trains thematic sub-models (Geography, Socio-Political, etc.). Stage 2 stacks them using Meta-Learners (Logistic & Ridge) to calibrate probability and intensity.' }
 };
 
 // =============================================================================
-// 3. API FUNCTIONS
+// 5. API FUNCTIONS
 // =============================================================================
 
 async function fetchJSON(endpoint) {
     try {
         const response = await fetch(`${CONFIG.API_BASE}${endpoint}`);
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         return await response.json();
     } catch (error) {
         console.error(`API Error [${endpoint}]:`, error);
@@ -113,7 +134,7 @@ async function checkAPIHealth() {
     if (health && health.status === 'healthy') {
         statusDot.classList.remove('bg-yellow-400', 'bg-red-500', 'animate-pulse');
         statusDot.classList.add('bg-green-400');
-        statusText.textContent = 'Connected';
+        statusText.textContent = `Connected (${health.cached_hexagons || 0} hexes)`;
         return true;
     } else {
         statusDot.classList.remove('bg-yellow-400', 'bg-green-400', 'animate-pulse');
@@ -132,19 +153,71 @@ async function fetchAvailableDates() {
     }
 }
 
-async function fetchPredictions() {
-    updateLoadingStatus('Fetching predictions...');
-    const params = new URLSearchParams({
-        horizon: STATE.currentHorizon
-    });
-    if (STATE.currentDate) {
-        params.append('date', STATE.currentDate);
+async function fetchHexGeometry() {
+    updateLoadingStatus('Loading hexagon geometry...');
+    const data = await fetchJSON('/api/features/hexgrid');
+    
+    if (data && data.features) {
+        STATE.hexGeometry = data;
+        STATE.hexGeometryLookup.clear();
+        for (const feature of data.features) {
+            STATE.hexGeometryLookup.set(feature.properties.h3_index, feature);
+        }
+        console.log(`Loaded geometry for ${STATE.hexGeometryLookup.size} hexagons`);
     }
+    return data;
+}
+
+async function fetchPredictionDataOnly() {
+    const params = new URLSearchParams({ horizon: STATE.currentHorizon });
+    if (STATE.currentDate) params.append('date', STATE.currentDate);
+    
+    const data = await fetchJSON(`/api/data/predictions?${params}`);
+    
+    if (data && data.data) {
+        STATE.predictionData.clear();
+        for (const row of data.data) {
+            STATE.predictionData.set(row.h3_index, {
+                pred_proba: row.pred_proba,
+                pred_fatalities: row.pred_fatalities
+            });
+        }
+        console.log(`Updated predictions for ${STATE.predictionData.size} hexagons`);
+        if (data.metadata) {
+            document.getElementById('current-date-display').textContent = data.metadata.date || '--';
+        }
+    }
+    return data;
+}
+
+async function fetchFullPredictions() {
+    updateLoadingStatus('Fetching predictions...');
+    const params = new URLSearchParams({ horizon: STATE.currentHorizon });
+    if (STATE.currentDate) params.append('date', STATE.currentDate);
     
     const data = await fetchJSON(`/api/predictions?${params}`);
-    if (data) {
-        STATE.predictions = data;
-        console.log(`Loaded ${data.features?.length || 0} prediction hexagons`);
+    
+    if (data && data.features) {
+        STATE.predictionData.clear();
+        for (const feature of data.features) {
+            const props = feature.properties;
+            STATE.predictionData.set(props.h3_index, {
+                pred_proba: props.pred_proba,
+                pred_fatalities: props.pred_fatalities
+            });
+        }
+        
+        if (!STATE.hexGeometry) {
+            STATE.hexGeometry = data;
+            STATE.hexGeometryLookup.clear();
+            for (const feature of data.features) {
+                STATE.hexGeometryLookup.set(feature.properties.h3_index, feature);
+            }
+        }
+        
+        if (data.metadata) {
+            document.getElementById('current-date-display').textContent = data.metadata.date || '--';
+        }
     }
     return data;
 }
@@ -161,106 +234,65 @@ async function fetchStaticFeatures() {
 
 async function fetchConflictEvents() {
     const data = await fetchJSON('/api/events?limit=500');
-    if (data) {
-        STATE.events = data;
-    }
+    if (data) STATE.events = data;
     return data;
 }
 
 async function fetchStats() {
     const stats = await fetchJSON('/api/stats');
     if (stats) {
-        if (stats.hexagon_count) {
-            document.getElementById('metric-hexagons').textContent = stats.hexagon_count.toLocaleString();
-        }
-        if (stats.event_count) {
-            document.getElementById('metric-events').textContent = stats.event_count.toLocaleString();
-        }
+        if (stats.hexagon_count) document.getElementById('metric-hexagons').textContent = stats.hexagon_count.toLocaleString();
+        if (stats.event_count) document.getElementById('metric-events').textContent = stats.event_count.toLocaleString();
     }
 }
 
 // =============================================================================
-// 4. COLOR UTILITIES
-// =============================================================================
-
-function probabilityToColor(prob) {
-    // Color ramp: Green -> Yellow -> Orange -> Red -> Dark Red
-    const colors = [
-        [16, 185, 129],    // Green (0.0)
-        [251, 191, 36],    // Yellow (0.25)
-        [249, 115, 22],    // Orange (0.5)
-        [239, 68, 68],     // Red (0.75)
-        [127, 29, 29]      // Dark Red (1.0)
-    ];
-    
-    const p = Math.max(0, Math.min(1, prob));
-    const idx = p * (colors.length - 1);
-    const lower = Math.floor(idx);
-    const upper = Math.min(lower + 1, colors.length - 1);
-    const t = idx - lower;
-    
-    return [
-        Math.round(colors[lower][0] + t * (colors[upper][0] - colors[lower][0])),
-        Math.round(colors[lower][1] + t * (colors[upper][1] - colors[lower][1])),
-        Math.round(colors[lower][2] + t * (colors[upper][2] - colors[lower][2])),
-        180  // Alpha
-    ];
-}
-
-// =============================================================================
-// 5. DECK.GL LAYERS
+// 6. DECK.GL LAYERS
 // =============================================================================
 
 function createHexagonLayer() {
-    if (!STATE.predictions || !STATE.predictions.features) {
-        return null;
-    }
+    if (!STATE.hexGeometry || !STATE.hexGeometry.features) return null;
+    
+    const featuresWithPredictions = STATE.hexGeometry.features.map(feature => {
+        const h3Index = feature.properties.h3_index;
+        const prediction = STATE.predictionData.get(h3Index) || { pred_proba: 0, pred_fatalities: 0 };
+        return {
+            ...feature,
+            properties: { ...feature.properties, pred_proba: prediction.pred_proba, pred_fatalities: prediction.pred_fatalities }
+        };
+    });
     
     return new deck.GeoJsonLayer({
         id: 'hexagons',
-        data: STATE.predictions,
+        data: { type: 'FeatureCollection', features: featuresWithPredictions },
         visible: STATE.layers.hexagons,
-        
-        // Polygon styling
         filled: true,
         stroked: true,
         extruded: false,
-        
-        getFillColor: f => {
-            const prob = f.properties.pred_proba || 0;
-            return probabilityToColor(prob);
-        },
-        getLineColor: [100, 100, 100, 100],
+        getFillColor: f => probabilityToColor(f.properties.pred_proba),
+        getLineColor: [100, 100, 100, 80],
         getLineWidth: 1,
         lineWidthMinPixels: 0.5,
-        
-        // Picking/Interaction
         pickable: true,
         autoHighlight: true,
         highlightColor: [255, 255, 255, 100],
-        
-        // Events
         onHover: info => handleHexHover(info),
         onClick: info => handleHexClick(info),
-        
-        // Update triggers
         updateTriggers: {
-            getFillColor: [STATE.currentHorizon, STATE.currentDate]
+            getFillColor: [STATE.currentHorizon, STATE.currentDate, STATE.predictionData.size]
         }
     });
 }
 
 function createRiversLayer() {
     if (!STATE.rivers) return null;
-    
     return new deck.GeoJsonLayer({
         id: 'rivers',
         data: STATE.rivers,
         visible: STATE.layers.rivers,
-        
         stroked: true,
         filled: false,
-        getLineColor: [30, 144, 255, 200],  // Dodger blue
+        getLineColor: [30, 144, 255, 200],
         getLineWidth: 2,
         lineWidthMinPixels: 1,
         lineWidthMaxPixels: 4
@@ -269,15 +301,13 @@ function createRiversLayer() {
 
 function createRoadsLayer() {
     if (!STATE.roads) return null;
-    
     return new deck.GeoJsonLayer({
         id: 'roads',
         data: STATE.roads,
         visible: STATE.layers.roads,
-        
         stroked: true,
         filled: false,
-        getLineColor: [139, 69, 19, 180],  // Saddle brown
+        getLineColor: [139, 69, 19, 180],
         getLineWidth: 1,
         lineWidthMinPixels: 0.5,
         lineWidthMaxPixels: 3
@@ -286,33 +316,24 @@ function createRoadsLayer() {
 
 function createEventsLayer() {
     if (!STATE.events || !STATE.events.features) return null;
-    
     return new deck.GeoJsonLayer({
         id: 'events',
         data: STATE.events,
         visible: STATE.layers.events,
-        
-        // Point styling
         pointType: 'circle',
         filled: true,
         stroked: true,
-        
-        getPointRadius: f => {
-            const fatalities = f.properties.fatalities || 0;
-            return Math.max(4, Math.min(20, 4 + fatalities * 0.5));
-        },
+        getPointRadius: f => Math.max(4, Math.min(20, 4 + (f.properties.fatalities || 0) * 0.5)),
         getFillColor: f => {
-            const fatalities = f.properties.fatalities || 0;
-            if (fatalities === 0) return [255, 165, 0, 180];  // Orange
-            if (fatalities < 5) return [255, 69, 0, 200];      // Red-orange
-            return [139, 0, 0, 220];                           // Dark red
+            const fat = f.properties.fatalities || 0;
+            if (fat === 0) return [255, 165, 0, 180];
+            if (fat < 5) return [255, 69, 0, 200];
+            return [139, 0, 0, 220];
         },
         getLineColor: [255, 255, 255, 200],
         getLineWidth: 1,
-        
         pointRadiusMinPixels: 3,
         pointRadiusMaxPixels: 20,
-        
         pickable: true,
         onHover: info => handleEventHover(info)
     });
@@ -320,31 +341,24 @@ function createEventsLayer() {
 
 function buildDeckLayers() {
     const layers = [];
-    
-    // Order matters: bottom to top
     const roadsLayer = createRoadsLayer();
     if (roadsLayer) layers.push(roadsLayer);
-    
     const riversLayer = createRiversLayer();
     if (riversLayer) layers.push(riversLayer);
-    
     const hexLayer = createHexagonLayer();
     if (hexLayer) layers.push(hexLayer);
-    
     const eventsLayer = createEventsLayer();
     if (eventsLayer) layers.push(eventsLayer);
-    
     return layers;
 }
 
 // =============================================================================
-// 6. MAP INITIALIZATION
+// 7. MAP INITIALIZATION
 // =============================================================================
 
 function initializeMap() {
     updateLoadingStatus('Initializing map...');
     
-    // Create MapLibre GL map with raster tiles
     STATE.map = new maplibregl.Map({
         container: 'map-container',
         style: {
@@ -358,18 +372,10 @@ function initializeMap() {
                         'https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png'
                     ],
                     tileSize: 256,
-                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+                    attribution: '&copy; OpenStreetMap &copy; CARTO'
                 }
             },
-            layers: [
-                {
-                    id: 'carto-light-layer',
-                    type: 'raster',
-                    source: 'carto-light',
-                    minzoom: 0,
-                    maxzoom: 19
-                }
-            ]
+            layers: [{ id: 'carto-light-layer', type: 'raster', source: 'carto-light', minzoom: 0, maxzoom: 19 }]
         },
         center: CONFIG.MAP_CENTER,
         zoom: CONFIG.MAP_ZOOM,
@@ -377,50 +383,36 @@ function initializeMap() {
         maxZoom: 12
     });
     
-    // Add navigation controls
     STATE.map.addControl(new maplibregl.NavigationControl(), 'top-right');
     STATE.map.addControl(new maplibregl.ScaleControl({ maxWidth: 200, unit: 'metric' }), 'bottom-left');
     
-    // Track mouse position
     STATE.map.on('mousemove', (e) => {
-        const coords = e.lngLat;
-        document.getElementById('cursor-coords').textContent = 
-            `Lat: ${coords.lat.toFixed(4)}, Lng: ${coords.lng.toFixed(4)}`;
+        document.getElementById('cursor-coords').textContent = `Lat: ${e.lngLat.lat.toFixed(4)}, Lng: ${e.lngLat.lng.toFixed(4)}`;
     });
     
-    // Initialize Deck.gl overlay once map loads
     STATE.map.on('load', () => {
         initializeDeckOverlay();
+        const legendEl = document.getElementById('legend-gradient');
+        if (legendEl) legendEl.style.background = generateLegendGradient();
     });
 }
 
 function initializeDeckOverlay() {
-    STATE.deckOverlay = new deck.MapboxOverlay({
-        interleaved: false,
-        layers: buildDeckLayers()
-    });
-    
+    STATE.deckOverlay = new deck.MapboxOverlay({ interleaved: false, layers: buildDeckLayers() });
     STATE.map.addControl(STATE.deckOverlay);
-    
-    // Hide loading overlay
     hideLoadingOverlay();
 }
 
 function updateDeckLayers() {
-    if (STATE.deckOverlay) {
-        STATE.deckOverlay.setProps({
-            layers: buildDeckLayers()
-        });
-    }
+    if (STATE.deckOverlay) STATE.deckOverlay.setProps({ layers: buildDeckLayers() });
 }
 
 // =============================================================================
-// 7. EVENT HANDLERS
+// 8. EVENT HANDLERS
 // =============================================================================
 
 function handleHexHover(info) {
     const hexInfo = document.getElementById('hex-info');
-    
     if (!info.object) {
         hexInfo.innerHTML = '<p class="text-slate-500 italic">Hover over a hexagon to see details.</p>';
         return;
@@ -429,61 +421,27 @@ function handleHexHover(info) {
     const props = info.object.properties;
     const prob = props.pred_proba || 0;
     const fatalities = props.pred_fatalities || 0;
-    const h3Index = props.h3_index;
     
-    // Determine risk level
     let riskLevel, riskColor;
-    if (prob < 0.2) {
-        riskLevel = 'Low';
-        riskColor = 'text-green-600';
-    } else if (prob < 0.5) {
-        riskLevel = 'Moderate';
-        riskColor = 'text-yellow-600';
-    } else if (prob < 0.75) {
-        riskLevel = 'High';
-        riskColor = 'text-orange-600';
-    } else {
-        riskLevel = 'Critical';
-        riskColor = 'text-red-600';
-    }
+    if (prob < 0.2) { riskLevel = 'Low'; riskColor = 'text-green-600'; }
+    else if (prob < 0.5) { riskLevel = 'Moderate'; riskColor = 'text-yellow-600'; }
+    else if (prob < 0.75) { riskLevel = 'High'; riskColor = 'text-orange-600'; }
+    else { riskLevel = 'Critical'; riskColor = 'text-red-600'; }
     
     hexInfo.innerHTML = `
         <div class="space-y-2">
-            <div class="flex justify-between">
-                <span class="text-slate-500">Risk Level:</span>
-                <span class="font-bold ${riskColor}">${riskLevel}</span>
-            </div>
-            <div class="flex justify-between">
-                <span class="text-slate-500">Probability:</span>
-                <span class="font-semibold">${(prob * 100).toFixed(1)}%</span>
-            </div>
-            <div class="flex justify-between">
-                <span class="text-slate-500">Exp. Fatalities:</span>
-                <span class="font-semibold">${fatalities.toFixed(1)}</span>
-            </div>
-            <div class="pt-2 border-t border-blue-200">
-                <span class="text-xs text-slate-400 font-mono">H3: ${h3Index}</span>
-            </div>
-        </div>
-    `;
+            <div class="flex justify-between"><span class="text-slate-500">Risk Level:</span><span class="font-bold ${riskColor}">${riskLevel}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">Probability:</span><span class="font-semibold">${(prob * 100).toFixed(1)}%</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">Exp. Fatalities:</span><span class="font-semibold">${fatalities.toFixed(1)}</span></div>
+            <div class="pt-2 border-t border-blue-200"><span class="text-xs text-slate-400 font-mono">H3: ${props.h3_index}</span></div>
+        </div>`;
 }
 
-function handleHexClick(info) {
-    if (!info.object) return;
-    
-    // Could expand this to show detailed analysis panel
-    console.log('Clicked hex:', info.object.properties);
-}
-
-function handleEventHover(info) {
-    // Could show event tooltip
-    if (info.object) {
-        console.log('Event:', info.object.properties);
-    }
-}
+function handleHexClick(info) { if (info.object) console.log('Clicked hex:', info.object.properties); }
+function handleEventHover(info) { if (info.object) console.log('Event:', info.object.properties); }
 
 // =============================================================================
-// 8. UI CONTROLS
+// 9. UI CONTROLS
 // =============================================================================
 
 function initializeDateControls() {
@@ -491,45 +449,63 @@ function initializeDateControls() {
     const dateSlider = document.getElementById('date-slider');
     
     if (STATE.availableDates.length > 0) {
-        // Set date picker value
         datePicker.value = STATE.currentDate;
-        
-        // Configure slider
         dateSlider.max = STATE.availableDates.length - 1;
-        dateSlider.value = 0;  // Latest date
-        
-        // Update labels
+        dateSlider.value = 0;
         document.getElementById('slider-start').textContent = STATE.availableDates[STATE.availableDates.length - 1];
         document.getElementById('slider-end').textContent = STATE.availableDates[0];
+        document.getElementById('current-date-display').textContent = STATE.currentDate || '--';
     }
     
-    // Event listeners
     datePicker.addEventListener('change', async (e) => {
         STATE.currentDate = e.target.value;
-        await refreshPredictions();
+        await updatePredictionDataOnly();
     });
     
-    dateSlider.addEventListener('input', async (e) => {
+    const debouncedSliderUpdate = debounce(async (dateValue) => {
+        STATE.currentDate = dateValue;
+        await updatePredictionDataOnly();
+    }, CONFIG.DEBOUNCE_MS);
+    
+    dateSlider.addEventListener('input', (e) => {
         const idx = parseInt(e.target.value);
-        STATE.currentDate = STATE.availableDates[idx];
-        datePicker.value = STATE.currentDate;
-        await refreshPredictions();
+        const dateValue = STATE.availableDates[idx];
+        datePicker.value = dateValue;
+        document.getElementById('current-date-display').textContent = dateValue;
+        showDataLoadingIndicator();
+        debouncedSliderUpdate(dateValue);
     });
 }
 
+async function updatePredictionDataOnly() {
+    STATE.isUpdatingData = true;
+    showDataLoadingIndicator();
+    try {
+        await fetchPredictionDataOnly();
+        updateDeckLayers();
+    } finally {
+        STATE.isUpdatingData = false;
+        hideDataLoadingIndicator();
+    }
+}
+
+function showDataLoadingIndicator() {
+    const indicator = document.getElementById('data-loading');
+    if (indicator) indicator.classList.remove('hidden');
+}
+
+function hideDataLoadingIndicator() {
+    const indicator = document.getElementById('data-loading');
+    if (indicator) indicator.classList.add('hidden');
+}
+
 function initializeLayerToggles() {
-    const toggles = {
-        'layer-hexagons': 'hexagons',
-        'layer-rivers': 'rivers',
-        'layer-roads': 'roads',
-        'layer-events': 'events'
-    };
+    const toggles = { 'layer-hexagons': 'hexagons', 'layer-rivers': 'rivers', 'layer-roads': 'roads', 'layer-events': 'events' };
     
     Object.entries(toggles).forEach(([elementId, layerKey]) => {
         const checkbox = document.getElementById(elementId);
         const toggle = checkbox.nextElementSibling;
         
-        // Set initial state
         if (STATE.layers[layerKey]) {
             checkbox.checked = true;
             toggle.classList.add('bg-blue-500');
@@ -540,8 +516,6 @@ function initializeLayerToggles() {
         
         checkbox.addEventListener('change', () => {
             STATE.layers[layerKey] = checkbox.checked;
-            
-            // Update toggle visual
             if (checkbox.checked) {
                 toggle.classList.add('bg-blue-500');
                 toggle.classList.remove('bg-slate-300');
@@ -553,18 +527,13 @@ function initializeLayerToggles() {
                 toggle.querySelector('.toggle-dot').classList.remove('right-0.5');
                 toggle.querySelector('.toggle-dot').classList.add('left-0.5');
             }
-            
-            // Update map layers
             updateDeckLayers();
         });
     });
 }
 
-// Global function for horizon buttons
 window.setHorizon = async function(horizon) {
     STATE.currentHorizon = horizon;
-    
-    // Update button styles
     document.querySelectorAll('.horizon-btn').forEach(btn => {
         if (btn.dataset.hz === horizon) {
             btn.classList.add('bg-blue-500', 'text-white');
@@ -574,123 +543,74 @@ window.setHorizon = async function(horizon) {
             btn.classList.add('bg-slate-100', 'text-slate-600', 'hover:bg-slate-200');
         }
     });
-    
-    await refreshPredictions();
+    await updatePredictionDataOnly();
 };
 
-// Global refresh function
 window.refreshPredictions = async function() {
     showLoadingOverlay();
-    await fetchPredictions();
+    await fetchFullPredictions();
     updateDeckLayers();
     hideLoadingOverlay();
 };
 
 // =============================================================================
-// 9. LOADING STATE
+// 10. LOADING STATE
 // =============================================================================
 
 function updateLoadingStatus(message) {
     const statusEl = document.getElementById('loading-status');
-    if (statusEl) {
-        statusEl.textContent = message;
-    }
+    if (statusEl) statusEl.textContent = message;
 }
 
 function showLoadingOverlay() {
     const overlay = document.getElementById('map-loading');
-    if (overlay) {
-        overlay.classList.remove('hidden');
-    }
+    if (overlay) overlay.classList.remove('hidden');
 }
 
 function hideLoadingOverlay() {
     const overlay = document.getElementById('map-loading');
-    if (overlay) {
-        overlay.classList.add('hidden');
-    }
+    if (overlay) overlay.classList.add('hidden');
     STATE.isLoading = false;
 }
 
 // =============================================================================
-// 10. CHARTS (Performance & Data Sources)
+// 11. CHARTS
 // =============================================================================
 
 function initializeCharts() {
-    // Data Sources Doughnut Chart
     const ctxData = document.getElementById('dataChart');
     if (ctxData) {
         window.dataChart = new Chart(ctxData.getContext('2d'), {
             type: 'doughnut',
             data: {
                 labels: Object.keys(dataSources),
-                datasets: [{
-                    data: Object.values(dataSources).map(arr => arr.length),
-                    backgroundColor: ['#10b981', '#ef4444', '#f59e0b', '#3b82f6', '#6366f1', '#8b5cf6'],
-                    borderWidth: 0
-                }]
+                datasets: [{ data: Object.values(dataSources).map(arr => arr.length), backgroundColor: ['#10b981', '#ef4444', '#f59e0b', '#3b82f6', '#6366f1', '#8b5cf6'], borderWidth: 0 }]
             },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: {
-                    legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 10 } } }
-                },
-                onClick: (e, elements) => {
-                    if (elements.length > 0) {
-                        const label = window.dataChart.data.labels[elements[0].index];
-                        updateSourceList(label);
-                    }
-                }
+                plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 10 } } } },
+                onClick: (e, elements) => { if (elements.length > 0) updateSourceList(window.dataChart.data.labels[elements[0].index]); }
             }
         });
-        
         updateSourceList('Environmental');
     }
     
-    // PR-AUC Chart
     const ctxAuc = document.getElementById('aucChart');
     if (ctxAuc) {
         window.aucChart = new Chart(ctxAuc.getContext('2d'), {
             type: 'bar',
-            data: {
-                labels: ['XGBoost', 'LightGBM'],
-                datasets: [{
-                    label: 'PR-AUC Score',
-                    data: [modelPerformance['14d'].xgb_auc, modelPerformance['14d'].lgb_auc],
-                    backgroundColor: ['#3b82f6', '#94a3b8'],
-                    borderRadius: 4
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                scales: { y: { beginAtZero: false, min: 0.5, max: 1.0 } },
-                plugins: { legend: { display: false } }
-            }
+            data: { labels: ['XGBoost', 'LightGBM'], datasets: [{ label: 'PR-AUC Score', data: [modelPerformance['14d'].xgb_auc, modelPerformance['14d'].lgb_auc], backgroundColor: ['#3b82f6', '#94a3b8'], borderRadius: 4 }] },
+            options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: false, min: 0.5, max: 1.0 } }, plugins: { legend: { display: false } } }
         });
     }
     
-    // Recall Chart
     const ctxRecall = document.getElementById('recallChart');
     if (ctxRecall) {
         window.recallChart = new Chart(ctxRecall.getContext('2d'), {
             type: 'bar',
-            data: {
-                labels: ['XGBoost', 'LightGBM'],
-                datasets: [{
-                    label: 'Top-10% Recall',
-                    data: [modelPerformance['14d'].xgb_recall, modelPerformance['14d'].lgb_recall],
-                    backgroundColor: ['#10b981', '#cbd5e1'],
-                    borderRadius: 4
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                scales: { y: { beginAtZero: true, max: 1.0 } },
-                plugins: { legend: { display: false } }
-            }
+            data: { labels: ['XGBoost', 'LightGBM'], datasets: [{ label: 'Top-10% Recall', data: [modelPerformance['14d'].xgb_recall, modelPerformance['14d'].lgb_recall], backgroundColor: ['#10b981', '#cbd5e1'], borderRadius: 4 }] },
+            options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, max: 1.0 } }, plugins: { legend: { display: false } } }
         });
     }
 }
@@ -698,17 +618,13 @@ function initializeCharts() {
 function updateSourceList(category) {
     const listContainer = document.getElementById('source-list');
     if (!listContainer) return;
-    
     const sources = dataSources[category] || [];
     let html = `<h5 class="font-bold text-slate-700 text-sm mb-2">${category} Sources</h5><ul class="text-sm space-y-2">`;
-    sources.forEach(s => {
-        html += `<li class="flex items-center"><i class="fa-solid fa-database text-slate-400 mr-2"></i> ${s}</li>`;
-    });
+    sources.forEach(s => { html += `<li class="flex items-center"><i class="fa-solid fa-database text-slate-400 mr-2"></i> ${s}</li>`; });
     html += '</ul>';
     listContainer.innerHTML = html;
 }
 
-// Global function for performance horizon buttons
 window.updatePerfHorizon = function(hz) {
     document.querySelectorAll('.perf-horizon-btn').forEach(btn => {
         if (btn.dataset.hz === hz) {
@@ -719,7 +635,6 @@ window.updatePerfHorizon = function(hz) {
             btn.classList.add('text-slate-600', 'hover:bg-slate-100');
         }
     });
-    
     if (window.aucChart) {
         window.aucChart.data.datasets[0].data = [modelPerformance[hz].xgb_auc, modelPerformance[hz].lgb_auc];
         window.aucChart.update();
@@ -730,15 +645,10 @@ window.updatePerfHorizon = function(hz) {
     }
 };
 
-// =============================================================================
-// 11. PHASE DETAILS
-// =============================================================================
-
 window.showPhaseDetails = function(phase) {
     const detailBox = document.getElementById('phase-detail');
     const title = document.getElementById('phase-title');
     const desc = document.getElementById('phase-desc');
-    
     if (phaseDetails[phase]) {
         title.textContent = phaseDetails[phase].title;
         desc.textContent = phaseDetails[phase].desc;
@@ -752,39 +662,32 @@ window.showPhaseDetails = function(phase) {
 // =============================================================================
 
 async function initializeApp() {
-    console.log('🚀 CEWP Dashboard Initializing...');
+    console.log('🚀 CEWP Dashboard Initializing (Optimized)...');
     
-    // Check API health
     const apiHealthy = await checkAPIHealth();
-    if (!apiHealthy) {
-        console.warn('API not available - some features may be limited');
-    }
+    if (!apiHealthy) console.warn('API not available - some features may be limited');
     
-    // Fetch initial data
     await fetchAvailableDates();
     await fetchStats();
     
-    // Initialize map
     initializeMap();
     
-    // Load data in parallel
+    // Load geometry ONCE, then load data
     await Promise.all([
-        fetchPredictions(),
+        fetchHexGeometry(),
         fetchStaticFeatures(),
         fetchConflictEvents()
     ]);
     
-    // Initialize UI
+    // Load initial predictions
+    await fetchPredictionDataOnly();
+    
     initializeLayerToggles();
     initializeCharts();
     
-    // Update layers once data is loaded
-    if (STATE.deckOverlay) {
-        updateDeckLayers();
-    }
+    if (STATE.deckOverlay) updateDeckLayers();
     
     console.log('✅ Dashboard initialization complete');
 }
 
-// Run on DOM ready
 document.addEventListener('DOMContentLoaded', initializeApp);
