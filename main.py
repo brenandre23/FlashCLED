@@ -39,6 +39,7 @@ from pipeline.ingestion import (
     fetch_population,
     fetch_acled,
     fetch_dynamic_event,
+    fetch_crisiswatch,
     fetch_gee_server_side,
     fetch_mines,
     fetch_dem,
@@ -227,6 +228,39 @@ class CEWPPipeline:
             # Distances
             calculate_static_distances.main()
 
+    def execute_dynamic_ingestion(self):
+        """
+        Phase 2: Dynamic Ingestion (Time-Series)
+        Fetches data that changes over time (Events, Climate, Prices).
+        """
+        # 1. Conflict Events (The "Target")
+        fetch_acled.run(self.configs, self.engine)
+
+        # 2. High-Frequency Automated Events (GDELT/IODA)
+        fetch_dynamic_event.run(self.configs, self.engine)
+
+        # 3. Qualitative Intelligence (CrisisWatch) [NEW]
+        # We wrap this in try/except because web scraping can be brittle.
+        # We don't want to halt the pipeline if the website is flaky.
+        try:
+            fetch_crisiswatch.run(self.configs, self.engine)
+        except Exception as e:
+            logger.warning(f"CrisisWatch ingestion failed (skipping): {e}")
+
+        # 4. Socio-Economic
+        ingest_food_security.run(self.configs, self.engine)
+        ingest_economy.main()
+        fetch_iom.main()
+
+        # 5. Spatial Disaggregation
+        logger.info(">> Spatial Disaggregation (Admin -> H3)")
+        spatial_disaggregation.run(self.configs, self.engine)
+
+        # 6. Environmental Variables (Google Earth Engine)
+        fetch_gee_server_side.run(self.configs, self.engine)
+
+        logger.info("✓ Dynamic Ingestion Phase Complete.")
+
     def run_dynamic_phase(self):
         if self.args.skip_dynamic:
             logger.info("Skipping Phase 2: Dynamic Ingestion")
@@ -241,21 +275,7 @@ class CEWPPipeline:
             )
 
         with pipeline_stage("PHASE 2: DYNAMIC INGESTION"):
-            # Conflict Events
-            fetch_acled.run(self.configs, self.engine)
-            fetch_dynamic_event.run(self.configs, self.engine)
-
-            # Socio-Economic
-            ingest_food_security.run(self.configs, self.engine)
-            ingest_economy.main()
-            fetch_iom.main()
-
-            # Spatial Disaggregation
-            logger.info(">> Spatial Disaggregation (Admin -> H3)")
-            spatial_disaggregation.run(self.configs, self.engine)
-
-            # Environment (GEE)
-            fetch_gee_server_side.run(self.configs, self.engine)
+            self.execute_dynamic_ingestion()
 
     def run_feature_engineering_phase(self):
         if self.args.skip_features:

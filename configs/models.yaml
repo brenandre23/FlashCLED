@@ -15,7 +15,7 @@ horizons:
 
 # 2. GLOBAL THESIS PARAMETERS
 # Used by the TwoStageEnsemble logic to weight rare events (~2% positive class)
-# Note: The new script calculates this dynamically, but this acts as a fallback.
+# Note: The script calculates this dynamically, but this acts as a fallback.
 hurdle_params:
   classifier_scale_pos_weight: 35.0
 
@@ -103,7 +103,6 @@ submodels:
       - "dist_to_river"
       - "dist_to_diamond_mine"
       - "dist_to_gold_mine"
-      # New Strategic Features
       - "dist_to_large_mine"
       - "dist_to_controlled_mine"
       - "dist_to_large_gold_mine"

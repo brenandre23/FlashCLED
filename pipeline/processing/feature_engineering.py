@@ -61,13 +61,15 @@ def parse_registry(features_config):
         'conflict': [],
         'economic': [],
         'social': [],
-        'demographic': []
+        'demographic': [],
+        'nlp': []
     }
     
     source_map = {
         'CHIRPS': 'environmental', 'ERA5': 'environmental', 
         'MODIS': 'environmental', 'VIIRS': 'environmental', 'JRC_Landsat': 'environmental',
         'ACLED': 'conflict', 'GDELT': 'conflict',
+        'NLP_ACLED': 'nlp', 'NLP_CrisisWatch': 'nlp',
         'YahooFinance': 'economic', 'Economy': 'economic',
         'FEWS_NET': 'social', 'Food_Security': 'social', 'IOM_DTM': 'social', 'EPR': 'social',
         'WorldPop': 'demographic'
@@ -886,6 +888,127 @@ def process_conflict(engine, spine, conflict_specs, features_config):
 
 
 # ==============================================================================
+# PHASE 4B: NLP SIGNALS (Topic Pivoting)
+# ==============================================================================
+def process_nlp_data(engine, spine, nlp_specs):
+    logger.info("PHASE 4B: Processing NLP Signals (Topic Pivoting)...")
+
+    if not nlp_specs:
+        logger.info("  No NLP specs found in registry; skipping.")
+        return spine
+
+    insp = inspect(engine)
+    dates = sorted(spine['date'].unique())
+
+    for spec in nlp_specs:
+        source = spec.get('source')
+        transformation = spec.get('transformation')
+        params = spec.get('transformation_params', {}) or {}
+        output_col = spec.get('output_col')
+
+        if source == "NLP_ACLED" and transformation == "pivot":
+            if not insp.has_table("features_nlp_acled", schema=SCHEMA):
+                logger.info("  features_nlp_acled not found; skipping ACLED NLP pivot.")
+                continue
+
+            df = pd.read_sql(
+                f"SELECT h3_index, date, acled_topic_id, topic_intensity FROM {SCHEMA}.features_nlp_acled",
+                engine
+            )
+            if df.empty:
+                logger.info("  features_nlp_acled is empty; skipping ACLED NLP pivot.")
+                continue
+
+            df['date'] = pd.to_datetime(df['date'])
+            df['h3_index'] = df['h3_index'].astype('int64')
+
+            topics = params.get('topics') or params.get('values')
+            if topics:
+                df = df[df['acled_topic_id'].isin(topics)]
+            else:
+                topics = sorted(df['acled_topic_id'].dropna().unique().tolist())
+
+            df['spine_date'] = pd.cut(df['date'], bins=dates, labels=dates[1:], right=True)
+            pivot_df = (
+                df.pivot_table(
+                    index=['h3_index', 'spine_date'],
+                    columns='acled_topic_id',
+                    values='topic_intensity',
+                    aggfunc='sum',
+                    fill_value=0
+                )
+                .reset_index()
+                .rename(columns={'spine_date': 'date'})
+            )
+
+            # Ensure all requested topic columns exist
+            for topic_id in topics:
+                col_name = f"{output_col}_{int(topic_id)}"
+                if topic_id in pivot_df.columns:
+                    pivot_df = pivot_df.rename(columns={topic_id: col_name})
+                else:
+                    pivot_df[col_name] = 0
+
+            # Drop the raw topic columns (numeric) if any remain
+            keep_cols = ['h3_index', 'date'] + [c for c in pivot_df.columns if isinstance(c, str) and c.startswith(f"{output_col}_")]
+            pivot_df = pivot_df[[c for c in keep_cols if c in pivot_df.columns]]
+
+            # Fill NaNs and merge
+            pivot_df = pivot_df.fillna(0)
+            spine = spine.merge(pivot_df, on=['h3_index', 'date'], how='left')
+
+            # Fill any new columns with 0 where missing
+            for c in pivot_df.columns:
+                if c not in ['h3_index', 'date']:
+                    spine[c] = spine[c].fillna(0)
+
+        elif source == "NLP_CrisisWatch" and transformation == "max":
+            cw_table = None
+            if insp.has_table("features_nlp_crisiswatch", schema=SCHEMA):
+                cw_table = "features_nlp_crisiswatch"
+                select_clause = "h3_index, date, nlp_risk_score"
+            elif insp.has_table("features_crisiswatch", schema=SCHEMA):
+                cw_table = "features_crisiswatch"
+                select_clause = "h3_index, date, cw_topic_id"
+            else:
+                logger.info("  CrisisWatch NLP table not found; skipping.")
+                continue
+
+            cw_raw = pd.read_sql(
+                f"""
+                SELECT {select_clause}
+                FROM {SCHEMA}.{cw_table}
+                """,
+                engine
+            )
+            if cw_raw.empty:
+                logger.info(f"  {cw_table} is empty; skipping.")
+                continue
+
+            cw_raw['date'] = pd.to_datetime(cw_raw['date'])
+            cw_raw['h3_index'] = cw_raw['h3_index'].astype('int64')
+            if 'nlp_risk_score' not in cw_raw.columns and 'cw_topic_id' in cw_raw.columns:
+                cw_raw['nlp_risk_score'] = 1.0
+
+            cw_raw['spine_date'] = pd.cut(cw_raw['date'], bins=dates, labels=dates[1:], right=True)
+            cw_agg = (
+                cw_raw
+                .groupby(['h3_index', 'spine_date'], observed=True)['nlp_risk_score']
+                .max()
+                .reset_index()
+                .rename(columns={'spine_date': 'date', 'nlp_risk_score': output_col or 'crisiswatch_nlp_risk_max'})
+            )
+            cw_agg['date'] = pd.to_datetime(cw_agg['date'])
+
+            spine = spine.merge(cw_agg, on=['h3_index', 'date'], how='left')
+            out_col = output_col or 'crisiswatch_nlp_risk_max'
+            if out_col in spine.columns:
+                spine[out_col] = spine[out_col].fillna(0)
+
+    return spine
+
+
+# ==============================================================================
 # MAIN PIPELINE
 # ==============================================================================
 def run():
@@ -935,6 +1058,10 @@ def run():
         
         # PHASE 4: Conflict
         spine = process_conflict(engine, spine, specs['conflict'], feat_cfg)
+        gc.collect()
+        
+        # PHASE 4B: NLP Signals (Topic Pivoting)
+        spine = process_nlp_data(engine, spine, specs['nlp'])
         gc.collect()
         
         # --- Final Optimization ---

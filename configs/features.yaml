@@ -32,7 +32,7 @@ registry:
 
   # =========================================================
   # 1. ENVIRONMENTAL FEATURES (Phase 3)
-  # Sources: CHIRPS, ERA5, MODIS, VIIRS
+  # Sources: CHIRPS, ERA5, MODIS, VIIRS, JRC
   # =========================================================
   - raw: "precip_mean_depth_mm"
     source: "CHIRPS"
@@ -59,7 +59,6 @@ registry:
     transformation: "mean"
     output_col: "nightlights_intensity"
 
-  # Water (JRC)
   - raw: "water_local_max"
     source: "JRC_Landsat"
     transformation: "lag_1_step"
@@ -113,14 +112,12 @@ registry:
     transformation: "decay_30d"
     output_col: "gdelt_decay_30d"
 
-  # --- NEW: Stream B Regional Context ---
-  # We lag this by 1 step so the model sees the "Ambient Risk" of the PREVIOUS period
-  # when trying to predict the current period.
+  # --- Stream B Regional Context ---
+  #  "Ambient Risk" of the PREVIOUS period using least precise acled events agg to admin2 (geo_precision lvl 3) 
   - source: ACLED
     raw: regional_risk_score
     transformation: lag_1_step
     output_col: regional_risk_score_lag1
-
 
   # =========================================================
   # 3. MACRO-ECONOMIC FEATURES (Phase 2)
@@ -172,7 +169,7 @@ registry:
     transformation: "none"
     output_col: "price_sorghum"
 
-  # Price Shocks (Calculated in Python)
+  # Price Shocks
   - raw: "price_maize"
     source: "Food_Security"
     transformation: "shock_12m"
@@ -304,3 +301,21 @@ registry:
     source: "Copernicus_DEM"
     transformation: "none"
     output_col: "slope_mean"
+
+
+  # =========================================================
+  # 7. NLP SIGNALS
+  # =========================================================
+  - raw: "topic_intensity"
+    source: "NLP_ACLED"
+    transformation: "pivot"
+    transformation_params:
+      pivot_column: "acled_topic_id"
+      topics: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # Top 10 topics
+      value_column: "topic_intensity"
+    output_col: "acled_topic_intensity"
+
+  - raw: "nlp_risk_score"
+    source: "NLP_CrisisWatch"
+    transformation: "max"
+    output_col: "crisiswatch_nlp_risk_max"
