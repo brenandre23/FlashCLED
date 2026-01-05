@@ -28,6 +28,8 @@ wheels/
 
 # --- Secrets (CRITICAL) ---
 .env
+.env.save
+.env_windows
 .venv
 GoogleKeys/
 
@@ -48,25 +50,34 @@ data_audit/
 data/raw/failed_windows_*.txt
 data/raw/processing.log
 analysis/
-KDTree/
 deprecated/
+
 # 2. Cache & Temp
 cache/*
 cached_originals/
+!cache/.gitkeep
 
-# Logs anywhere
+# All log files
 *.log
 
-!cache/.gitkeep  # (Optional: keeps the folder structure but empty)
-
-# 3. Heavy/Generated Data (Ignore these)
+# 3. Heavy/Generated Data
 data/processed/*
-data/raw/*.nc
-data/raw/*.zip
-data/raw/*.tif
-data/raw/*.tiff
-data/raw/esa_cci_extracted/
-data/raw/worldpop_comparison/
+data/raw/*
+!data/processed/.gitkeep
+!data/raw/.gitkeep
+
+# 4. Temporary/Debug Scripts (Not for production)
+clean_cache.py
+troubleshoot_mines.py
+RootList.py
+check_como.py
+rootlist.txt
+WSL_command.txt
 KDTree
 
-clean_cache.py
+# 5. Test outputs
+test/*.png
+test/*.csv
+
+# 6. Models (too large for git, use git-lfs if needed)
+models/*.pkl
