@@ -109,7 +109,8 @@ class TwoStageEnsemble:
             y_fat_conflict = np.maximum(y_fatalities[conflict_mask], 0)
             
             # Constraint: Enforce non-negativity on inputs from base models
-            X_regress = np.maximum(oof_regress[conflict_mask.values, :], 0)
+            # NOTE: Apply log1p to prevent double-exponential blow-up in Poisson GLM
+            X_regress = np.log1p(np.maximum(oof_regress[conflict_mask.values, :], 0))
             
             self.meta_regress.fit(X_regress, y_fat_conflict)
         else:
@@ -153,7 +154,7 @@ class TwoStageEnsemble:
 
         if self.meta_regress:
             # Constraint: Enforce non-negativity on inputs
-            regress_inputs = np.maximum(l1_regress, 0)
+            regress_inputs = np.log1p(np.maximum(l1_regress, 0))
             mu_fatal = self.meta_regress.predict(regress_inputs)
             # Constraint: Enforce non-negativity on outputs
             mu_fatal = np.clip(mu_fatal, 0.0, None)

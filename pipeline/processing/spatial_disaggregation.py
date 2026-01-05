@@ -27,7 +27,17 @@ from utils import logger, get_db_engine, load_configs, upload_to_postgis, SCHEMA
 
 # --- Constants ---
 POPULATION_TABLE = "population_h3"
+STATIC_TABLE = "features_static"
 IOM_SOURCE_TABLE = "iom_dtm_raw"  # Updated to match fetch_iom.py
+
+
+def ensure_admin_columns(engine) -> None:
+    """
+    Ensure admin1/admin2/admin3 columns exist on features_static.
+    """
+    with engine.begin() as conn:
+        for col in ["admin1", "admin2", "admin3"]:
+            conn.execute(text(f"ALTER TABLE {SCHEMA}.{STATIC_TABLE} ADD COLUMN IF NOT EXISTS {col} VARCHAR(255);"))
 
 
 def _infer_pcode_col(gdf: gpd.GeoDataFrame, level: str) -> Optional[str]:
@@ -185,6 +195,83 @@ def build_admin_h3_map(engine, data_cfg: Dict, features_cfg: Dict) -> Dict[str, 
     return admin_map
 
 
+def enrich_features_static_admins(engine, data_cfg: Dict, features_cfg: Dict) -> None:
+    """
+    Persist admin1/admin2/admin3 names onto features_static for downstream aggregations.
+    """
+    logger.info("Enriching features_static with admin names...")
+
+    ensure_admin_columns(engine)
+
+    geodetic_crs = features_cfg["spatial"]["crs"]["geodetic"]
+
+    h3_gdf = gpd.read_postgis(
+        f"SELECT h3_index, geometry FROM {SCHEMA}.features_static",
+        engine,
+        geom_col="geometry"
+    )
+    h3_gdf["h3_index"] = h3_gdf["h3_index"].astype("int64")
+    h3_gdf = h3_gdf.to_crs(geodetic_crs)
+
+    admin_columns = {}
+    for level in ["admin1", "admin2", "admin3"]:
+        path_key = f"{level}_path"
+        admin_path = Path(data_cfg["admin_boundaries"].get(path_key))
+        if not admin_path or not admin_path.exists():
+            logger.warning(f"  {level} boundary file not found: {admin_path}")
+            continue
+
+        admin_gdf = gpd.read_file(admin_path).to_crs(geodetic_crs)
+        name_col = _infer_name_col(admin_gdf, level)
+        if not name_col:
+            logger.warning(f"  Could not infer name column for {level}; skipping.")
+            continue
+
+        join_cols = ["geometry", name_col]
+        if level == "admin3":
+            # Use centroid to enforce a single dominant admin3 per H3
+            admin_gdf["__centroid"] = admin_gdf.geometry.centroid
+            admin_join_geom = admin_gdf.set_geometry("__centroid")
+            joined = gpd.sjoin(
+                h3_gdf[["h3_index", "geometry"]],
+                admin_join_geom[join_cols + ["__centroid"]],
+                how="left",
+                predicate="intersects"
+            )
+        else:
+            joined = gpd.sjoin(
+                h3_gdf[["h3_index", "geometry"]],
+                admin_gdf[join_cols],
+                how="left",
+                predicate="intersects"
+            )
+        admin_columns[level] = joined[name_col]
+
+    if not admin_columns:
+        logger.warning("  No admin enrichment performed (missing boundary data).")
+        return
+
+    for level, series in admin_columns.items():
+        h3_gdf[level] = series
+
+    temp_table = "features_static_admin_enrich_tmp"
+    df_admin = h3_gdf[["h3_index", "admin1", "admin2", "admin3"]].copy()
+    df_admin.to_sql(temp_table, engine, schema=SCHEMA, if_exists="replace", index=False)
+
+    with engine.begin() as conn:
+        conn.execute(text(f"""
+            UPDATE {SCHEMA}.features_static fs
+            SET
+                admin1 = COALESCE(t.admin1, fs.admin1),
+                admin2 = COALESCE(t.admin2, fs.admin2)
+            FROM {SCHEMA}.{temp_table} t
+            WHERE fs.h3_index = t.h3_index;
+        """))
+        conn.execute(text(f"DROP TABLE IF EXISTS {SCHEMA}.{temp_table};"))
+
+    logger.info("  features_static admin enrichment complete.")
+
+
 def distribute_iom(engine, admin_map: Dict[str, Dict], start_date: str, end_date: str) -> pd.DataFrame:
     """
     Disaggregate IOM DTM data from 'iom_dtm_raw' to H3 grid.
@@ -321,6 +408,9 @@ def run(configs: Dict, engine):
     end_date = data_cfg["global_date_window"]["end_date"]
     
     try:
+        # 0. Enrich features_static with admin names for downstream aggregations
+        enrich_features_static_admins(engine, data_cfg, features_cfg)
+
         # 1. Build Map
         admin_map = build_admin_h3_map(engine, data_cfg, features_cfg)
         

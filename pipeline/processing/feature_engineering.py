@@ -762,7 +762,13 @@ def process_conflict(engine, spine, conflict_specs, features_config):
     # --- Admin mapping (prefer admin2/prefecture, fallback to admin1) ---
     insp = inspect(engine)
     fs_cols = {c["name"] for c in insp.get_columns("features_static", schema=SCHEMA)}
-    admin_col = "admin2" if "admin2" in fs_cols else "admin1"
+    if "admin3" in fs_cols:
+        admin_col = "admin3"
+    elif "admin2" in fs_cols:
+        admin_col = "admin2"
+    else:
+        admin_col = "admin1"
+
     if admin_col in fs_cols:
         logger.info(f"  Using '{admin_col}' for regional risk aggregation.")
         admin_map = pd.read_sql(f"SELECT h3_index, {admin_col} FROM {SCHEMA}.features_static", engine)
