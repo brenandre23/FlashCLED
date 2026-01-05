@@ -503,6 +503,7 @@ def process_social_data(engine, spine, social_specs, feat_cfg):
             iom_df['date'] = pd.to_datetime(iom_df['date'])
             
             spine = spine.merge(iom_df, on=['h3_index', 'date'], how='left')
+            spine['iom_data_available'] = spine['iom_displacement_sum'].notna().astype(int)
             spine['iom_displacement_sum'] = spine['iom_displacement_sum'].fillna(0)
             
             if 'lag' in iom_spec.get('transformation', ''):
@@ -978,7 +979,7 @@ def run():
         # --- TYPE FIX: Define columns that MUST be integers for Postgres ---
         integer_cols = [
             "gdelt_event_count", "acled_event_count", "protest_count", "riot_count", 
-            "fatalities", "time_since_last_fatal_event", "pop_count", "iom_displacement_sum", "is_dry_season"
+            "fatalities", "time_since_last_fatal_event", "pop_count", "iom_displacement_sum", "is_dry_season", "iom_data_available"
         ]
 
         for chunk_num, start_idx in enumerate(range(0, total_rows, CHUNK_SIZE), start=1):
