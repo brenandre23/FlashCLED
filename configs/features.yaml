@@ -205,6 +205,12 @@ registry:
     transformation: "lag_1_step"
     output_col: "iom_displacement_count_lag1"
 
+  - raw: "iom_data_available"
+    source: "IOM_DTM"
+    transformation: "none"
+    output_col: "iom_data_available"
+    description: "Structural break flag: 1 if IOM data exists for this period, 0 if imputed."
+
   # EPR (Ethnic Power Relations)
   - raw: "epr_excluded_groups_count"
     source: "EPR"
