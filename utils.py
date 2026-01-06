@@ -229,6 +229,23 @@ def get_boundary(data_config: dict, features_config: dict):
 # -----------------------------------------------------------------
 # 8. UPLOAD HELPER (UPSERT + CSV SAFETY)
 # -----------------------------------------------------------------
+def _infer_sql_type(dtype_str: str) -> str:
+    """
+    Lightweight dtype -> SQL type mapper for dynamic table creation.
+    """
+    dtype_str = str(dtype_str).lower()
+    if 'int' in dtype_str:
+        return "BIGINT"
+    if 'float' in dtype_str or 'double' in dtype_str:
+        return "DOUBLE PRECISION"
+    if 'datetime' in dtype_str or 'timestamp' in dtype_str:
+        return "TIMESTAMP"
+    if 'date' in dtype_str:
+        return "DATE"
+    if 'bool' in dtype_str:
+        return "BOOLEAN"
+    return "TEXT"
+
 def upload_to_postgis(engine, df: pd.DataFrame, table_name: str, schema: str, primary_keys: list):
     if df.empty: return
         
@@ -236,6 +253,20 @@ def upload_to_postgis(engine, df: pd.DataFrame, table_name: str, schema: str, pr
     
     with engine.begin() as conn:
         conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema};"))
+        
+        # Ensure target table exists (needed for LIKE on temp table)
+        insp = inspect(engine)
+        if not insp.has_table(table_name, schema=schema):
+            col_defs = []
+            for col, dtype in df.dtypes.items():
+                col_defs.append(f'"{col}" {_infer_sql_type(dtype)}')
+            pk_clause = ""
+            if primary_keys:
+                pk_cols = ', '.join([f'"{c}"' for c in primary_keys])
+                pk_clause = f", PRIMARY KEY ({pk_cols})"
+            create_sql = f"CREATE TABLE IF NOT EXISTS {schema}.{table_name} ({', '.join(col_defs)}{pk_clause});"
+            conn.execute(text(create_sql))
+        
         conn.execute(text(f"CREATE TEMPORARY TABLE {temp_table} (LIKE {schema}.{table_name} INCLUDING ALL) ON COMMIT DROP;"))
         
         raw_conn = conn.connection

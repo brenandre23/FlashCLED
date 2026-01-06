@@ -60,6 +60,7 @@ from pipeline.processing import (
     spatial_disaggregation,
     feature_engineering as master_fe,
     calculate_epr_features,
+    process_acled_nlp,
 )
 
 # --- Modeling ---
@@ -77,7 +78,8 @@ try:
         analyze_predictions,
         analyze_model_selection,
         analyze_sensitivity,
-        analyze_spatial_residuals
+        analyze_spatial_residuals,
+        analyze_metadata_associations
     )
     ANALYSIS_AVAILABLE = True
 except ImportError as e:
@@ -294,6 +296,10 @@ class CEWPPipeline:
             # 3.1 Master Feature Script
             master_fe.run()
 
+            # 3.3 Semantic / NLP Features
+            logger.info(">> Generating ACLED Semantic Features (ConfliBERT)...")
+            process_acled_nlp.run(self.configs, self.engine)
+
             # 3.2 EPR Features (Sidecar)
             calculate_epr_features.main()
 
@@ -360,6 +366,9 @@ class CEWPPipeline:
 
                 logger.info("   > Running General Prediction Analytics...")
                 analyze_predictions.main()
+
+                logger.info("   > Running Metadata Association Analysis (Topics vs Predictions)...")
+                analyze_metadata_associations.main()
                 
                 logger.info("   ✓ Analysis complete. Check 'analysis/' folder for plots.")
                 

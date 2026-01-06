@@ -1,9 +1,9 @@
 # CEWP Dashboard Requirements
 # Install with: pip install -r requirements_dashboard.txt
 
-# Web Framework
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
+# Web Framework (Flask-based backend)
+flask>=3.0.0
+flask-cors>=4.0.0
 
 # Database
 sqlalchemy>=2.0.0
@@ -21,6 +21,9 @@ h3>=3.7.6
 
 # Environment
 python-dotenv>=1.0.0
+
+# Optional: Fast JSON serialization
+orjson>=3.9.0
 
 # Optional: Development
 httpx>=0.26.0  # For testing

@@ -33,7 +33,7 @@ GRID_TABLE = "features_static"
 TARGET_TABLE = "environmental_features"
 DATA_DIR = ROOT_DIR / "data" / "raw"
 
-MAX_WORKERS = 3
+MAX_WORKERS = 12
 H3_BATCH_SIZE = 300
 MAX_RETRIES = 5
 BATCH_SLEEP = 1

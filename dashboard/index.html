@@ -3,409 +3,111 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CEWP: Conflict Early Warning Pipeline</title>
+    <title>FlashCLED | Conflict Early Warning</title>
     
-    <!-- Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- MapLibre GL CSS -->
+    <link href="https://unpkg.com/maplibre-gl@3.0.0/dist/maplibre-gl.css" rel="stylesheet" />
     
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="style.css">
     
-    <!-- Font Awesome for Icons -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    
-    <!-- MapLibre GL JS (Open Source Mapbox Alternative) -->
-    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
-    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    
-    <!-- Deck.gl Standalone Bundle -->
-    <script src="https://unpkg.com/deck.gl@8.9.33/dist.min.js"></script>
-    
-    <!-- H3-js for client-side H3 operations -->
-    <script src="https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js"></script>
-    
-    <!-- D3.js for professional color scales -->
-    <script src="https://cdn.jsdelivr.net/npm/d3-color@3"></script>
-    <script src="https://cdn.jsdelivr.net/npm/d3-interpolate@3"></script>
-    <script src="https://cdn.jsdelivr.net/npm/d3-scale@4"></script>
-    <script src="https://cdn.jsdelivr.net/npm/d3-scale-chromatic@3"></script>
-    
-    <!-- Custom CSS - FIXED PATH -->
-    <link rel="stylesheet" href="/static/style.css">
+    <!-- Dependencies -->
+    <script src="https://unpkg.com/deck.gl@8.9.0/dist.min.js"></script>
+    <script src="https://unpkg.com/maplibre-gl@3.0.0/dist/maplibre-gl.js"></script>
+    <script src="https://unpkg.com/h3-js@3.7.2/dist/h3-js.umd.js"></script>
 </head>
-<body class="bg-slate-50 text-slate-800 font-sans leading-relaxed">
+<body>
 
-    <!-- NAVIGATION -->
-    <nav class="bg-slate-900 text-white shadow-lg sticky top-0 z-50">
-        <div class="container mx-auto px-4 py-4 flex justify-between items-center">
-            <div class="flex items-center space-x-3">
-                <i class="fa-solid fa-shield-halved text-blue-400 text-2xl"></i>
-                <div>
-                    <h1 class="text-xl font-bold tracking-tight">CEWP Dashboard</h1>
-                    <p class="text-xs text-slate-400">Conflict Early Warning Pipeline 🇨🇫</p>
-                </div>
+    <div class="app-container">
+        
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="brand">
+                <h1>FlashCLED</h1>
+                <p>Conflict Early Warning System</p>
             </div>
-            <div class="hidden md:flex items-center space-x-6 text-sm font-medium">
-                <a href="#overview" class="hover:text-blue-400 transition">Overview</a>
-                <a href="#risk-map" class="hover:text-blue-400 transition">Risk Map</a>
-                <a href="#pipeline" class="hover:text-blue-400 transition">Pipeline</a>
-                <a href="#performance" class="hover:text-blue-400 transition">Performance</a>
-                <!-- API Status Indicator -->
-                <div id="api-status" class="flex items-center space-x-2 px-3 py-1 rounded-full bg-slate-800">
-                    <span class="w-2 h-2 rounded-full bg-yellow-400 animate-pulse" id="status-dot"></span>
-                    <span class="text-xs text-slate-400" id="status-text">Connecting...</span>
-                </div>
-            </div>
-        </div>
-    </nav>
 
-    <!-- HERO SECTION -->
-    <section id="overview" class="py-12 md:py-20 bg-white border-b border-slate-200">
-        <div class="container mx-auto px-4 text-center max-w-4xl">
-            <span class="inline-block px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-xs font-bold mb-4 uppercase tracking-wide">Production-Grade Forecasting</span>
-            <h2 class="text-4xl md:text-5xl font-extrabold text-slate-900 mb-6">Predicting Conflict Risk in the Central African Republic</h2>
-            <p class="text-lg text-slate-600 mb-10 leading-relaxed">
-                A comprehensive spatio-temporal machine learning framework. We integrate <strong>21 diverse data sources</strong> onto a unified <strong>H3 Hexagonal Grid</strong> to forecast conflict probability and intensity at <strong>14-day, 1-month, and 3-month horizons</strong>.
-            </p>
-            
-            <!-- Key Metrics Grid -->
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-left">
-                <div class="p-4 bg-slate-50 rounded-lg border border-slate-100">
-                    <div class="text-3xl font-bold text-blue-600 mb-1" id="metric-hexagons">--</div>
-                    <div class="text-xs text-slate-500 font-semibold uppercase">H3 Hexagons (Res 5)</div>
-                </div>
-                <div class="p-4 bg-slate-50 rounded-lg border border-slate-100">
-                    <div class="text-3xl font-bold text-emerald-600 mb-1">26</div>
-                    <div class="text-xs text-slate-500 font-semibold uppercase">Years of Data (2000-2025)</div>
-                </div>
-                <div class="p-4 bg-slate-50 rounded-lg border border-slate-100">
-                    <div class="text-3xl font-bold text-purple-600 mb-1" id="metric-events">--</div>
-                    <div class="text-xs text-slate-500 font-semibold uppercase">Conflict Events</div>
-                </div>
-                <div class="p-4 bg-slate-50 rounded-lg border border-slate-100">
-                    <div class="text-3xl font-bold text-rose-600 mb-1">2-Stage</div>
-                    <div class="text-xs text-slate-500 font-semibold uppercase">Hurdle Ensemble</div>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- RISK MAP SECTION (MAIN VISUALIZATION) -->
-    <section id="risk-map" class="py-8 bg-slate-900">
-        <div class="container mx-auto px-4">
-            <div class="flex flex-col lg:flex-row gap-6">
+            <div class="controls">
+                <h3>Layers</h3>
                 
-                <!-- Map Container -->
-                <div class="w-full lg:w-3/4">
-                    <div class="relative bg-slate-800 rounded-xl overflow-hidden shadow-2xl" style="height: 600px;">
-                        <!-- Deck.gl + MapLibre Container -->
-                        <div id="map-container" style="width: 100%; height: 100%;"></div>
-                        
-                        <!-- Map Loading Overlay -->
-                        <div id="map-loading" class="absolute inset-0 bg-slate-900/80 flex items-center justify-center z-10">
-                            <div class="text-center">
-                                <i class="fa-solid fa-spinner fa-spin text-4xl text-blue-400 mb-4"></i>
-                                <p class="text-white font-medium">Loading Risk Map...</p>
-                                <p class="text-slate-400 text-sm" id="loading-status">Initializing...</p>
-                            </div>
-                        </div>
-                        
-                        <!-- Map Legend (D3 Color Scale) -->
-                        <div class="absolute bottom-4 left-4 bg-slate-900/90 backdrop-blur-sm rounded-lg p-4 text-white text-sm z-20">
-                            <h5 class="font-bold mb-2">Conflict Probability</h5>
-                            <div class="flex items-center space-x-2">
-                                <div id="legend-gradient" class="w-32 h-3 rounded" style="background: linear-gradient(to right, #ffffb2, #fecc5c, #fd8d3c, #f03b20, #bd0026);"></div>
-                            </div>
-                            <div class="flex justify-between text-xs text-slate-400 mt-1 w-32">
-                                <span>0%</span>
-                                <span>50%</span>
-                                <span>100%</span>
-                            </div>
-                        </div>
-                        
-                        <!-- Coordinates Display -->
-                        <div class="absolute bottom-4 right-4 bg-slate-900/90 backdrop-blur-sm rounded-lg px-3 py-2 text-white text-xs z-20">
-                            <span id="cursor-coords">Lat: --, Lng: --</span>
-                        </div>
-                        
-                        <!-- Data Loading Indicator (for slider) -->
-                        <div id="data-loading" class="absolute top-4 left-4 bg-blue-600 text-white px-3 py-1 rounded-full text-xs font-medium z-20 hidden">
-                            <i class="fa-solid fa-sync fa-spin mr-1"></i> Updating...
-                        </div>
-                    </div>
+                <div class="control-group">
+                    <label class="toggle">
+                        <input type="checkbox" id="toggle-conflict" checked>
+                        <span class="slider"></span>
+                        <span class="label-text">Conflict Risk (H3)</span>
+                    </label>
                 </div>
 
-                <!-- Controls Sidebar -->
-                <div class="w-full lg:w-1/4 space-y-4">
-                    
-                    <!-- Date & Horizon Controls -->
-                    <div class="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
-                        <h5 class="font-bold text-slate-800 mb-4 flex items-center">
-                            <i class="fa-solid fa-sliders mr-2 text-blue-500"></i>
-                            Forecast Controls
-                        </h5>
-                        
-                        <!-- Horizon Selector -->
-                        <div class="mb-4">
-                            <label class="block text-xs font-semibold text-slate-500 mb-2 uppercase">Forecast Horizon</label>
-                            <div class="grid grid-cols-3 gap-2">
-                                <button onclick="setHorizon('14d')" class="horizon-btn px-3 py-2 text-sm font-medium rounded-lg bg-blue-500 text-white transition" data-hz="14d">14 Days</button>
-                                <button onclick="setHorizon('1m')" class="horizon-btn px-3 py-2 text-sm font-medium rounded-lg bg-slate-100 text-slate-600 hover:bg-slate-200 transition" data-hz="1m">1 Month</button>
-                                <button onclick="setHorizon('3m')" class="horizon-btn px-3 py-2 text-sm font-medium rounded-lg bg-slate-100 text-slate-600 hover:bg-slate-200 transition" data-hz="3m">3 Months</button>
-                            </div>
-                        </div>
-                        
-                        <!-- Date Selector -->
-                        <div class="mb-4">
-                            <label class="block text-xs font-semibold text-slate-500 mb-2 uppercase">Forecast Date</label>
-                            <input type="date" id="date-picker" class="w-full p-2 text-sm border border-slate-300 rounded-lg bg-white focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
-                        </div>
-                        
-                        <!-- Date Slider -->
-                        <div class="mb-4">
-                            <label class="block text-xs font-semibold text-slate-500 mb-2 uppercase">Time Navigation</label>
-                            <input type="range" id="date-slider" class="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer" min="0" max="100" value="0">
-                            <div class="flex justify-between text-xs text-slate-400 mt-1">
-                                <span id="slider-start">--</span>
-                                <span id="slider-end">--</span>
-                            </div>
-                        </div>
-                        
-                        <!-- Current Date Display -->
-                        <div class="mb-4 p-2 bg-slate-50 rounded-lg text-center">
-                            <span class="text-xs text-slate-500 uppercase">Showing</span>
-                            <div class="text-lg font-bold text-slate-800" id="current-date-display">--</div>
-                        </div>
-                        
-                        <!-- Refresh Button -->
-                        <button onclick="refreshPredictions()" class="w-full py-2 bg-slate-900 text-white rounded-lg text-sm font-bold hover:bg-slate-800 transition flex items-center justify-center">
-                            <i class="fa-solid fa-rotate mr-2"></i> Full Refresh
-                        </button>
-                    </div>
-                    
-                    <!-- Layer Controls -->
-                    <div class="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
-                        <h5 class="font-bold text-slate-800 mb-4 flex items-center">
-                            <i class="fa-solid fa-layer-group mr-2 text-purple-500"></i>
-                            Map Layers
-                        </h5>
-                        
-                        <div class="space-y-3">
-                            <label class="flex items-center justify-between cursor-pointer">
-                                <span class="text-sm text-slate-600">Risk Hexagons</span>
-                                <input type="checkbox" id="layer-hexagons" checked class="toggle-checkbox sr-only">
-                                <div class="toggle-switch w-10 h-5 bg-blue-500 rounded-full relative">
-                                    <div class="toggle-dot absolute w-4 h-4 bg-white rounded-full top-0.5 right-0.5 transition-all"></div>
-                                </div>
-                            </label>
-                            
-                            <label class="flex items-center justify-between cursor-pointer">
-                                <span class="text-sm text-slate-600">Rivers</span>
-                                <input type="checkbox" id="layer-rivers" class="toggle-checkbox sr-only">
-                                <div class="toggle-switch w-10 h-5 bg-slate-300 rounded-full relative">
-                                    <div class="toggle-dot absolute w-4 h-4 bg-white rounded-full top-0.5 left-0.5 transition-all"></div>
-                                </div>
-                            </label>
-                            
-                            <label class="flex items-center justify-between cursor-pointer">
-                                <span class="text-sm text-slate-600">Roads</span>
-                                <input type="checkbox" id="layer-roads" class="toggle-checkbox sr-only">
-                                <div class="toggle-switch w-10 h-5 bg-slate-300 rounded-full relative">
-                                    <div class="toggle-dot absolute w-4 h-4 bg-white rounded-full top-0.5 left-0.5 transition-all"></div>
-                                </div>
-                            </label>
-                            
-                            <label class="flex items-center justify-between cursor-pointer">
-                                <span class="text-sm text-slate-600">Conflict Events</span>
-                                <input type="checkbox" id="layer-events" class="toggle-checkbox sr-only">
-                                <div class="toggle-switch w-10 h-5 bg-slate-300 rounded-full relative">
-                                    <div class="toggle-dot absolute w-4 h-4 bg-white rounded-full top-0.5 left-0.5 transition-all"></div>
-                                </div>
-                            </label>
-                        </div>
-                    </div>
-                    
-                    <!-- Hex Info Panel -->
-                    <div class="bg-blue-50 p-5 rounded-xl border border-blue-100">
-                        <h5 class="font-bold text-blue-900 mb-3 flex items-center">
-                            <i class="fa-solid fa-hexagon-vertical-nft mr-2"></i>
-                            Cell Details
-                        </h5>
-                        <div id="hex-info" class="text-sm text-blue-800 space-y-2">
-                            <p class="text-slate-500 italic">Hover over a hexagon to see details.</p>
-                        </div>
-                    </div>
-                    
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- PIPELINE ARCHITECTURE -->
-    <section id="pipeline" class="py-16 bg-slate-50">
-        <div class="container mx-auto px-4">
-            <div class="text-center mb-12">
-                <h3 class="text-3xl font-bold text-slate-900">System Architecture</h3>
-                <p class="text-slate-600 mt-2">Orchestrated by <code class="bg-slate-200 px-1 py-0.5 rounded text-sm text-slate-800">main.py</code></p>
-            </div>
-
-            <div class="grid md:grid-cols-4 gap-6">
-                <!-- Phase 1 -->
-                <div class="phase-card bg-white p-6 rounded-xl shadow-sm border border-slate-200 relative overflow-hidden" onclick="showPhaseDetails('static')">
-                    <div class="absolute top-0 right-0 w-16 h-16 bg-blue-50 rounded-bl-full -mr-8 -mt-8"></div>
-                    <div class="relative z-10">
-                        <div class="w-10 h-10 bg-blue-100 text-blue-600 rounded-lg flex items-center justify-center mb-4 text-lg">
-                            <i class="fa-solid fa-map"></i>
-                        </div>
-                        <h4 class="text-lg font-bold text-slate-900 mb-2">1. Static Ingestion</h4>
-                        <p class="text-sm text-slate-500 mb-4">Generates the invariant spatial framework.</p>
-                        <ul class="text-xs text-slate-600 space-y-2">
-                            <li class="flex items-center"><i class="fa-solid fa-check text-emerald-500 mr-2"></i> H3 Grid Generation</li>
-                            <li class="flex items-center"><i class="fa-solid fa-check text-emerald-500 mr-2"></i> DEM & Terrain (Slope/TRI)</li>
-                            <li class="flex items-center"><i class="fa-solid fa-check text-emerald-500 mr-2"></i> Rivers & Roads</li>
-                        </ul>
-                    </div>
+                <div class="control-group">
+                    <label class="toggle">
+                        <input type="checkbox" id="toggle-roads">
+                        <span class="slider"></span>
+                        <span class="label-text">GRIP4 Roads</span>
+                    </label>
                 </div>
 
-                <!-- Phase 2 -->
-                <div class="phase-card bg-white p-6 rounded-xl shadow-sm border border-slate-200 relative overflow-hidden" onclick="showPhaseDetails('dynamic')">
-                    <div class="absolute top-0 right-0 w-16 h-16 bg-purple-50 rounded-bl-full -mr-8 -mt-8"></div>
-                    <div class="relative z-10">
-                        <div class="w-10 h-10 bg-purple-100 text-purple-600 rounded-lg flex items-center justify-center mb-4 text-lg">
-                            <i class="fa-solid fa-rss"></i>
-                        </div>
-                        <h4 class="text-lg font-bold text-slate-900 mb-2">2. Dynamic Ingestion</h4>
-                        <p class="text-sm text-slate-500 mb-4">Fetches time-series data from APIs.</p>
-                        <ul class="text-xs text-slate-600 space-y-2">
-                            <li class="flex items-center"><i class="fa-solid fa-check text-emerald-500 mr-2"></i> ACLED & GDELT</li>
-                            <li class="flex items-center"><i class="fa-solid fa-check text-emerald-500 mr-2"></i> WorldPop & IOM</li>
-                            <li class="flex items-center"><i class="fa-solid fa-check text-emerald-500 mr-2"></i> Spatial Disaggregation</li>
-                        </ul>
-                    </div>
+                <div class="control-group">
+                    <label class="toggle">
+                        <input type="checkbox" id="toggle-rivers">
+                        <span class="slider"></span>
+                        <span class="label-text">Rivers</span>
+                    </label>
                 </div>
 
-                <!-- Phase 3 -->
-                <div class="phase-card bg-white p-6 rounded-xl shadow-sm border border-slate-200 relative overflow-hidden" onclick="showPhaseDetails('engineering')">
-                    <div class="absolute top-0 right-0 w-16 h-16 bg-amber-50 rounded-bl-full -mr-8 -mt-8"></div>
-                    <div class="relative z-10">
-                        <div class="w-10 h-10 bg-amber-100 text-amber-600 rounded-lg flex items-center justify-center mb-4 text-lg">
-                            <i class="fa-solid fa-gears"></i>
-                        </div>
-                        <h4 class="text-lg font-bold text-slate-900 mb-2">3. Feature Eng.</h4>
-                        <p class="text-sm text-slate-500 mb-4">Computes spatio-temporal signals.</p>
-                        <ul class="text-xs text-slate-600 space-y-2">
-                            <li class="flex items-center"><i class="fa-solid fa-check text-emerald-500 mr-2"></i> Conflict Decays (30d/90d)</li>
-                            <li class="flex items-center"><i class="fa-solid fa-check text-emerald-500 mr-2"></i> Environmental Anomalies</li>
-                            <li class="flex items-center"><i class="fa-solid fa-check text-emerald-500 mr-2"></i> EPR Entropy Logic</li>
-                        </ul>
-                    </div>
+                <div class="control-group">
+                    <label class="toggle">
+                        <input type="checkbox" id="toggle-events">
+                        <span class="slider"></span>
+                        <span class="label-text">Conflict Events</span>
+                    </label>
                 </div>
-
-                <!-- Phase 4 -->
-                <div class="phase-card bg-white p-6 rounded-xl shadow-sm border border-slate-200 relative overflow-hidden" onclick="showPhaseDetails('modeling')">
-                    <div class="absolute top-0 right-0 w-16 h-16 bg-rose-50 rounded-bl-full -mr-8 -mt-8"></div>
-                    <div class="relative z-10">
-                        <div class="w-10 h-10 bg-rose-100 text-rose-600 rounded-lg flex items-center justify-center mb-4 text-lg">
-                            <i class="fa-solid fa-brain"></i>
-                        </div>
-                        <h4 class="text-lg font-bold text-slate-900 mb-2">4. Modeling</h4>
-                        <p class="text-sm text-slate-500 mb-4">Two-Stage Hurdle Ensemble.</p>
-                        <ul class="text-xs text-slate-600 space-y-2">
-                            <li class="flex items-center"><i class="fa-solid fa-check text-emerald-500 mr-2"></i> Thematic Base Learners</li>
-                            <li class="flex items-center"><i class="fa-solid fa-check text-emerald-500 mr-2"></i> Meta-Learner Stacking</li>
-                            <li class="flex items-center"><i class="fa-solid fa-check text-emerald-500 mr-2"></i> Prob. + Fatalities</li>
-                        </ul>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Dynamic Phase Detail View -->
-            <div id="phase-detail" class="mt-8 bg-white p-6 rounded-xl border border-slate-200 shadow-sm hidden">
-                <h4 id="phase-title" class="text-xl font-bold text-slate-800 mb-2"></h4>
-                <p id="phase-desc" class="text-slate-600 text-sm"></p>
-            </div>
-        </div>
-    </section>
-
-    <!-- DATA INTELLIGENCE -->
-    <section id="data" class="py-16 bg-white border-y border-slate-200">
-        <div class="container mx-auto px-4">
-            <div class="flex flex-col md:flex-row gap-12 items-center">
                 
-                <!-- Chart Column -->
-                <div class="w-full md:w-1/2">
-                    <h3 class="text-2xl font-bold text-slate-900 mb-6">Multi-Source Integration</h3>
-                    <p class="text-slate-600 mb-6">The CEWP harmonizes 21 distinct data sources. Click a category to view specific inputs.</p>
-                    <div class="chart-wrapper">
-                        <canvas id="dataChart"></canvas>
+                <div class="legend">
+                    <h4>Risk Intensity</h4>
+                    <div class="gradient-bar"></div>
+                    <div class="labels">
+                        <span>Low</span>
+                        <span>High</span>
                     </div>
                 </div>
 
-                <!-- Details Column -->
-                <div class="w-full md:w-1/2">
-                    <div class="bg-slate-50 rounded-xl p-6 border border-slate-200 h-full max-h-[500px] overflow-y-auto">
-                        <h4 class="text-lg font-bold text-slate-800 mb-4 border-b pb-2">Source Registry</h4>
-                        <div id="source-list" class="space-y-4">
-                            <!-- Populated by JS -->
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- MODEL PERFORMANCE -->
-    <section id="performance" class="py-16 bg-slate-50">
-        <div class="container mx-auto px-4">
-            <div class="flex justify-between items-center mb-8 flex-wrap gap-4">
-                <div>
-                    <h3 class="text-3xl font-bold text-slate-900">Model Benchmarking</h3>
-                    <p class="text-sm text-slate-500">XGBoost vs. LightGBM across time horizons.</p>
-                </div>
-                <div class="flex bg-white rounded-lg shadow-sm p-1 border border-slate-200">
-                    <button onclick="updatePerfHorizon('14d')" class="perf-horizon-btn px-4 py-2 text-sm font-medium rounded-md bg-blue-500 text-white transition" data-hz="14d">14 Days</button>
-                    <button onclick="updatePerfHorizon('1m')" class="perf-horizon-btn px-4 py-2 text-sm font-medium rounded-md text-slate-600 hover:bg-slate-100 transition" data-hz="1m">1 Month</button>
-                    <button onclick="updatePerfHorizon('3m')" class="perf-horizon-btn px-4 py-2 text-sm font-medium rounded-md text-slate-600 hover:bg-slate-100 transition" data-hz="3m">3 Months</button>
-                </div>
-            </div>
-
-            <div class="grid md:grid-cols-2 gap-8">
-                <!-- Bar Chart: PR-AUC -->
-                <div class="bg-white p-6 rounded-xl border border-slate-200 shadow-sm">
-                    <h4 class="text-sm font-bold text-slate-500 uppercase mb-4">Precision-Recall AUC</h4>
-                    <div class="chart-wrapper">
-                        <canvas id="aucChart"></canvas>
+                <!-- Hex Info Panel -->
+                <div class="hex-info-panel">
+                    <h4>Cell Details</h4>
+                    <div id="hex-info">
+                        <p class="muted">Hover over a hexagon to see details.</p>
                     </div>
                 </div>
 
-                <!-- Bar Chart: Operational Recall -->
-                <div class="bg-white p-6 rounded-xl border border-slate-200 shadow-sm">
-                    <h4 class="text-sm font-bold text-slate-500 uppercase mb-4">Top-10% Operational Recall</h4>
-                    <div class="chart-wrapper">
-                        <canvas id="recallChart"></canvas>
-                    </div>
-                    <p class="text-xs text-slate-400 mt-2 text-center">Percentage of actual conflict events captured within the highest-risk 10% of cells.</p>
+                <!-- API Status -->
+                <div class="api-status">
+                    <span class="status-dot" id="status-dot"></span>
+                    <span class="status-text" id="status-text">Connecting...</span>
                 </div>
             </div>
-        </div>
-    </section>
+        </aside>
 
-    <!-- FOOTER -->
-    <footer class="bg-slate-900 text-slate-400 py-12">
-        <div class="container mx-auto px-4 text-center">
-            <div class="mb-6">
-                <i class="fa-solid fa-shield-halved text-blue-500 text-3xl mb-2"></i>
-                <h2 class="text-white font-bold text-xl">CEWP</h2>
+        <!-- Map Container -->
+        <main class="map-wrapper">
+            <div id="map"></div>
+            <div id="tooltip" class="tooltip hidden"></div>
+            
+            <!-- Loading Overlay -->
+            <div id="loading" class="loading-overlay">
+                <div class="spinner"></div>
+                <p>Loading Geospatial Data...</p>
+                <p class="loading-status" id="loading-status">Initializing...</p>
             </div>
-            <p class="text-sm mb-4">A Spatio-Temporal Machine Learning Framework for Predicting Armed Conflict Risk.</p>
-            <div class="text-xs space-y-1">
-                <p>Developed by Brenan Andre (2025).</p>
-                <p>Master's Thesis Research.</p>
-            </div>
-        </div>
-    </footer>
 
-    <!-- JAVASCRIPT - FIXED PATH -->
-    <script src="/static/script.js"></script>
+            <!-- Coordinates Display -->
+            <div class="coords-display" id="coords-display">
+                <span id="cursor-coords">Lat: --, Lng: --</span>
+            </div>
+        </main>
+
+    </div>
+
+    <!-- JavaScript -->
+    <script src="script.js"></script>
 </body>
 </html>

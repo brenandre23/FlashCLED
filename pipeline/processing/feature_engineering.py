@@ -759,7 +759,11 @@ def process_conflict(engine, spine, conflict_specs, features_config):
     
     temporal_config = features_config.get('temporal', {}) if isinstance(features_config, dict) else {}
 
-    # --- Admin mapping (prefer admin2/prefecture, fallback to admin1) ---
+    # --- Admin mapping (prefer admin3/sub-prefecture, fallback to admin2, then admin1) ---
+    # NOTE: We use features_static for admin mapping because:
+    #   - Your WBG data: admin1=regions, admin2=prefectures, admin3=sub-prefectures
+    #   - ACLED data: admin1=prefectures, admin2=sub-prefectures (different schema!)
+    # So we join ACLED events to features_static via h3_index to get consistent admin names.
     insp = inspect(engine)
     fs_cols = {c["name"] for c in insp.get_columns("features_static", schema=SCHEMA)}
     if "admin3" in fs_cols:
@@ -770,7 +774,7 @@ def process_conflict(engine, spine, conflict_specs, features_config):
         admin_col = "admin1"
 
     if admin_col in fs_cols:
-        logger.info(f"  Using '{admin_col}' for regional risk aggregation.")
+        logger.info(f"  Using '{admin_col}' from features_static for regional risk aggregation.")
         admin_map = pd.read_sql(f"SELECT h3_index, {admin_col} FROM {SCHEMA}.features_static", engine)
         admin_map["h3_index"] = admin_map["h3_index"].astype("int64")
         spine = spine.merge(admin_map, on="h3_index", how="left")
@@ -779,11 +783,22 @@ def process_conflict(engine, spine, conflict_specs, features_config):
         spine[admin_col] = None
 
     # 1. Load ACLED - Split Protest and Riots
+    # NOTE: We do NOT select admin columns from acled_events because ACLED uses a different
+    # admin hierarchy (ACLED admin1=prefectures, admin2=sub-prefectures) than our WBG schema
+    # (WBG admin1=regions, admin2=prefectures, admin3=sub-prefectures).
+    # Instead, we join to features_static via h3_index to get the correct admin assignment.
     acled_query = f"""
-        SELECT h3_index, {admin_col}, event_date AS date, geo_precision, time_precision, fatalities, 
-               CASE WHEN event_type = 'Protests' THEN 1 ELSE 0 END as protest_flag,
-               CASE WHEN event_type = 'Riots' THEN 1 ELSE 0 END as riot_flag
-        FROM {SCHEMA}.acled_events
+        SELECT 
+            ae.h3_index, 
+            fs.{admin_col} AS {admin_col},
+            ae.event_date AS date, 
+            ae.geo_precision, 
+            ae.time_precision, 
+            ae.fatalities, 
+            CASE WHEN ae.event_type = 'Protests' THEN 1 ELSE 0 END as protest_flag,
+            CASE WHEN ae.event_type = 'Riots' THEN 1 ELSE 0 END as riot_flag
+        FROM {SCHEMA}.acled_events ae
+        LEFT JOIN {SCHEMA}.features_static fs ON ae.h3_index = fs.h3_index
     """
     acled_raw = pd.read_sql(acled_query, engine)
     acled_raw['date'] = pd.to_datetime(acled_raw['date'])
@@ -968,48 +983,64 @@ def process_nlp_data(engine, spine, nlp_specs):
                 if c not in ['h3_index', 'date']:
                     spine[c] = spine[c].fillna(0)
 
-        elif source == "NLP_CrisisWatch" and transformation == "max":
-            cw_table = None
-            if insp.has_table("features_nlp_crisiswatch", schema=SCHEMA):
-                cw_table = "features_nlp_crisiswatch"
-                select_clause = "h3_index, date, nlp_risk_score"
-            elif insp.has_table("features_crisiswatch", schema=SCHEMA):
-                cw_table = "features_crisiswatch"
-                select_clause = "h3_index, date, cw_topic_id"
-            else:
-                logger.info("  CrisisWatch NLP table not found; skipping.")
+        # ---------------------------------------------------------
+        # STREAM B: CRISISWATCH (Strategic Monthly Intel)
+        # ---------------------------------------------------------
+        elif source == "NLP_CrisisWatch" and transformation == "pivot":
+            # 1. Check if table exists
+            if not insp.has_table("features_crisiswatch", schema=SCHEMA):
+                logger.warning("  features_crisiswatch table not found. Skipping.")
                 continue
 
+            # 2. Load strictly the ID (the "What") and Date/Location
             cw_raw = pd.read_sql(
-                f"""
-                SELECT {select_clause}
-                FROM {SCHEMA}.{cw_table}
-                """,
+                f"SELECT h3_index, date, cw_topic_id FROM {SCHEMA}.features_crisiswatch",
                 engine
             )
-            if cw_raw.empty:
-                logger.info(f"  {cw_table} is empty; skipping.")
+            if cw_raw.empty: 
+                logger.info("  features_crisiswatch is empty. Skipping.")
                 continue
 
             cw_raw['date'] = pd.to_datetime(cw_raw['date'])
             cw_raw['h3_index'] = cw_raw['h3_index'].astype('int64')
-            if 'nlp_risk_score' not in cw_raw.columns and 'cw_topic_id' in cw_raw.columns:
-                cw_raw['nlp_risk_score'] = 1.0
+            
+            # 3. Assign intensity (1 mention = 1 count)
+            cw_raw['intensity'] = 1.0
 
+            # 4. Filter topics if config limits them (e.g., only want 'Rebel' topics)
+            valid_topics = params.get('topics')
+            if valid_topics:
+                cw_raw = cw_raw[cw_raw['cw_topic_id'].isin(valid_topics)]
+
+            # 5. Bin to Spine (Monthly -> Daily/Weekly)
             cw_raw['spine_date'] = pd.cut(cw_raw['date'], bins=dates, labels=dates[1:], right=True)
-            cw_agg = (
-                cw_raw
-                .groupby(['h3_index', 'spine_date'], observed=True)['nlp_risk_score']
-                .max()
-                .reset_index()
-                .rename(columns={'spine_date': 'date', 'nlp_risk_score': output_col or 'crisiswatch_nlp_risk_max'})
-            )
-            cw_agg['date'] = pd.to_datetime(cw_agg['date'])
 
-            spine = spine.merge(cw_agg, on=['h3_index', 'date'], how='left')
-            out_col = output_col or 'crisiswatch_nlp_risk_max'
-            if out_col in spine.columns:
-                spine[out_col] = spine[out_col].fillna(0)
+            # 6. PIVOT: Create columns like 'cw_topic_id_4'
+            pivot_df = (
+                cw_raw.pivot_table(
+                    index=['h3_index', 'spine_date'],
+                    columns='cw_topic_id',
+                    values='intensity',
+                    aggfunc='sum', 
+                    fill_value=0
+                )
+                .reset_index()
+                .rename(columns={'spine_date': 'date'})
+            )
+
+            # 7. Rename columns from integers (4) to strings (crisiswatch_topic_4)
+            topic_cols = [c for c in pivot_df.columns if c not in ['h3_index', 'date']]
+            rename_map = {c: f"{output_col}_{int(c)}" for c in topic_cols}
+            pivot_df = pivot_df.rename(columns=rename_map)
+            
+            # 8. Merge back to the main spine
+            spine = spine.merge(pivot_df, on=['h3_index', 'date'], how='left')
+            
+            # 9. Fill NaNs for the new columns only
+            new_cols = list(rename_map.values())
+            spine[new_cols] = spine[new_cols].fillna(0)
+            
+            logger.info(f"  ✓ Merged {len(new_cols)} CrisisWatch topic features.")
 
     return spine
 

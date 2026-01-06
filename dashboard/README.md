@@ -1,24 +1,24 @@
-# CEWP Dashboard
+# FlashCLED Dashboard
 
 Interactive web dashboard for the Conflict Early Warning Pipeline (CEWP). Visualizes conflict risk predictions across the Central African Republic using a high-performance H3 hexagonal grid.
 
-## Architecture
+## Architecture (Refactored)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Frontend                                  │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │
-│  │  MapLibre   │  │   Deck.gl   │  │       Chart.js          │ │
-│  │  (Base Map) │  │ (H3 Hexes)  │  │  (Performance Metrics)  │ │
-│  └─────────────┘  └─────────────┘  └─────────────────────────┘ │
+│  ┌─────────────┐  ┌──────────────────┐  ┌───────────────────┐  │
+│  │  MapLibre   │  │   Deck.gl        │  │   Responsive      │  │
+│  │  (Base Map) │  │  MapboxOverlay   │  │   Sidebar UI      │  │
+│  └─────────────┘  └──────────────────┘  └───────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼ REST API
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Backend (FastAPI)                            │
+│                     Backend (Flask)                              │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ /api/predict │  │ /api/features│  │ /api/events          │  │
-│  │              │  │  /static     │  │                      │  │
+│  │ /api/h3_data │  │ /api/roads   │  │ /api/events          │  │
+│  │              │  │ /api/rivers  │  │                      │  │
 │  └──────────────┘  └──────────────┘  └──────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
                               │
@@ -32,17 +32,26 @@ Interactive web dashboard for the Conflict Early Warning Pipeline (CEWP). Visual
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+## Key Improvements (v2.0)
+
+| Issue | Fix |
+|-------|-----|
+| Invisible Hexagons | Robust `ensure_signed_h3()` handles hex-string vs signed-int mismatches |
+| Fragile Connectivity | JSON error responses instead of crashes |
+| Rigid Layout | Flexbox sidebar + map-container responsive design |
+| Deck.gl Integration | MapboxOverlay (modern standard for Deck.gl + MapLibre) |
+| Static Data Performance | `lru_cache` on roads/rivers endpoints |
+
 ## Tech Stack
 
 | Component | Technology | Purpose |
 |-----------|------------|---------|
-| Backend | FastAPI | REST API server |
+| Backend | **Flask** | REST API server |
 | Database | PostgreSQL + PostGIS | Spatial data storage |
 | Base Map | MapLibre GL JS | Open-source map rendering |
-| Hex Layer | Deck.gl | High-performance WebGL visualization |
-| Tile Source | CartoDB Positron | Free raster tiles (no API key) |
-| Charts | Chart.js | Performance metrics visualization |
-| Styling | Tailwind CSS | Responsive UI framework |
+| Hex Layer | Deck.gl + H3HexagonLayer | High-performance WebGL visualization |
+| Tile Source | CARTO Dark Matter | Free vector tiles (no API key) |
+| Styling | Custom CSS (Flexbox) | Responsive UI |
 
 ## Quick Start
 
@@ -70,10 +79,9 @@ DB_PASS=your_password
 ```bash
 # From the dashboard directory
 python app.py
-
-# Or using uvicorn directly
-uvicorn app:app --reload --port 8000
 ```
+
+Server runs on: **http://localhost:8000**
 
 ### 4. Open the Dashboard
 
@@ -85,10 +93,12 @@ Navigate to: **http://localhost:8000**
 |----------|--------|-------------|
 | `/` | GET | Serve dashboard HTML |
 | `/api/health` | GET | Health check |
-| `/api/dates` | GET | Available prediction dates |
-| `/api/predictions` | GET | Prediction data (GeoJSON) |
-| `/api/features/static` | GET | Rivers, roads, boundaries |
-| `/api/features/hexgrid` | GET | H3 grid geometries |
+| `/api/h3_data` | GET | H3 hexagons with risk scores |
+| `/api/predictions` | GET | Full predictions with geometry (GeoJSON) |
+| `/api/data/predictions` | GET | Lightweight predictions (data only) |
+| `/api/features/hexgrid` | GET | H3 grid geometries only |
+| `/api/roads` | GET | Road geometries (cached) |
+| `/api/rivers` | GET | River geometries (cached) |
 | `/api/events` | GET | ACLED conflict events |
 | `/api/stats` | GET | Summary statistics |
 
@@ -101,7 +111,38 @@ Navigate to: **http://localhost:8000**
 **`/api/events`**
 - `start_date` (optional): Filter start (YYYY-MM-DD)
 - `end_date` (optional): Filter end (YYYY-MM-DD)
-- `limit` (optional): Max results (default: 1000)
+- `limit` (optional): Max results (default: 1000, max: 5000)
+
+## Features
+
+### Interactive Map
+- **H3 Hexagon Layer**: Color-coded by conflict probability (YlOrRd scale)
+- **Layer Toggles**: Show/hide roads, rivers, conflict events
+- **Hover Tooltips**: View cell-level predictions
+- **Responsive Sidebar**: Controls and legend
+
+### Layer Controls
+- ✅ Conflict Risk (H3) - Hexagonal risk visualization
+- ☐ GRIP4 Roads - Transportation network
+- ☐ Rivers - Hydrological features  
+- ☐ Conflict Events - ACLED point events
+
+### Status Indicators
+- 🟢 Connected - API healthy
+- 🟡 Connecting - Loading
+- 🔴 Disconnected - API unavailable
+
+## File Structure
+
+```
+dashboard/
+├── app.py                    # Flask backend (refactored)
+├── index.html                # Simplified responsive layout
+├── script.js                 # MapboxOverlay + async/await
+├── style.css                 # Flexbox architecture
+├── requirements_dashboard.txt # Python dependencies
+└── README.md                 # This file
+```
 
 ## Database Schema
 
@@ -110,95 +151,55 @@ The dashboard expects these tables in the `car_cewp` schema:
 ### Required Tables
 
 ```sql
--- Predictions (if available)
+-- Static features (required for hexgrid)
+CREATE TABLE car_cewp.features_static (
+    h3_index BIGINT PRIMARY KEY
+);
+
+-- Predictions (optional - mock data generated if missing)
 CREATE TABLE car_cewp.predictions_latest (
     h3_index BIGINT,
     date DATE,
-    horizon TEXT,
-    pred_proba FLOAT,
-    pred_fatalities FLOAT,
-    PRIMARY KEY (h3_index, date, horizon)
+    prob_conflict_3m FLOAT,
+    expected_fatalities_3m FLOAT,
+    PRIMARY KEY (h3_index, date)
 );
+```
 
--- Static features (required)
-CREATE TABLE car_cewp.features_static (
-    h3_index BIGINT PRIMARY KEY,
-    geometry GEOMETRY(Polygon, 4326),
-    -- ... other features
-);
+### Optional Tables
 
--- Optional: Rivers
+```sql
+-- Rivers
 CREATE TABLE car_cewp.rivers (
-    gid SERIAL PRIMARY KEY,
-    geometry GEOMETRY(LineString, 4326)
+    hyriv_id INTEGER PRIMARY KEY,
+    geometry GEOMETRY(LineString, 32634)
 );
 
--- Optional: ACLED Events
+-- Roads (tries multiple table names)
+CREATE TABLE car_cewp.grip4_roads_h3 (
+    gid SERIAL PRIMARY KEY,
+    geometry GEOMETRY(LineString, 32634)
+);
+
+-- ACLED Events
 CREATE TABLE car_cewp.acled_events (
     event_id_cnty TEXT PRIMARY KEY,
     event_date DATE,
     event_type TEXT,
+    sub_event_type TEXT,
     fatalities INTEGER,
-    geometry GEOMETRY(Point, 4326)
+    latitude FLOAT,
+    longitude FLOAT
 );
 ```
 
-## Features
-
-### Interactive Map
-- **H3 Hexagon Layer**: Color-coded by conflict probability
-- **Layer Toggles**: Show/hide rivers, roads, conflict events
-- **Hover Tooltips**: View cell-level predictions
-- **Zoom Controls**: Navigate the map
-
-### Time Navigation
-- **Date Picker**: Select specific forecast dates
-- **Time Slider**: Navigate through available dates
-- **Horizon Selector**: Toggle between 14d/1m/3m forecasts
-
-### Performance Dashboard
-- **PR-AUC Comparison**: XGBoost vs LightGBM
-- **Operational Recall**: Top-10% capture rate
-- **Data Source Registry**: Interactive exploration
-
-## Development
-
-### File Structure
-
-```
-dashboard/
-├── app.py                    # FastAPI backend
-├── index.html                # Main HTML page
-├── script.js                 # Frontend JavaScript
-├── style.css                 # Custom styles
-├── requirements_dashboard.txt # Python dependencies
-└── README.md                 # This file
-```
-
-### Adding New Endpoints
-
-```python
-@app.get("/api/custom")
-async def custom_endpoint(param: str = Query(None)):
-    # Your logic here
-    return {"result": "data"}
-```
-
-### Modifying Map Layers
-
-Edit `script.js` and add/modify layer creation functions:
-
-```javascript
-function createCustomLayer() {
-    return new deck.GeoJsonLayer({
-        id: 'custom-layer',
-        data: STATE.customData,
-        // ... layer options
-    });
-}
-```
-
 ## Troubleshooting
+
+### "Invisible Hexagons"
+The refactored `ensure_signed_h3()` function handles:
+- Hex strings (e.g., `'852a104ffffffff'`)
+- Unsigned integers from DB
+- Converts to signed 64-bit int for Deck.gl
 
 ### "Database connection failed"
 - Verify PostgreSQL is running
@@ -209,10 +210,41 @@ function createCustomLayer() {
 - Dashboard generates mock data if `predictions_latest` doesn't exist
 - Run the modeling pipeline to generate actual predictions
 
-### "Map not loading"
-- Check browser console for errors
-- Verify CDN scripts are accessible
-- Try clearing browser cache
+### "Roads/Rivers not showing"
+- Check tables exist: `SELECT to_regclass('car_cewp.rivers')`
+- Backend tries multiple table names for roads
+
+## Development
+
+### Adding New Layers
+
+1. Add data fetching function in `script.js`:
+```javascript
+async function fetchCustomData() {
+    const response = await fetch(`${API_URL}/custom`);
+    return await response.json();
+}
+```
+
+2. Add layer creation function:
+```javascript
+function createCustomLayer(data) {
+    return new deck.GeoJsonLayer({
+        id: 'custom-layer',
+        data: data,
+        // ... options
+    });
+}
+```
+
+3. Add to `renderLayers()`:
+```javascript
+if (layersState.custom && cachedData.custom) {
+    layers.push(createCustomLayer(cachedData.custom));
+}
+```
+
+4. Add toggle in `index.html` and listener in `setupToggleListeners()`
 
 ## License
 

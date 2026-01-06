@@ -11,6 +11,10 @@ spatial:
     geodetic: "EPSG:4326" # WGS84
   h3_resolution: 5
   buffer_km: 8.5
+  admin_columns:
+    admin1: "NAM_1"
+    admin2: "NAM_2"
+    admin3: "adm2_ref_name"
 
 # --- TEMPORAL DEFINITIONS (The 14-Day Spine) ---
 temporal:
@@ -191,6 +195,13 @@ registry:
       lookback_months: 12
     output_col: "price_oil_shock"
 
+  - raw: "price_sorghum"
+    source: "Food_Security"
+    transformation: "shock_12m"
+    transformation_params:
+      lookback_months: 12
+    output_col: "price_sorghum_shock"
+
 
   # =========================================================
   # 5. SOCIAL & DEMOGRAPHIC (Phase 2B/2C)
@@ -223,11 +234,6 @@ registry:
     source: "EPR"
     transformation: "none"
     output_col: "epr_status_mean"
-
-  - raw: "epr_status_entropy"
-    source: "EPR"
-    transformation: "none"
-    output_col: "epr_horizontal_inequality"
 
   - raw: "ethnic_group_count"
     source: "EPR"
