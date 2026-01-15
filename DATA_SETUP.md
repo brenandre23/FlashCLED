@@ -21,6 +21,9 @@ ACLED_PASSWORD=your_password
 # IOM DTM (Request access): [https://dtm.iom.int/data/api](https://dtm.iom.int/data/api)
 IOM_PRIMARY_KEY=your_key
 
+# IPC-CH API (Request access): [https://www.ipcinfo.org/ipc-country-analysis/api/](https://www.ipcinfo.org/ipc-country-analysis/api/)
+IOM_PRIMARY_KEY=your_key
+
 # Sentinel Hub (Copernicus DEM): [https://www.sentinel-hub.com/](https://www.sentinel-hub.com/)
 SH_CLIENT_ID=your_client_id
 SH_CLIENT_SECRET=your_client_secret
@@ -86,4 +89,5 @@ Why? The pipeline's legacy spatial_disaggregation.py logic looks for an "Admin 3
 # 4. Quotas & Limits
 
 Google BigQuery (GDELT): The pipeline queries the public GDELT dataset. This falls under the BigQuery free tier (1TB/month), but repeated full-history ingestion may incur costs. The pipeline implements caching to minimize this.
+
 Google Earth Engine: Requires an enabled GEE account linked to your Google Cloud Project.
