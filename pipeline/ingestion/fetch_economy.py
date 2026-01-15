@@ -183,6 +183,9 @@ def run(configs, engine):
     start_date = data_cfg.get('global_date_window', {}).get('start_date', '2000-01-01')
     end_date = data_cfg.get('global_date_window', {}).get('end_date', '2025-12-31')
     
+    # Enforce lower bound to avoid stale pre-2003 data
+    min_start = pd.to_datetime("2003-12-01").date()
+    start_date = max(pd.to_datetime(start_date).date(), min_start)
     logger.info(f"Date Range: {start_date} to {end_date}")
     
     # 1. Recreate table with new schema

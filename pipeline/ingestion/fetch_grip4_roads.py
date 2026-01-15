@@ -49,10 +49,18 @@ def check_data_exists(engine):
         return False
 
 def _poly_to_h3(geom, resolution):
+    """
+    Convert road geometries to H3 with a buffer large enough to capture line centerlines.
+    Uses polygon_to_cells on a buffered geometry; buffer is scaled to resolution.
+    """
+    # Approx edge length (km) by resolution; res 7 ~1.2 km, res 8 ~0.46 km.
+    # Use ~550 m buffer (~0.006 deg) to ensure capture at res 7-8.
+    buffer_size = 0.006
     try:
-        buffered = geom.buffer(0.0002) 
-        if buffered.is_empty: return set()
-        polys = list(buffered.geoms) if buffered.geom_type == 'MultiPolygon' else [buffered]
+        buffered = geom.buffer(buffer_size)
+        if buffered.is_empty:
+            return set()
+        polys = list(buffered.geoms) if buffered.geom_type == "MultiPolygon" else [buffered]
         cells = set()
         for poly in polys:
             exterior = [(y, x) for x, y in poly.exterior.coords]

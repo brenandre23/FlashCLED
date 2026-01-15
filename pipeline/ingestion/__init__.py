@@ -2,10 +2,12 @@
 
 from . import (
     create_h3_grid,
+    discover_gdelt_themes,
+    fetch_economy,
+    fetch_food_security,
+    fetch_ioda,
     fetch_population,
     fetch_acled,
-    fetch_dynamic_event,
-    fetch_crisiswatch,
     fetch_gee_server_side,
     fetch_mines,
     fetch_dem,
@@ -15,16 +17,16 @@ from . import (
     fetch_epr_core,
     fetch_iom,
     fetch_settlements,
-    ingest_economy,
-    ingest_food_security
+    fetch_gdelt_themes,
+    fetch_gdelt_events
 )
 
 __all__ = [
     'create_h3_grid',
+    'discover_gdelt_themes',
     'fetch_population',
     'fetch_acled',
-    'fetch_dynamic_event',
-    'fetch_crisiswatch',
+    'fetch_ioda',
     'fetch_gee_server_side',
     'fetch_mines',
     'fetch_dem',
@@ -34,6 +36,8 @@ __all__ = [
     'fetch_geoepr',
     'fetch_epr_core',
     'fetch_iom',
-    'ingest_economy',
-    'ingest_food_security',
+    'fetch_economy',
+    'fetch_gdelt_themes',
+    'fetch_gdelt_events',
+    'fetch_food_security',
 ]

@@ -45,6 +45,11 @@ def ensure_table_structure(engine):
                 event_type VARCHAR(100),
                 sub_event_type VARCHAR(100),
                 geo_precision INTEGER,
+                acled_count_battles INTEGER DEFAULT 0,
+                acled_count_vac INTEGER DEFAULT 0,
+                acled_count_explosions INTEGER DEFAULT 0,
+                acled_count_protests INTEGER DEFAULT 0,
+                acled_count_riots INTEGER DEFAULT 0,
                 actor1 VARCHAR(255),
                 actor2 VARCHAR(255),
                 latitude FLOAT,
@@ -78,7 +83,12 @@ def ensure_table_structure(engine):
         'geo_precision': 'INTEGER', 
         'time_precision': 'INTEGER', 
         'admin1': 'VARCHAR(255)', 
-        'admin2': 'VARCHAR(255)'
+        'admin2': 'VARCHAR(255)',
+        'acled_count_battles': 'INTEGER DEFAULT 0',
+        'acled_count_vac': 'INTEGER DEFAULT 0',
+        'acled_count_explosions': 'INTEGER DEFAULT 0',
+        'acled_count_protests': 'INTEGER DEFAULT 0',
+        'acled_count_riots': 'INTEGER DEFAULT 0'
     }
     
     with engine.begin() as conn:
@@ -124,39 +134,52 @@ def process_data(df: pd.DataFrame, resolution: int = 5) -> pd.DataFrame:
     logger.info(f"  Rows after H3 mapping: {h3_count:,} (Dropped {date_count - h3_count:,})")
     
     # 3. Conflict Binary & Integers
-    df['conflict_binary'] = (df['fatalities'] > 0).astype(int)
     df['h3_index'] = df['h3_index'].astype('int64')
     df['fatalities'] = df['fatalities'].fillna(0).astype(int)
 
-    # 4. Column Selection & Defaults
-    # Ensure all required columns exist in DataFrame, filling defaults if missing
-    defaults = {
-        'geo_precision': 1,
-        'time_precision': 1,
-        'admin1': None,
-        'admin2': None
+    # 4. Event-type flags for aggregation
+    EVENT_FLAG_MAP = {
+        'acled_count_battles': 'Battles',
+        'acled_count_vac': 'Violence against civilians',
+        'acled_count_explosions': 'Explosions/Remote violence',
+        'acled_count_protests': 'Protests',
+        'acled_count_riots': 'Riots'
     }
-    
-    for col, default_val in defaults.items():
-        if col not in df.columns:
-            logger.warning(f"  Column '{col}' missing in CSV. Filling with default.")
-            df[col] = default_val
-        elif col in ['geo_precision', 'time_precision']:
-            # Ensure numeric types for precision columns
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(default_val).astype(int)
+    for col, evt in EVENT_FLAG_MAP.items():
+        df[col] = (df['event_type'] == evt).astype(int)
 
-    cols = [
-        'event_id_cnty', 'event_date', 'year', 'event_type', 'sub_event_type', 
-        'actor1', 'actor2', 'location', 'latitude', 'longitude', 
-        'geo_precision', 'time_precision', 
-        'admin1', 'admin2', 
-        'fatalities', 'notes', 'h3_index', 'conflict_binary'
+    # 5. Group by h3/date and aggregate fatalities + counts
+    agg_cols = {'fatalities': 'sum'}
+    agg_cols.update({c: 'sum' for c in EVENT_FLAG_MAP})
+    grouped = (
+        df.groupby(['h3_index', 'event_date'], observed=True)
+        .agg(agg_cols)
+        .reset_index()
+    )
+
+    # 6. Fill defaults and derive conflict flag + synthetic key
+    for c in EVENT_FLAG_MAP:
+        grouped[c] = grouped[c].fillna(0).astype(int)
+    grouped['fatalities'] = grouped['fatalities'].fillna(0).astype(int)
+    grouped['conflict_binary'] = (grouped['fatalities'] > 0).astype(int)
+    grouped['event_id_cnty'] = grouped.apply(
+        lambda r: f"{int(r['h3_index'])}_{pd.to_datetime(r['event_date']).strftime('%Y%m%d')}",
+        axis=1
+    )
+
+    ordered_cols = [
+        'event_id_cnty',
+        'event_date',
+        'h3_index',
+        'fatalities',
+        'acled_count_battles',
+        'acled_count_vac',
+        'acled_count_explosions',
+        'acled_count_protests',
+        'acled_count_riots',
+        'conflict_binary'
     ]
-    
-    # Only keep columns that actually exist in the DF (safety)
-    final_cols = [c for c in cols if c in df.columns]
-    
-    return df[final_cols].copy()
+    return grouped[ordered_cols].copy()
 
 def run(configs, engine):
     logger.info("=" * 60)
