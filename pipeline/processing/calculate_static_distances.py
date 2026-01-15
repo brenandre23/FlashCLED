@@ -26,7 +26,7 @@ def add_distance_columns(engine):
     """Ensure all distance columns exist."""
     cols = [
         "dist_to_capital FLOAT", "dist_to_border FLOAT", "dist_to_city FLOAT",
-        "dist_to_road FLOAT", "dist_to_river FLOAT",
+        "dist_to_road FLOAT", "dist_to_river FLOAT", "dist_to_market_km FLOAT",
         # Mine Features
         "dist_to_diamond_mine FLOAT", "dist_to_gold_mine FLOAT",
         "dist_to_large_mine FLOAT", "dist_to_controlled_mine FLOAT",
@@ -57,11 +57,42 @@ def calculate_capital_distance(engine):
 
 def calculate_border_distance(engine, configs):
     logger.info("  Calculating Distance to Border...")
-    # Requires an 'admin0' boundary table or similar. 
-    # If using the 'features_static' boundary, we calculate distance to the exterior ring.
-    # Simplified approach: Distance to nearest non-CAR cell is complex.
-    # Better approach: Use the Admin0 shapefile geometry if available.
-    pass  # Placeholder if no specific border geom table exists.
+    try:
+        boundary = get_boundary(configs['data'], configs['features'])
+    except Exception as e:
+        logger.warning(f"    Failed to load boundary for border distance: {e}")
+        return
+
+    if boundary is None or boundary.empty or 'geometry' not in boundary:
+        logger.warning("    Boundary geometry missing; skipping dist_to_border.")
+        return
+
+    # Use union of all admin0 polygons
+    boundary = boundary.to_crs(epsg=4326)
+    geom = boundary.unary_union
+    if geom.is_empty:
+        logger.warning("    Boundary geometry empty; skipping dist_to_border.")
+        return
+
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {SCHEMA}._tmp_border"))
+        conn.execute(text(f"CREATE TABLE {SCHEMA}._tmp_border (geom geometry(Geometry, 4326))"))
+        conn.execute(
+            text(f"INSERT INTO {SCHEMA}._tmp_border (geom) VALUES (ST_GeomFromText(:wkt, 4326))"),
+            {"wkt": geom.wkt}
+        )
+        conn.execute(text(f"""
+            UPDATE {SCHEMA}.{STATIC_TABLE} t
+            SET dist_to_border = (
+                SELECT ST_Distance(
+                    t.geometry::geography, 
+                    ST_Boundary(b.geom)::geography
+                ) / 1000.0
+                FROM {SCHEMA}._tmp_border b
+            )
+            WHERE dist_to_border IS NULL;
+        """))
+        conn.execute(text(f"DROP TABLE IF EXISTS {SCHEMA}._tmp_border"))
 
 
 def calculate_distance_sql(engine, target_col, source_table, filter_sql=None):
@@ -73,16 +104,21 @@ def calculate_distance_sql(engine, target_col, source_table, filter_sql=None):
     insp = inspect(engine)
     cols = {c["name"] for c in insp.get_columns(source_table, schema=SCHEMA)}
 
-    # Prefer geometry on source table; if absent but h3_index exists, join to features_static for geometry
+    source_geom = None
     if "geometry" in cols:
         source_geom = "s.geometry"
+    elif "geom" in cols:
+        source_geom = "s.geom"
+
+    # Prefer geometry on source table; if absent but h3_index exists, join to features_static for geometry
+    if source_geom:
         from_clause = f"{SCHEMA}.{source_table} s"
     elif "h3_index" in cols:
         logger.info(f"    Geometry column missing on {source_table}; joining via h3_index to {STATIC_TABLE}.")
         source_geom = "fs.geometry"
         from_clause = f"{SCHEMA}.{source_table} s JOIN {SCHEMA}.{STATIC_TABLE} fs ON s.h3_index = fs.h3_index"
     else:
-        logger.error(f"    Cannot compute {target_col}: {source_table} lacks geometry and h3_index columns.")
+        logger.error(f"    Cannot compute {target_col}: {source_table} lacks geometry/geom and h3_index columns.")
         return
 
     where_clause = f"WHERE {filter_sql}" if filter_sql else ""
@@ -101,6 +137,34 @@ def calculate_distance_sql(engine, target_col, source_table, filter_sql=None):
         conn.execute(text(sql))
 
 
+def calculate_market_distance(engine):
+    """
+    Compute distance from each H3 cell to nearest market (market_locations table).
+    Assumes market_locations has latitude/longitude columns.
+    """
+    logger.info("  Calculating Distance to Nearest Market...")
+    tmp_table = f"{SCHEMA}._tmp_markets"
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {tmp_table}"))
+        conn.execute(text(f"CREATE TABLE {tmp_table} (geom geometry(Point, 4326))"))
+        conn.execute(text(f"""
+            INSERT INTO {tmp_table} (geom)
+            SELECT ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)
+            FROM {SCHEMA}.market_locations
+            WHERE longitude IS NOT NULL AND latitude IS NOT NULL
+        """))
+        conn.execute(text(f"""
+            UPDATE {SCHEMA}.{STATIC_TABLE} t
+            SET dist_to_market_km = (
+                SELECT ST_Distance(t.geometry::geography, m.geom::geography) / 1000.0
+                FROM {tmp_table} m
+                ORDER BY t.geometry <-> m.geom
+                LIMIT 1
+            );
+        """))
+        conn.execute(text(f"DROP TABLE IF EXISTS {tmp_table}"))
+
+
 def main():
     try:
         logger.info("=" * 60)
@@ -114,10 +178,12 @@ def main():
         
         # 1. Geography
         calculate_capital_distance(engine)
+        calculate_border_distance(engine, configs)
         
         # 2. Infrastructure
         calculate_distance_sql(engine, "dist_to_city", "osm_cities_h3")
         calculate_distance_sql(engine, "dist_to_road", "grip4_roads_h3")
+        calculate_market_distance(engine)
         
         # 3. Mines (OPTIMIZED STRATEGY)
         # A. Geology (What is in the ground?)

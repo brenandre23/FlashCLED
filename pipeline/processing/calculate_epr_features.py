@@ -199,17 +199,6 @@ def map_groups_to_h3(gdf, resolution=5):
 # 3. Aggregation Logic
 # -------------------------------------------------------------
 
-def calculate_shannon_entropy(status_series):
-    """Calculates Shannon Entropy (diversity) of status codes."""
-    if status_series.empty:
-        return 0.0
-    counts = status_series.value_counts()
-    if len(counts) <= 1:
-        return 0.0
-    probs = counts / counts.sum()
-    entropy = -np.sum(probs * np.log(probs))
-    return float(entropy)
-
 def compute_yearly_h3_stats(df_map, df_status):
     """
     Joins Spatial Map with Temporal Status and aggregates by (H3, Year).
@@ -242,16 +231,6 @@ def compute_yearly_h3_stats(df_map, df_status):
         epr_discriminated_groups_count=('is_discriminated', 'sum'),
         epr_status_mean=('status_score', 'mean')
     ).reset_index()
-
-    # Calculate Entropy (slower, apply separately)
-    # We group by [h3, year] and apply entropy to 'status'
-    entropy_df = grouped['status'].apply(calculate_shannon_entropy).reset_index(name='epr_status_entropy')
-    
-    # Merge entropy back
-    stats = stats.merge(entropy_df, on=['h3_index', 'year'])
-    
-    # Alias for interpretability
-    stats['epr_horizontal_inequality'] = stats['epr_status_entropy']
 
     return stats
 
@@ -302,9 +281,7 @@ def run():
             'ethnic_group_count': 0,
             'epr_excluded_groups_count': 0,
             'epr_discriminated_groups_count': 0,
-            'epr_status_mean': -2.0,       # Irrelevant
-            'epr_status_entropy': 0.0,
-            'epr_horizontal_inequality': 0.0
+            'epr_status_mean': -2.0       # Irrelevant
         }
         final_df.fillna(fill_values, inplace=True)
         
@@ -322,8 +299,7 @@ def run():
         cols_to_upload = [
             'h3_index', 'date', 
             'ethnic_group_count', 'epr_excluded_groups_count', 
-            'epr_discriminated_groups_count', 'epr_status_mean', 
-            'epr_status_entropy', 'epr_horizontal_inequality'
+            'epr_discriminated_groups_count', 'epr_status_mean'
         ]
         
         # Create columns if missing (Schema Evolution)

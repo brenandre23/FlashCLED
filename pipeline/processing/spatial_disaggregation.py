@@ -184,14 +184,18 @@ def build_admin_h3_map(engine, data_cfg: Dict, features_cfg: Dict) -> Dict[str, 
         
         if pcode_col:
             for pcode, group in joined.groupby(pcode_col):
-                admin_map[level]["by_pcode"][str(pcode)] = group["h3_index"].tolist()
+                if pd.notna(pcode):
+                    admin_map[level]["by_pcode"][str(pcode)] = group["h3_index"].tolist()
         
         if name_col:
             for name, group in joined.groupby(name_col):
-                normalized = normalize_name(name)
-                admin_map[level]["by_name"][normalized] = group["h3_index"].tolist()
+                if pd.notna(name):
+                    normalized = normalize_name(name)
+                    admin_map[level]["by_name"][normalized] = group["h3_index"].tolist()
         
-        logger.info(f"  Mapped {level}: {len(admin_map[level]['by_pcode'])} pcodes")
+        pcode_count = len(admin_map[level]['by_pcode'])
+        name_count = len(admin_map[level]['by_name'])
+        logger.info(f"  Mapped {level}: {pcode_count} pcodes, {name_count} names")
     
     return admin_map
 
@@ -266,6 +270,10 @@ def enrich_features_static_admins(engine, data_cfg, features_cfg):
     df_upload = h3_gdf[levels].reset_index()
     
     with engine.begin() as conn:
+        # Ensure admin columns exist on features_static before updating
+        for col in ["admin1", "admin2", "admin3"]:
+            conn.execute(text(f"ALTER TABLE {SCHEMA}.{STATIC_TABLE} ADD COLUMN IF NOT EXISTS {col} TEXT"))
+
         conn.execute(text("CREATE TEMP TABLE admin_updates (h3_index BIGINT, admin1 TEXT, admin2 TEXT, admin3 TEXT)"))
         
         # Chunked insert for stability
@@ -328,6 +336,60 @@ def distribute_iom(engine, admin_map: Dict[str, Dict], start_date: str, end_date
         return pd.DataFrame()
     
     logger.info(f"  Loaded {len(iom_df):,} IOM records")
+
+    # --- ADMIN2 REMAP (Post-2020 units -> legacy admin3 equivalents) ---
+    ADMIN2_REMAP = {
+        "CAF423": {"pcode": "CF421", "name": "Kaga-Bandoro"},       # Nana-Outa
+        "CAF334": {"pcode": "CF327", "name": "Kabo"},               # Sido
+        "CAF345": {"pcode": "CF314", "name": "Paoua"},              # Taley
+        "CAF343": {"pcode": "CF215", "name": "Ngaoundaye"},         # Ndim
+        "CAF533": {"pcode": "CF522", "name": "Ouadda"},             # Ouandja
+        "CAF524": {"pcode": "CF52",  "name": "Yalinga"},            # Ouandja-Kotto
+        "CAF635": {"pcode": "CF631", "name": "Obo"},                # Mboki
+        "CAF711": {"pcode": "CF003", "name": "Bamingui-Bangoran"},  # Bangui-Centre
+        "CAF712": {"pcode": "CF003", "name": "Bamingui-Bangoran"},  # Bangui-Kagas
+        "CAF713": {"pcode": "CF003", "name": "Bamingui-Bangoran"},  # Bangui-Fleuve
+        "CAF714": {"pcode": "CF003", "name": "Bamingui-Bangoran"},  # Bangui-Rapide
+    }
+    ADMIN2_REMAP_BY_NAME = {normalize_name(k.split("#")[0] if "#" in k else k): v for k, v in {
+        "Nana-Outa": {"pcode": "CF421", "name": "Kaga-Bandoro"},
+        "Sido": {"pcode": "CF327", "name": "Kabo"},
+        "Taley": {"pcode": "CF314", "name": "Paoua"},
+        "Ndim": {"pcode": "CF215", "name": "Ngaoundaye"},
+        "Ouandja": {"pcode": "CF522", "name": "Ouadda"},
+        "Ouandja-Kotto": {"pcode": "CF52", "name": "Yalinga"},
+        "Mboki": {"pcode": "CF631", "name": "Obo"},
+        "Bangui-Centre": {"pcode": "CF003", "name": "Bamingui-Bangoran"},
+        "Bangui-Kagas": {"pcode": "CF003", "name": "Bamingui-Bangoran"},
+        "Bangui-Fleuve": {"pcode": "CF003", "name": "Bamingui-Bangoran"},
+        "Bangui-Rapide": {"pcode": "CF003", "name": "Bamingui-Bangoran"},
+    }.items()}
+
+    iom_df["admin2_pcode_orig"] = iom_df["admin2_pcode"]
+    iom_df["admin2_name_orig"] = iom_df["admin2_name"]
+    remap_counts = {}
+
+    def _remap_admin2(row):
+        pcode = str(row["admin2_pcode"]) if pd.notna(row["admin2_pcode"]) else None
+        name_norm = normalize_name(row["admin2_name"]) if pd.notna(row["admin2_name"]) else ""
+        if pcode in ADMIN2_REMAP:
+            mapped = ADMIN2_REMAP[pcode]
+            row["admin2_pcode"] = mapped["pcode"]
+            row["admin2_name"] = mapped["name"]
+            remap_counts[pcode] = remap_counts.get(pcode, 0) + 1
+        elif name_norm in ADMIN2_REMAP_BY_NAME:
+            mapped = ADMIN2_REMAP_BY_NAME[name_norm]
+            row["admin2_pcode"] = mapped["pcode"]
+            row["admin2_name"] = mapped["name"]
+            remap_counts[name_norm] = remap_counts.get(name_norm, 0) + 1
+        return row
+
+    iom_df = iom_df.apply(_remap_admin2, axis=1)
+    if remap_counts:
+        total_remaps = sum(remap_counts.values())
+        logger.info(f"IOM admin2 remaps applied: {total_remaps} rows")
+        for k, v in remap_counts.items():
+            logger.info(f"  remapped key {k} -> {v} rows")
     
     # Load population weights for distribution
     pop_df = pd.read_sql(
@@ -347,9 +409,22 @@ def distribute_iom(engine, admin_map: Dict[str, Dict], start_date: str, end_date
         return []
     
     disagg_records = []
+
+    # Diagnostics counters
+    total_rows = 0
+    mapped_admin3 = 0
+    fallback_admin2 = 0
+    fallback_admin1 = 0  # reserved for future coarser fallback
     unmapped_count = 0
+
+    # Top failing units tracking
+    admin3_failures = {}      # key: (admin2_pcode, admin2_name) -> count
+    fallback_admin2_units = {}  # key: (admin1_pcode, admin1_name) -> count
+    fallback_admin1_units = {}  # not used currently
+    unmapped_units = {}         # key: (admin1_name, admin2_name) -> count
     
     for _, row in iom_df.iterrows():
+        total_rows += 1
         date = row["date"]
         count = row["count"]
         
@@ -362,13 +437,24 @@ def distribute_iom(engine, admin_map: Dict[str, Dict], start_date: str, end_date
         # Try Admin 2 (Sub-Prefecture) first
         if pd.notna(row["admin2_pcode"]) or pd.notna(row["admin2_name"]):
             h3_list = _get_h3_list("admin3", row["admin2_pcode"], row["admin2_name"])
-            
+            if h3_list:
+                mapped_admin3 += 1
+            else:
+                key = (row.get("admin2_pcode"), row.get("admin2_name"))
+                admin3_failures[key] = admin3_failures.get(key, 0) + 1
+        
         # Fallback to Admin 1 (Prefecture)
         if not h3_list and (pd.notna(row["admin1_pcode"]) or pd.notna(row["admin1_name"])):
             h3_list = _get_h3_list("admin2", row["admin1_pcode"], row["admin1_name"])
-            
+            if h3_list:
+                fallback_admin2 += 1
+                key = (row.get("admin1_pcode"), row.get("admin1_name"))
+                fallback_admin2_units[key] = fallback_admin2_units.get(key, 0) + 1
+        
         if not h3_list:
             unmapped_count += 1
+            key = (row.get("admin1_name", ''), row.get("admin2_name", ''))
+            unmapped_units[key] = unmapped_units.get(key, 0) + 1
             continue
             
         # Population weighting
@@ -392,8 +478,31 @@ def distribute_iom(engine, admin_map: Dict[str, Dict], start_date: str, end_date
                     "iom_displacement_sum": count * weight
                 })
 
-    if unmapped_count > 0:
-        logger.warning(f"  Could not map {unmapped_count:,} IOM records to H3.")
+    # --- Summary diagnostics ---
+    if total_rows > 0:
+        pct = lambda x: (x / total_rows) * 100
+        logger.info("IOM disaggregation summary:")
+        logger.info(f"  Total rows processed: {total_rows:,}")
+        logger.info(f"  MAPPED_ADMIN3: {mapped_admin3:,} ({pct(mapped_admin3):.2f}%)")
+        logger.info(f"  FALLBACK_ADMIN2: {fallback_admin2:,} ({pct(fallback_admin2):.2f}%)")
+        logger.info(f"  FALLBACK_ADMIN1: {fallback_admin1:,} ({pct(fallback_admin1):.2f}%)")
+        logger.info(f"  UNMAPPED: {unmapped_count:,} ({pct(unmapped_count):.2f}%)")
+
+        def _log_top(title: str, d: Dict, n: int = 20):
+            if not d:
+                logger.info(f"  {title}: none")
+                return
+            top = sorted(d.items(), key=lambda x: x[1], reverse=True)[:n]
+            logger.info(f"  {title} (top {len(top)}):")
+            for key, val in top:
+                logger.info(f"    {key} -> {val}")
+
+        _log_top("Failed admin3 lookup (triggered fallback)", admin3_failures)
+        _log_top("Resolved at admin2 fallback", fallback_admin2_units)
+        _log_top("Resolved at admin1 fallback", fallback_admin1_units)
+        if unmapped_count > 0:
+            logger.warning("Unmapped units after all fallbacks:")
+            _log_top("UNMAPPED", unmapped_units)
 
     if not disagg_records:
         return pd.DataFrame()
