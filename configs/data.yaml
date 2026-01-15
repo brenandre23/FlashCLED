@@ -14,6 +14,10 @@ split:
   validation_years: [2021, 2022, 2024, 2025]
   train_cutoff: "2020-12-31"
 
+# --- VALIDATION ---
+validation:
+  run_assertions: true
+
 # --- SPATIAL BOUNDING BOX ---
 car_bbox: [14.0, 2.0, 28.0, 11.5]
 
@@ -54,7 +58,6 @@ iom_dtm:
   base_url: "https://dtmapi.iom.int/v3"
   local_file: "data/raw/iom_manual.csv"
 
-
 fews_net:
   iso2: "CF"
   iso3: "CAF"
@@ -76,7 +79,6 @@ admin_boundaries:
   admin2_path: "data/raw/wbgCAFadmin2.geojson" #labeled as admin2 in source from World Bank
   admin3_path: "data/raw/wbgCAFadmin3.geojson" #labeled as admin2 in source from OCHA
   url: "https://datacatalog.worldbank.org/search/dataset/0038272/World-Bank-Official-Boundaries"
-
 
 population:
   base_url_v2: "https://data.worldpop.org/GIS/Population/Global_2015_2030/R2025A"
@@ -104,4 +106,9 @@ ipis_mines:
 
 commodities:
   oil_series_id: "PET.RBRTE.D"
-  ioda_entity_code: "CF"
+
+ioda:
+  source_url: "https://api.ioda.inetintel.cc.gatech.edu/v2"
+  variable: "ioda_connectivity_index"
+  entity_code: "CF"
+  description: "Hybrid Internet Connectivity Index. National active probing baseline (2014+) overlaid with regional precision (2022+)."

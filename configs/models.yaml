@@ -1,120 +1,168 @@
-# ==============================================================================
-# MODEL CONFIGURATION
-# Methodology (Objectives, Metrics) is hardcoded in Python.
-# This file controls Hyperparameters and Feature Selection.
-# ==============================================================================
+# configs/models.yaml
+# =================================================================
+# MODELING CONFIGURATION
+# =================================================================
 
-# 1. FORECAST HORIZONS
 horizons:
-  - name: "14d"
-    steps: 1
-  - name: "1m"
-    steps: 2
-  - name: "3m"
-    steps: 6
+- name: 14d
+  steps: 1
+- name: 1m
+  steps: 2
+- name: 3m
+  steps: 6
 
-# 2. GLOBAL THESIS PARAMETERS
-# Used by the TwoStageEnsemble logic to weight rare events (~2% positive class)
-# Note: The script calculates this dynamically, but this acts as a fallback.
+# Isotonic calibration for probability reliability
+calibration:
+  method: isotonic    # "isotonic" | "none"
+  fraction: 0.2       # Fraction of training data held out for calibration
+
+# Bin-Conditional Conformal Prediction for uncertainty intervals
+# Reference: Randahl, Williams & Hegre (2026), Political Analysis
+conformal_prediction:
+  enabled: true
+  alpha: 0.1          # Significance level (0.1 = 90% coverage target)
+  contiguous: true    # Merge discontiguous intervals (slightly over-covers but cleaner)
+  log_scale: true     # Work on log1p(fatalities) scale
+  # Bins following ViEWS/paper convention (exponentially increasing)
+  bins: [0, 1, 3, 8, 21, 55, 149, .inf]
+
 hurdle_params:
   classifier_scale_pos_weight: 35.0
 
-# 3. LEARNERS (Hyperparameters Only)
-# NOTE: Do NOT add 'objective' or 'eval_metric' here. They are handled in train_models.py.
+# =================================================================
+# LEARNERS (Optimized for Speed & Deadlock Prevention)
+# =================================================================
 learners:
   xgboost:
-    type: "xgboost"
+    type: xgboost
     params:
-      n_estimators: 1000
+      # --- CRITICAL FIXES ---
+      tree_method: "hist"   # SPEED: 2x-5x faster than 'auto'
+      n_jobs: 1             # SAFETY: Prevents deadlock in parallel pipeline
+      # ----------------------
+      
+      n_estimators: 150
       learning_rate: 0.05
-      max_depth: 6
-      subsample: 0.8
-      colsample_bytree: 0.8
+      max_depth: 5
+      subsample: 0.7
+      colsample_bytree: 0.7
       gamma: 1.0
       reg_alpha: 0.1
       reg_lambda: 1.0
 
   lightgbm:
-    type: "lightgbm"
+    type: lightgbm
     params:
-      n_estimators: 1000
+      # --- CRITICAL FIX ---
+      num_threads: 1        # SAFETY: Prevents deadlock (equivalent to n_jobs)
+      # --------------------
+      
+      n_estimators: 150
       learning_rate: 0.05
       num_leaves: 31
       max_depth: -1
-      subsample: 0.8
-      colsample_bytree: 0.8
+      subsample: 0.7
+      colsample_bytree: 0.7
       reg_alpha: 0.1
       reg_lambda: 1.0
       verbose: -1
 
-# 4. SUBMODEL THEMES
-# ==============================================================================
-# CRITICAL: Feature names MUST match actual DB column names in either:
-#   - car_cewp.temporal_features (dynamic/time-varying features)
-#   - car_cewp.features_static (static/geographic features)
-# ==============================================================================
+# =================================================================
+# SUB-MODELS (Synced with your provided list)
+# =================================================================
 submodels:
   conflict_history:
     enabled: true
     features:
-      - "fatalities_1m_lag"
-      - "events_3m_lag"
-      # - "days_since_last_event"  # Not currently generated
-      - "conflict_density_10km"
-      - "regional_risk_score_lag1"
+    - fatalities_1m_lag
+    - fatalities_14d_sum       # Added: Immediate intensity signal
+    - protest_count_lag1       # Added: Civil unrest signal
+    - riot_count_lag1          # Added: Violent demonstration signal
+    - gdelt_avg_tone_decay_30d
+    - gdelt_decay_30d          # Added: Short-term media volume
+    - gdelt_goldstein_mean     # Added: Event stability score
+    - gdelt_mentions_total     # Added: Event salience/importance
+    - ioda_outage_detected     # Added: Internet outage signal
+    - conflict_density_10km
+    - regional_risk_score_lag1
 
   economics:
     enabled: true
     features:
-      - "price_maize"
-      - "price_maize_shock"
-      - "price_rice"
-      - "price_rice_shock"
-      - "price_oil"
-      - "price_oil_shock"
-      - "gold_price_usd_lag1"
-      - "dist_to_city"
+    - price_maize
+    - price_maize_shock
+    - price_rice
+    - price_rice_shock
+    - price_oil                # Local cooking oil
+    - price_oil_shock          # Added: Composite food security signal
+    - gold_price_usd_lag1
+    - oil_price_usd_lag1       # Added: Global crude oil price      
+    - eur_usd_rate_lag1        # Added: Purchasing power parity
+    - dist_to_city             # Market access proxy
+    - food_data_available      # Added: Structural flag for zero-filled food prices
+    - econ_data_available      # Added: Structural flag for zero-filled macro indicators
 
   environmental:
     enabled: true
     features:
-      - "chirps_precip_anomaly"
-      - "era5_temp_anomaly"
-      - "era5_soil_moisture_anomaly"
-      - "ndvi_anomaly"
-      - "nightlights_intensity"
-      - "water_coverage_lag1"
+    - chirps_precip_anomaly
+    - era5_temp_anomaly
+    - era5_soil_moisture_anomaly
+    - ndvi_anomaly
+    - nightlights_intensity
+    - water_local_max
+    - water_local_mean
+    - dist_to_market_km        # Access/Infrastructure overlap
 
   epr:
     enabled: true
     features:
-      - "epr_excluded_groups_count"
-      - "epr_horizontal_inequality"
-      - "epr_status_mean"
+    - epr_excluded_groups_count
+    - epr_discriminated_groups_count # Added: Active discrimination
+    - ethnic_group_count             # Added: Diversity proxy
+    - iom_displacement_count_lag1    # Added: Displacement dynamics
+    - iom_data_available             # Added: Structural flag for zero-filled survey gaps
+
+  demographic:
+    enabled: true
+    features:
+    - pop_log
+    - is_worldpop_v1           # Structural break flag
 
   terrain:
     enabled: true
     features:
-      - "elevation_mean"
-      - "slope_mean"
-      - "terrain_ruggedness_index"
-      - "dist_to_road"
-      - "dist_to_city"
-      - "dist_to_river"
-      - "dist_to_diamond_mine"
-      - "dist_to_gold_mine"
-      - "dist_to_large_mine"
-      - "dist_to_controlled_mine"
-      - "dist_to_large_gold_mine"
+    - elevation_mean
+    - slope_mean
+    - terrain_ruggedness_index
+    - dist_to_road
+    - dist_to_city
+    - dist_to_capital          # Added: Core-periphery dynamics
+    - dist_to_border           # Added: Transnational spillover risk
+    - dist_to_river
+    - dist_to_diamond_mine
+    - dist_to_gold_mine
 
   temporal_context:
     enabled: true
     features:
-      - "month_sin"
-      - "month_cos"
-      - "is_dry_season"
+    - month_sin
+    - month_cos
+    - is_dry_season
+news_ops:
+  enabled: true
+  features:
+  - ioda_connectivity_index_lag1
 
-  # REQUIRED: The script looks for this specific key for dimensionality reduction
   broad_pca:
     enabled: true
-    variance_retention: 0.90
+    variance_retention: 0.9
+
+  acled_hybrid:
+    enabled: true
+    features:
+    - driver_resource_cattle
+    - driver_resource_mining
+    - driver_econ_taxation
+    - driver_political_coup
+    - driver_civilian_abuse

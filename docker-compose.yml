@@ -1,0 +1,34 @@
+services:
+  web:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    environment:
+      # Windows Postgres reachable from Docker via WSL gateway IP (verified TCP OK)
+      DB_HOST: ${DB_HOST:-172.31.48.1}
+      DB_PORT: 5433
+      DB_NAME: ${DB_NAME:-thesis_db}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASS: ${DB_PASS:-bluebeans}
+      DB_SCHEMA: ${DB_SCHEMA:-car_cewp}
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  # Optional: keep this if you still want a Docker PostGIS instance available.
+  # IMPORTANT: it's mapped to 5434 so it doesn't conflict with your host Postgres on 5433.
+  db:
+    image: postgis/postgis:15-3.3
+    environment:
+      POSTGRES_DB: ${DB_NAME:-thesis_db}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASS:-bluebeans}
+    command: ["-c", "shared_buffers=512MB", "-c", "work_mem=16MB"]
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:

@@ -1,327 +1,347 @@
-# config/features.yaml (Cleaned & Grouped)
-# =================================================================
-# FEATURE ENGINEERING CONFIGURATION
-# Backbone for pipeline/processing/feature_engineering.py
-# =================================================================
-
-# --- SPATIAL DEFINITIONS ---
 spatial:
   crs:
-    metric: "EPSG:32634"  # UTM Zone 34N
-    geodetic: "EPSG:4326" # WGS84
+    metric: EPSG:32634
+    geodetic: EPSG:4326
   h3_resolution: 5
   buffer_km: 8.5
   admin_columns:
-    admin1: "NAM_1"
-    admin2: "NAM_2"
-    admin3: "adm2_ref_name"
-
-# --- TEMPORAL DEFINITIONS (The 14-Day Spine) ---
+    admin1: NAM_1
+    admin2: NAM_2
+    admin3: adm2_ref_name
 temporal:
-  base_unit: "step"
-  step_days: 14           # 1 Step = 14 Days
-  alignment_date: "2000-01-01"
+  base_unit: step
+  step_days: 14
+  alignment_date: '2000-01-01'
   decays:
-    half_life_30d: { steps: 2.14 }
-    half_life_90d: { steps: 6.43 }
-
-# --- IMPUTATION STRATEGY ---
+    half_life_30d:
+      steps: 2.14
+    half_life_90d:
+      steps: 6.43
 imputation:
   defaults:
     method: "forward_fill"
-    limit: 4
-
-# --- FEATURE REGISTRY ---
+    limit: 4  # Global fallback (approx 2 months)
+  domains:
+    environmental:
+      limit: 2  # Short: Weather/NDVI change rapidly (approx 1 month)
+    economic:
+      limit: 4  # Medium: Market prices (approx 2 months)
+    conflict:
+      limit: 3  # Medium-Short: News/Sentiment decays faster (approx 1.5 months)
+    social:
+      limit: 12 # Long: Displacement (IOM) is structural; updated quarterly (approx 6 months)
 registry:
-
-  # =========================================================
-  # 1. ENVIRONMENTAL FEATURES (Phase 3)
-  # Sources: CHIRPS, ERA5, MODIS, VIIRS, JRC
-  # =========================================================
-  - raw: "precip_mean_depth_mm"
-    source: "CHIRPS"
-    transformation: "anomaly"
-    output_col: "chirps_precip_anomaly"
-
-  - raw: "temp_mean"
-    source: "ERA5"
-    transformation: "anomaly"
-    output_col: "era5_temp_anomaly"
-
-  - raw: "soil_moisture_mean"
-    source: "ERA5"
-    transformation: "anomaly"
-    output_col: "era5_soil_moisture_anomaly"
-
-  - raw: "ndvi_max"
-    source: "MODIS"
-    transformation: "anomaly"
-    output_col: "ndvi_anomaly"
-
-  - raw: "ntl_mean"
-    source: "VIIRS"
-    transformation: "mean"
-    output_col: "nightlights_intensity"
-
-  - raw: "water_local_max"
-    source: "JRC_Landsat"
-    transformation: "lag_1_step"
-    output_col: "water_presence_lag1"
-
-  - raw: "water_local_mean"
-    source: "JRC_Landsat"
-    transformation: "lag_1_step"
-    output_col: "water_coverage_lag1"
-
-
-  # =========================================================
-  # 2. CONFLICT FEATURES (Phase 4)
-  # Sources: ACLED, GDELT
-  # =========================================================
-  # ACLED Fatalities
-  - raw: "fatalities"
-    source: "ACLED"
-    transformation: "lag"
-    output_col: "fatalities_1m_lag"
-
-  - raw: "fatalities"
-    source: "ACLED"
-    transformation: "decay_30d"
-    output_col: "conflict_density_10km"
-
-  - raw: "fatalities"
-    source: "ACLED"
-    transformation: "sum"
-    output_col: "fatalities_14d_sum"
-
-  # ACLED Civil Unrest
-  - raw: "protest_count"
-    source: "ACLED"
-    transformation: "lag_1_step"
-    output_col: "protest_count_lag1"
-
-  - raw: "riot_count"
-    source: "ACLED"
-    transformation: "lag_1_step"
-    output_col: "riot_count_lag1"
-
-  # GDELT
-  - raw: "gdelt_event_count"
-    source: "GDELT"
-    transformation: "decay_90d"
-    output_col: "events_3m_lag"
-
-  - raw: "gdelt_event_count"
-    source: "GDELT"
-    transformation: "decay_30d"
-    output_col: "gdelt_decay_30d"
-
-  # --- Stream B Regional Context ---
-  #  "Ambient Risk" of the PREVIOUS period using least precise acled events agg to admin2 (geo_precision lvl 3) 
-  - source: ACLED
-    raw: regional_risk_score
-    transformation: lag_1_step
-    output_col: regional_risk_score_lag1
-
-  # =========================================================
-  # 3. MACRO-ECONOMIC FEATURES (Phase 2)
-  # Sources: YahooFinance/Economy
-  # =========================================================
-  - raw: "gold_price_usd"
-    source: "Economy"
-    transformation: "lag_1_step"
-    output_col: "gold_price_usd_lag1"
-
-  - raw: "oil_price_usd"
-    source: "Economy"
-    transformation: "lag_1_step"
-    output_col: "oil_price_usd_lag1"
-
-  - raw: "sp500_index"
-    source: "Economy"
-    transformation: "lag_1_step"
-    output_col: "sp500_index_lag1"
-
-  - raw: "eur_usd_rate"
-    source: "Economy"
-    transformation: "lag_1_step"
-    output_col: "eur_usd_rate_lag1"
-
-
-  # =========================================================
-  # 4. FOOD SECURITY (Phase 2B)
-  # Sources: FEWS NET (Food_Security)
-  # =========================================================
-  # Raw Prices
-  - raw: "price_maize"
-    source: "Food_Security"
-    transformation: "none"
-    output_col: "price_maize"
-
-  - raw: "price_rice"
-    source: "Food_Security"
-    transformation: "none"
-    output_col: "price_rice"
-
-  - raw: "price_oil"
-    source: "Food_Security"
-    transformation: "none"
-    output_col: "price_oil"
-
-  - raw: "price_sorghum"
-    source: "Food_Security"
-    transformation: "none"
-    output_col: "price_sorghum"
-
-  # Price Shocks
-  - raw: "price_maize"
-    source: "Food_Security"
-    transformation: "shock_12m"
-    transformation_params:
-      lookback_months: 12
-    output_col: "price_maize_shock"
-
-  - raw: "price_rice"
-    source: "Food_Security"
-    transformation: "shock_12m"
-    transformation_params:
-      lookback_months: 12
-    output_col: "price_rice_shock"
-
-  - raw: "price_oil"
-    source: "Food_Security"
-    transformation: "shock_12m"
-    transformation_params:
-      lookback_months: 12
-    output_col: "price_oil_shock"
-
-  - raw: "price_sorghum"
-    source: "Food_Security"
-    transformation: "shock_12m"
-    transformation_params:
-      lookback_months: 12
-    output_col: "price_sorghum_shock"
-
-
-  # =========================================================
-  # 5. SOCIAL & DEMOGRAPHIC (Phase 2B/2C)
-  # Sources: IOM, EPR, WorldPop
-  # =========================================================
-  # IOM Displacement
-  - raw: "iom_displacement_sum"
-    source: "IOM_DTM"
-    transformation: "lag_1_step"
-    output_col: "iom_displacement_count_lag1"
-
-  - raw: "iom_data_available"
-    source: "IOM_DTM"
-    transformation: "none"
-    output_col: "iom_data_available"
-    description: "Structural break flag: 1 if IOM data exists for this period, 0 if imputed."
-
-  # EPR (Ethnic Power Relations)
-  - raw: "epr_excluded_groups_count"
-    source: "EPR"
-    transformation: "none"
-    output_col: "epr_excluded_groups_count"
-
-  - raw: "epr_discriminated_groups_count"
-    source: "EPR"
-    transformation: "none"
-    output_col: "epr_discriminated_groups_count"
-
-  - raw: "epr_status_mean"
-    source: "EPR"
-    transformation: "none"
-    output_col: "epr_status_mean"
-
-  - raw: "ethnic_group_count"
-    source: "EPR"
-    transformation: "none"
-    output_col: "ethnic_group_count"
-
-  # Demographics
-  - raw: "pop_count"
-    source: "WorldPop"
-    transformation: "log1p"
-    output_col: "pop_log"
-
-
-  # =========================================================
-  # 6. STATIC GEOGRAPHY
-  # Computed by calculate_static_distances.py -> features_static
-  # =========================================================
-  # Distances
-  - raw: "dist_to_capital"
-    source: "Static_Geography"
-    transformation: "none"
-    output_col: "dist_to_capital"
-
-  - raw: "dist_to_border"
-    source: "Static_Geography"
-    transformation: "none"
-    output_col: "dist_to_border"
-
-  - raw: "dist_to_road"
-    source: "GRIP4"
-    transformation: "none"
-    output_col: "dist_to_road"
-
-  - raw: "dist_to_city"
-    source: "OSM_Settlements"
-    transformation: "none"
-    output_col: "dist_to_city"
-
-  - raw: "dist_to_diamond_mine"
-    source: "IPIS_Mines"
-    transformation: "none"
-    output_col: "dist_to_diamond_mine"
-
-  - raw: "dist_to_large_mine"
-    source: "IPIS_Mines"
-    transformation: "none"
-    output_col: "dist_to_large_mine"
-
-  - raw: "dist_to_controlled_mine"
-    source: "IPIS_Mines"
-    transformation: "none"
-    output_col: "dist_to_controlled_mine"
-
-  - raw: "dist_to_large_gold_mine"
-    source: "IPIS_Mines"
-    transformation: "none"
-    output_col: "dist_to_large_gold_mine"
-
-  # Terrain
-  - raw: "terrain_ruggedness_index"
-    source: "Copernicus_DEM"
-    transformation: "none"
-    output_col: "terrain_ruggedness_index"
-
-  - raw: "elevation_mean"
-    source: "Copernicus_DEM"
-    transformation: "none"
-    output_col: "elevation_mean"
-
-  - raw: "slope_mean"
-    source: "Copernicus_DEM"
-    transformation: "none"
-    output_col: "slope_mean"
-
-
-  # =========================================================
-  # 7. NLP SIGNALS
-  # =========================================================
-  - raw: "topic_intensity"
-    source: "NLP_ACLED"
-    transformation: "pivot"
-    transformation_params:
-      pivot_column: "acled_topic_id"
-      topics: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # Top 10 topics
-      value_column: "topic_intensity"
-    output_col: "acled_topic_intensity"
-
-  - raw: "nlp_risk_score"
-    source: "NLP_CrisisWatch"
-    transformation: "max"
-    output_col: "crisiswatch_nlp_risk_max"
+- raw: precip_mean_depth_mm
+  source: CHIRPS
+  transformation: anomaly
+  output_col: chirps_precip_anomaly
+- raw: temp_mean
+  source: ERA5
+  transformation: anomaly
+  output_col: era5_temp_anomaly
+- raw: soil_moisture_mean
+  source: ERA5
+  transformation: anomaly
+  output_col: era5_soil_moisture_anomaly
+- raw: ndvi_max
+  source: MODIS
+  transformation: anomaly
+  output_col: ndvi_anomaly
+- raw: ntl_mean
+  source: VIIRS
+  transformation: mean
+  output_col: nightlights_intensity
+- raw: month_sin
+  source: Temporal
+  transformation: none
+  output_col: month_sin
+- raw: month_cos
+  source: Temporal
+  transformation: none
+  output_col: month_cos
+- raw: is_dry_season
+  source: Temporal
+  transformation: none
+  output_col: is_dry_season
+- raw: fatalities
+  source: ACLED
+  transformation: none
+  output_col: fatalities_14d_sum
+- raw: acled_count_battles
+  source: ACLED
+  transformation: none
+  output_col: acled_count_battles
+- raw: acled_count_vac
+  source: ACLED
+  transformation: none
+  output_col: acled_count_vac
+- raw: acled_count_explosions
+  source: ACLED
+  transformation: none
+  output_col: acled_count_explosions
+- raw: acled_count_protests
+  source: ACLED
+  transformation: none
+  output_col: acled_count_protests
+- raw: acled_count_riots
+  source: ACLED
+  transformation: none
+  output_col: acled_count_riots
+- raw: protest_count
+  source: ACLED
+  transformation: lag_1_step
+  output_col: protest_count_lag1
+- raw: riot_count
+  source: ACLED
+  transformation: lag_1_step
+  output_col: riot_count_lag1
+- raw: gdelt_event_count
+  source: GDELT
+  transformation: decay_90d
+  output_col: events_3m_lag
+- raw: gdelt_event_count
+  source: GDELT
+  transformation: decay_30d
+  output_col: gdelt_decay_30d
+- raw: gdelt_avg_tone
+  source: GDELT
+  transformation: decay_30d
+  output_col: gdelt_avg_tone_decay_30d
+- raw: gdelt_data_available
+  source: GDELT
+  transformation: none
+  output_col: gdelt_data_available_flag
+- raw: ioda_data_available
+  source: IODA
+  transformation: none
+  output_col: ioda_data_available_flag
+- raw: cw_score_local
+  source: CrisisWatch
+  transformation: none
+  output_col: cw_score_local
+- source: ACLED
+  raw: regional_risk_score
+  transformation: lag_1_step
+  output_col: regional_risk_score_lag1
+- raw: gold_price_usd
+  source: Economy
+  transformation: lag_1_step
+  output_col: gold_price_usd_lag1
+- raw: oil_price_usd
+  source: Economy
+  transformation: lag_1_step
+  output_col: oil_price_usd_lag1
+- raw: sp500_index
+  source: Economy
+  transformation: lag_1_step
+  output_col: sp500_index_lag1
+- raw: eur_usd_rate
+  source: Economy
+  transformation: lag_1_step
+  output_col: eur_usd_rate_lag1
+- raw: econ_data_available
+  source: Economy
+  transformation: none
+  output_col: econ_data_available
+- raw: price_maize
+  source: Food_Security
+  transformation: none
+  output_col: price_maize
+- raw: price_rice
+  source: Food_Security
+  transformation: none
+  output_col: price_rice
+- raw: price_oil
+  source: Food_Security
+  transformation: none
+  output_col: price_oil
+- raw: price_sorghum
+  source: Food_Security
+  transformation: none
+  output_col: price_sorghum
+- raw: price_cassava
+  source: Food_Security
+  transformation: none
+  output_col: price_cassava
+- raw: price_groundnuts
+  source: Food_Security
+  transformation: none
+  output_col: price_groundnuts
+- raw: price_maize
+  source: Food_Security
+  transformation: shock_12m
+  transformation_params:
+    lookback_months: 12
+  output_col: price_maize_shock
+- raw: price_rice
+  source: Food_Security
+  transformation: shock_12m
+  transformation_params:
+    lookback_months: 12
+  output_col: price_rice_shock
+- raw: price_oil
+  source: Food_Security
+  transformation: shock_12m
+  transformation_params:
+    lookback_months: 12
+  output_col: price_oil_shock
+- raw: price_sorghum
+  source: Food_Security
+  transformation: shock_12m
+  transformation_params:
+    lookback_months: 12
+  output_col: price_sorghum_shock
+- raw: price_cassava
+  source: Food_Security
+  transformation: shock_12m
+  transformation_params:
+    lookback_months: 12
+  output_col: price_cassava_shock
+- raw: price_groundnuts
+  source: Food_Security
+  transformation: shock_12m
+  transformation_params:
+    lookback_months: 12
+  output_col: price_groundnuts_shock
+- raw: food_price_index
+  source: Food_Security
+  transformation: none
+  output_col: food_price_index
+- raw: food_data_available
+  source: Food_Security
+  transformation: none
+  output_col: food_data_available
+- raw: iom_displacement_sum
+  source: IOM_DTM
+  transformation: lag_1_step
+  output_col: iom_displacement_count_lag1
+- raw: iom_data_available
+  source: IOM_DTM
+  transformation: none
+  output_col: iom_data_available
+  description: "Structural break flag: 1 if IOM data exists for this period, 0 if imputed."
+- raw: epr_excluded_groups_count
+  source: EPR
+  transformation: none
+  output_col: epr_excluded_groups_count
+- raw: epr_discriminated_groups_count
+  source: EPR
+  transformation: none
+  output_col: epr_discriminated_groups_count
+- raw: epr_status_mean
+  source: EPR
+  transformation: none
+  output_col: epr_status_mean
+- raw: ethnic_group_count
+  source: EPR
+  transformation: none
+  output_col: ethnic_group_count
+- raw: pop_count
+  source: WorldPop
+  transformation: log1p
+  output_col: pop_log
+- raw: is_worldpop_v1
+  source: WorldPop
+  transformation: none
+  output_col: is_worldpop_v1
+  description: 'Structural break flag: 1 for pre-2015 WorldPop (V1), 0 otherwise.'
+- raw: dist_to_capital
+  source: Static_Geography
+  transformation: none
+  output_col: dist_to_capital
+- raw: dist_to_border
+  source: Static_Geography
+  transformation: none
+  output_col: dist_to_border
+- raw: dist_to_road
+  source: GRIP4
+  transformation: none
+  output_col: dist_to_road
+- raw: dist_to_city
+  source: OSM_Settlements
+  transformation: none
+  output_col: dist_to_city
+- raw: dist_to_diamond_mine
+  source: IPIS_Mines
+  transformation: none
+  output_col: dist_to_diamond_mine
+- raw: dist_to_large_mine
+  source: IPIS_Mines
+  transformation: none
+  output_col: dist_to_large_mine
+- raw: dist_to_controlled_mine
+  source: IPIS_Mines
+  transformation: none
+  output_col: dist_to_controlled_mine
+- raw: dist_to_large_gold_mine
+  source: IPIS_Mines
+  transformation: none
+  output_col: dist_to_large_gold_mine
+- raw: dist_to_gold_mine
+  source: IPIS_Mines
+  transformation: none
+  output_col: dist_to_gold_mine
+- raw: dist_to_market_km
+  source: Static_Geography
+  transformation: none
+  output_col: dist_to_market_km
+- raw: dist_to_river
+  source: HydroRIVERS
+  transformation: none
+  output_col: dist_to_river
+- raw: terrain_ruggedness_index
+  source: Copernicus_DEM
+  transformation: none
+  output_col: terrain_ruggedness_index
+- raw: elevation_mean
+  source: Copernicus_DEM
+  transformation: none
+  output_col: elevation_mean
+- raw: slope_mean
+  source: Copernicus_DEM
+  transformation: none
+  output_col: slope_mean
+- raw: driver_resource_cattle
+  source: ACLED_Hybrid
+  transformation: none
+  output_col: driver_resource_cattle
+- raw: driver_resource_mining
+  source: ACLED_Hybrid
+  transformation: none
+  output_col: driver_resource_mining
+- raw: driver_econ_taxation
+  source: ACLED_Hybrid
+  transformation: none
+  output_col: driver_econ_taxation
+- raw: driver_civilian_abuse
+  source: ACLED_Hybrid
+  transformation: none
+  output_col: driver_civilian_abuse
+- raw: driver_political_coup
+  source: ACLED_Hybrid
+  transformation: none
+  output_col: driver_political_coup
+- raw: gdelt_goldstein_mean
+  source: GDELT
+  transformation: none
+  output_col: gdelt_goldstein_mean
+- raw: gdelt_mentions_total
+  source: GDELT
+  transformation: none
+  output_col: gdelt_mentions_total
+- raw: ioda_connectivity_index
+  source: IODA
+  transformation: lag1
+  output_col: ioda_connectivity_index_lag1
+- raw: ioda_outage_detected
+  source: IODA
+  transformation: none
+  output_col: ioda_outage_detected
+- raw: water_local_max
+  source: JRC_Landsat
+  transformation: none
+  output_col: water_local_max
+- raw: water_local_mean
+  source: JRC_Landsat
+  transformation: none
+  output_col: water_local_mean

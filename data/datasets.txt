@@ -11,7 +11,6 @@ VIIRS Nightlights (NASA VNP46A2),2012-01-19–present,Daily (nightly composites)
 WFP VAM Market Prices,2000s–present (monthly data),Monthly,Medium
 FEWS NET Food Data Warehouse (prices),1995–present (monthly),Monthly,Medium
 FAOSTAT CPI (All items),2000–present,Quarterly releases (monthly indices),High
-IPC (Acute Food Insecurity, FEWS/IP),2016–present,Irregular (periodic IPC analyses and reports),Low
 EPR (Ethnic Power Relations),1946–2021,Static (annual data up to 2021),High
 IOM DTM (Displacement Tracking),2000s–present,Continuous (typically monthly or periodic updates),Medium
 GDELT Event Database,1979–present,Every 15 minutes (near real-time),High
