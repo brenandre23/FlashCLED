@@ -109,6 +109,6 @@ commodities:
 
 ioda:
   source_url: "https://api.ioda.inetintel.cc.gatech.edu/v2"
-  variable: "ioda_connectivity_index"
+  variable: "ioda_outage_score"
   entity_code: "CF"
-  description: "Hybrid Internet Connectivity Index. National active probing baseline (2014+) overlaid with regional precision (2022+)."
+  description: "Outage event score aggregated over 14d windows. IODA events available nationally from 2022 onward; regional detail unavailable for CAR."

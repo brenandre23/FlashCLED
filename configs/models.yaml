@@ -82,7 +82,7 @@ submodels:
     - gdelt_decay_30d          # Added: Short-term media volume
     - gdelt_goldstein_mean     # Added: Event stability score
     - gdelt_mentions_total     # Added: Event salience/importance
-    - ioda_outage_detected     # Added: Internet outage signal
+    - ioda_outage_score_lag1   # Added: Internet outage signal (lagged score)
     - conflict_density_10km
     - regional_risk_score_lag1
 
@@ -106,9 +106,13 @@ submodels:
     enabled: true
     features:
     - chirps_precip_anomaly
+    - chirps_precip_mean
     - era5_temp_anomaly
+    - era5_temp_mean
     - era5_soil_moisture_anomaly
+    - era5_soil_moisture_mean
     - ndvi_anomaly
+    - ndvi_max
     - nightlights_intensity
     - water_local_max
     - water_local_mean
@@ -149,10 +153,11 @@ submodels:
     - month_sin
     - month_cos
     - is_dry_season
-news_ops:
-  enabled: true
-  features:
-  - ioda_connectivity_index_lag1
+
+  news_ops:
+    enabled: true
+    features:
+    - ioda_outage_score_lag1
 
   broad_pca:
     enabled: true

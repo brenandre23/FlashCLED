@@ -456,11 +456,16 @@ def run():
 
     # Find CrisisWatch file (explicit pattern)
     raw_dir = ROOT_DIR / "data" / "raw"
-    input_files = list(raw_dir.glob("*crisiswatch*.txt")) + list(raw_dir.glob("*CrisisWatch*.txt"))
+    input_files = (
+        list(raw_dir.glob("*crisiswatch*.txt"))
+        + list(raw_dir.glob("*CrisisWatch*.txt"))
+        + list(raw_dir.glob("*criseswatchdata*.txt"))  # e.g., criseswatchdataNOV25.txt
+        + list(raw_dir.glob("*CrisesWatchData*.txt"))
+    )
     
     if not input_files:
         # Fallback: any txt file with "crisis" in name
-        input_files = [f for f in raw_dir.glob("*.txt") if "crisis" in f.name.lower()]
+        input_files = [f for f in raw_dir.glob("*.txt") if "crisis" in f.name.lower() or "criseswatchdata" in f.name.lower()]
         
     if not input_files:
         logger.error("No CrisisWatch txt file found in data/raw/")

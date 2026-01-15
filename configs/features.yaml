@@ -35,18 +35,34 @@ registry:
   source: CHIRPS
   transformation: anomaly
   output_col: chirps_precip_anomaly
+- raw: precip_mean_depth_mm
+  source: CHIRPS
+  transformation: mean
+  output_col: chirps_precip_mean
 - raw: temp_mean
   source: ERA5
   transformation: anomaly
   output_col: era5_temp_anomaly
+- raw: temp_mean
+  source: ERA5
+  transformation: mean
+  output_col: era5_temp_mean
 - raw: soil_moisture_mean
   source: ERA5
   transformation: anomaly
   output_col: era5_soil_moisture_anomaly
+- raw: soil_moisture_mean
+  source: ERA5
+  transformation: mean
+  output_col: era5_soil_moisture_mean
 - raw: ndvi_max
   source: MODIS
   transformation: anomaly
   output_col: ndvi_anomaly
+- raw: ndvi_max
+  source: MODIS
+  transformation: mean
+  output_col: ndvi_max
 - raw: ntl_mean
   source: VIIRS
   transformation: mean
@@ -329,14 +345,14 @@ registry:
   source: GDELT
   transformation: none
   output_col: gdelt_mentions_total
-- raw: ioda_connectivity_index
-  source: IODA
-  transformation: lag1
-  output_col: ioda_connectivity_index_lag1
-- raw: ioda_outage_detected
+- raw: ioda_outage_score
   source: IODA
   transformation: none
-  output_col: ioda_outage_detected
+  output_col: ioda_outage_score
+- raw: ioda_outage_score
+  source: IODA
+  transformation: lag_1_step
+  output_col: ioda_outage_score_lag1
 - raw: water_local_max
   source: JRC_Landsat
   transformation: none

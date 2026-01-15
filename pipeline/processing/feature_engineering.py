@@ -1250,7 +1250,7 @@ def process_conflict(engine, spine, conflict_specs, features_config):
     # --- Stream A: Local Precision ---
     precise_mask = acled_raw['geo_precision'].isin([1, 2]) & acled_raw['time_precision'].isin([1, 2])
     acled_local = acled_raw[precise_mask]
-    acled_local_agg = acled_local.groupby(['h3_index', 'spine_date'], observed=True).agg({
+    acled_local_agg = acled_local.groupby(['h3_index', admin_col, 'spine_date'], observed=True).agg({
         'fatalities': 'sum',
         'protest_flag': 'sum',
         'riot_flag': 'sum',
@@ -1307,12 +1307,18 @@ def process_conflict(engine, spine, conflict_specs, features_config):
         ioda_raw = pd.DataFrame(columns=["h3_index", "date", "variable", "value"])
     gdelt_raw['date'] = pd.to_datetime(gdelt_raw['date'])
     gdelt_raw['spine_date'] = pd.cut(gdelt_raw['date'], bins=dates, labels=dates[1:], right=True)
+    if not ioda_raw.empty:
+        ioda_raw['date'] = pd.to_datetime(ioda_raw['date'])
+        ioda_raw['spine_date'] = pd.cut(ioda_raw['date'], bins=dates, labels=dates[1:], right=True)
+    else:
+        ioda_raw['spine_date'] = pd.Series(dtype='datetime64[ns]')
     
     gdelt_event = gdelt_raw[gdelt_raw['variable'] == 'gdelt_event_count']
     gdelt_tone = gdelt_raw[gdelt_raw['variable'] == 'gdelt_avg_tone']
     gdelt_goldstein = gdelt_raw[gdelt_raw['variable'] == 'gdelt_goldstein_mean']
     gdelt_mentions = gdelt_raw[gdelt_raw['variable'] == 'gdelt_mentions_total']
-    ioda_outage = ioda_raw[ioda_raw['variable'] == 'ioda_outage_detected'] if not ioda_raw.empty else gdelt_raw[gdelt_raw['variable'] == 'ioda_outage_detected']
+    # Prefer new outage score; fallback to legacy detected flag
+    ioda_outage = ioda_raw[ioda_raw['variable'].isin(['ioda_outage_score', 'ioda_outage_detected'])]
     ioda_connectivity = ioda_raw[ioda_raw['variable'] == 'ioda_connectivity_index'] if not ioda_raw.empty else pd.DataFrame(columns=['h3_index','spine_date','value'])
     
     gdelt_event_agg = gdelt_event.groupby(['h3_index', 'spine_date'], observed=True)['value'].sum().reset_index()
@@ -1331,9 +1337,16 @@ def process_conflict(engine, spine, conflict_specs, features_config):
     gdelt_mentions_agg = gdelt_mentions_agg.rename(columns={'spine_date': 'date', 'value': 'gdelt_mentions_total'})
     gdelt_mentions_agg['date'] = pd.to_datetime(gdelt_mentions_agg['date'])
 
-    ioda_outage_agg = ioda_outage.groupby(['h3_index', 'spine_date'], observed=True)['value'].max().reset_index()
-    ioda_outage_agg = ioda_outage_agg.rename(columns={'spine_date': 'date', 'value': 'ioda_outage_detected'})
-    ioda_outage_agg['date'] = pd.to_datetime(ioda_outage_agg['date'])
+    ioda_outage_agg = pd.DataFrame(columns=['h3_index','date','ioda_outage_score'])
+    if not ioda_outage.empty:
+        ioda_outage_agg = (
+            ioda_outage
+            .groupby(['h3_index', 'spine_date'], observed=True)['value']
+            .max()
+            .reset_index()
+            .rename(columns={'spine_date': 'date', 'value': 'ioda_outage_score'})
+        )
+        ioda_outage_agg['date'] = pd.to_datetime(ioda_outage_agg['date'])
 
     ioda_conn_agg = pd.DataFrame(columns=['h3_index','date','ioda_connectivity_index'])
     if not ioda_connectivity.empty:
