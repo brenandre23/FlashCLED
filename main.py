@@ -7,6 +7,9 @@ from datetime import datetime
 from contextlib import contextmanager
 from typing import Optional, Tuple, Dict, Any
 
+import pandas as pd
+import pyarrow.parquet as pq
+
 from sqlalchemy import text, inspect
 from sqlalchemy.engine import Engine
 
@@ -36,10 +39,13 @@ import init_db
 # --- Ingestion ---
 from pipeline.ingestion import (
     create_h3_grid,
+    fetch_economy,
+    fetch_food_security,
+    fetch_gdelt_events,
+    fetch_gdelt_themes,
+    fetch_ioda,
     fetch_population,
     fetch_acled,
-    fetch_dynamic_event,
-    fetch_crisiswatch,
     fetch_gee_server_side,
     fetch_mines,
     fetch_dem,
@@ -49,8 +55,6 @@ from pipeline.ingestion import (
     fetch_epr_core,
     fetch_iom,
     fetch_settlements,
-    ingest_economy,
-    ingest_food_security,
 )
 
 # --- Processing ---
@@ -60,7 +64,8 @@ from pipeline.processing import (
     spatial_disaggregation,
     feature_engineering as master_fe,
     calculate_epr_features,
-    process_acled_nlp,
+    process_criseswatch,
+    process_acled_hybrid,
 )
 
 # --- Modeling ---
@@ -69,6 +74,9 @@ from pipeline.modeling import (
     train_models,
     generate_predictions,
 )
+
+# --- Validation ---
+from pipeline.validation import run_assertions
 
 # --- Analysis (NEW) ---
 try:
@@ -239,26 +247,23 @@ class CEWPPipeline:
         fetch_acled.run(self.configs, self.engine)
 
         # 2. High-Frequency Automated Events (GDELT/IODA)
-        fetch_dynamic_event.run(self.configs, self.engine)
+        fetch_ioda.run(self.configs, self.engine)
+        fetch_gdelt_events.run(engine=self.engine)
+        if self.args.skip_gdelt_themes:
+            logger.info("Skipping GDELT Themes fetch (per flag).")
+        else:
+            fetch_gdelt_themes.run(engine=self.engine)
 
-        # 3. Qualitative Intelligence (CrisisWatch) [NEW]
-        # We wrap this in try/except because web scraping can be brittle.
-        # We don't want to halt the pipeline if the website is flaky.
-        try:
-            fetch_crisiswatch.run(self.configs, self.engine)
-        except Exception as e:
-            logger.warning(f"CrisisWatch ingestion failed (skipping): {e}")
-
-        # 4. Socio-Economic
-        ingest_food_security.run(self.configs, self.engine)
-        ingest_economy.main()
+        # 3. Socio-Economic
+        fetch_food_security.run(self.configs, self.engine)
+        fetch_economy.main()
         fetch_iom.main()
 
-        # 5. Spatial Disaggregation
+        # 4. Spatial Disaggregation
         logger.info(">> Spatial Disaggregation (Admin -> H3)")
         spatial_disaggregation.run(self.configs, self.engine)
 
-        # 6. Environmental Variables (Google Earth Engine)
+        # 5. Environmental Variables (Google Earth Engine)
         fetch_gee_server_side.run(self.configs, self.engine)
 
         logger.info("✓ Dynamic Ingestion Phase Complete.")
@@ -296,12 +301,44 @@ class CEWPPipeline:
             # 3.1 Master Feature Script
             master_fe.run()
 
-            # 3.3 Semantic / NLP Features
-            logger.info(">> Generating ACLED Semantic Features (ConfliBERT)...")
-            process_acled_nlp.run(self.configs, self.engine)
+            # 3.2 ACLED Hybrid (Regex + Semantic) Features
+            logger.info(">> Generating ACLED Hybrid Features (Regex + Semantic)...")
+            process_acled_hybrid.run()
 
-            # 3.2 EPR Features (Sidecar)
+            # 3.3 CrisisWatch NLP Features
+            logger.info(">> Generating CrisisWatch NLP Features...")
+            process_criseswatch.run()
+
+            # 3.4 EPR Features (Sidecar)
             calculate_epr_features.main()
+
+        # Optional pause for manual pruning
+        if getattr(self.args, "stop_after_features", False):
+            self._write_feature_schema_summary()
+            logger.info("stop-after-features set; exiting before modeling. Review summary and prune as needed.")
+            return "STOP_AFTER_FEATURES"
+
+        # Optional collinearity diagnostics before modeling
+        if getattr(self.args, "run_collinearity_only", False):
+            # Ensure feature matrix exists
+            logger.info("Collinearity-only mode: ensuring feature matrix exists before diagnostics.")
+            if self.configs["data"].get("validation", {}).get("run_assertions", False):
+                logger.info("Running data contract assertions before building feature matrix...")
+                run_assertions.run_checks()
+            build_feature_matrix.run(
+                self.configs,
+                self.engine,
+                str(self.start_date),
+                str(self.end_date)
+            )
+            try:
+                from pipeline.processing import collinearity_check
+                collinearity_check.run()
+            except Exception as e:
+                logger.error(f"Collinearity check failed: {e}", exc_info=True)
+                return 1
+            logger.info("Collinearity check complete. Exiting before modeling.")
+            return "STOP_AFTER_COLLINEARITY"
 
     def run_modeling_phase(self):
         if self.args.skip_modeling:
@@ -317,6 +354,10 @@ class CEWPPipeline:
             )
 
         with pipeline_stage("PHASE 4: MODELING"):
+            if self.configs["data"].get("validation", {}).get("run_assertions", False):
+                logger.info("Running data contract assertions before building feature matrix...")
+                run_assertions.run_checks()
+
             # 4.1 Build ABT
             build_feature_matrix.run(
                 self.configs, 
@@ -416,6 +457,46 @@ class CEWPPipeline:
             # Handle validation-only mode
             if self.args.validate_only:
                 return self.run_validation_only()
+
+            # Handle diagnostics-only mode
+            if self.args.run_diagnostics_only:
+                logger.info("Diagnostics-only mode: ensuring feature matrix exists, then running diagnostics.")
+                # Build matrix if missing
+                matrix_path = Path("data/processed/feature_matrix.parquet")
+                if not matrix_path.exists():
+                    logger.info("Feature matrix missing; building before diagnostics.")
+                    build_feature_matrix.run(
+                        self.configs,
+                        self.engine,
+                        str(self.start_date),
+                        str(self.end_date)
+                    )
+                try:
+                    from scripts.diagnostics import feature_diagnostics, visualize_diagnostics
+                except ImportError as e:
+                    logger.error(f"Diagnostics modules not found: {e}")
+                    return 1
+
+                feature_diagnostics.main()
+                visualize_diagnostics.main()
+                return 0
+
+            # Handle single-step mode
+            if self.args.step:
+                logger.info(f"Running single step: {self.args.step}")
+                if self.args.step == "acled_hybrid":
+                    process_acled_hybrid.run()
+                elif self.args.step == "build_matrix":
+                    if self.configs["data"].get("validation", {}).get("run_assertions", False):
+                        logger.info("Running data contract assertions before building feature matrix...")
+                        run_assertions.run_checks()
+                    build_feature_matrix.run(
+                        self.configs,
+                        self.engine,
+                        str(self.start_date),
+                        str(self.end_date)
+                    )
+                return 0
             
             logger.info("=" * 60)
             logger.info("   ORCHESTRATING CEWP PIPELINE")
@@ -425,6 +506,9 @@ class CEWPPipeline:
             self.run_static_phase()
             self.run_dynamic_phase()
             self.run_feature_engineering_phase()
+            if getattr(self.args, "stop_after_features", False):
+                return 0
+
             self.run_modeling_phase()
             self.run_analysis_phase()
 
@@ -442,6 +526,29 @@ class CEWPPipeline:
             if self.engine:
                 self.engine.dispose()
 
+    def _write_feature_schema_summary(self):
+        """
+        Lightweight summary of the current feature matrix schema for pruning.
+        Reads the Parquet schema only (no full load) and writes a CSV with column
+        names and types to data/processed/feature_schema_summary.csv.
+        """
+        parquet_path = Path("data/processed/temporal_features.parquet")
+        if not parquet_path.exists():
+            logger.warning("temporal_features.parquet not found; skipping schema summary.")
+            return
+
+        try:
+            schema = pq.read_schema(parquet_path)
+            df = pd.DataFrame(
+                [(f.name, str(f.type)) for f in schema],
+                columns=["column", "dtype"]
+            )
+            out_path = Path("data/processed/feature_schema_summary.csv")
+            df.to_csv(out_path, index=False)
+            logger.info(f"Wrote feature schema summary to {out_path}")
+        except Exception as e:
+            logger.warning(f"Could not write feature schema summary: {e}")
+
 
 # ---------------------------------------------------------
 # 4) ENTRY POINT
@@ -458,15 +565,36 @@ def parse_args():
     parser.add_argument("--reset-schema", action="store_true", help="Hard reset schema before running.")
     parser.add_argument("--skip-static", action="store_true", help="Skip static ingestion.")
     parser.add_argument("--skip-dynamic", action="store_true", help="Skip dynamic ingestion.")
+    parser.add_argument("--skip-gdelt-themes", action="store_true", help="Skip GDELT themes fetch (BigQuery).")
     parser.add_argument("--skip-features", action="store_true", help="Skip feature engineering.")
     parser.add_argument("--skip-modeling", action="store_true", help="Skip modeling & predictions.")
     parser.add_argument("--skip-analysis", action="store_true", help="Skip post-run analysis.")
+    parser.add_argument(
+        "--stop-after-features",
+        action="store_true",
+        help="Run feature engineering, write schema summary, and exit before modeling."
+    )
+    parser.add_argument(
+        "--step",
+        choices=["acled_hybrid", "build_matrix"],
+        help="Run a single pipeline step and exit (bypasses full orchestration)."
+    )
+    parser.add_argument(
+        "--run-collinearity-only",
+        action="store_true",
+        help="Build feature matrix if missing, run collinearity check, then exit before modeling."
+    )
     
     # Validation
     parser.add_argument(
         "--validate-only", 
         action="store_true", 
         help="Run pre-flight validation without executing pipeline."
+    )
+    parser.add_argument(
+        "--run-diagnostics-only",
+        action="store_true",
+        help="Run consolidated diagnostics (correlation/VIF) and exit before modeling."
     )
     
     return parser.parse_args()

@@ -1,4 +1,4 @@
-"""
+﻿"""
 utils.py
 ========
 Core utilities for the CEWP pipeline.
@@ -96,12 +96,24 @@ def ensure_h3_int64(h3_val):
 # -----------------------------------------------------------------
 # 3b. IMPUTATION & TYPE VALIDATION HELPERS
 # -----------------------------------------------------------------
-def apply_forward_fill(df, col, groupby_col="h3_index", limit=None, config=None):
-    if limit is None:
-        if config:
+
+def apply_forward_fill(df, col, groupby_col="h3_index", limit=None, config=None, domain=None):
+    """
+    Applies forward fill per group. 
+    Priority: Explicit limit > Domain-specific limit from config > Global default > Hardcoded 4.
+    """
+    if limit is None and config:
+        # 1. Try to find domain-specific override in features.yaml
+        if domain:
+            limit = config.get("imputation", {}).get("domains", {}).get(domain, {}).get("limit")
+        
+        # 2. Fallback to global default in config
+        if limit is None:
             limit = config.get("imputation", {}).get("defaults", {}).get("limit", 4)
-        else:
-            limit = 4
+            
+    if limit is None:
+        limit = 4
+        
     return df.groupby(groupby_col)[col].ffill(limit=limit)
 
 
@@ -160,13 +172,19 @@ def load_configs() -> ConfigBundle:
 def get_secrets() -> dict:
     env_path = PATHS["root"] / ".env"
     load_dotenv(env_path)
-    
-    if os.environ.get("DB_HOST") == "localhost" and "microsoft" in os.uname().release.lower():
+
+    try:
+        uname_release = os.uname().release.lower()
+    except AttributeError:
+        import platform
+        uname_release = platform.uname().release.lower()
+
+    if os.environ.get("DB_HOST") == "localhost" and "microsoft" in uname_release:
         try:
             cmd = "ip route show | awk '/default/ {print $3}'"
             gateway_ip = subprocess.check_output(cmd, shell=True).decode().strip()
             os.environ["DB_HOST"] = gateway_ip
-            logger.info(f"🔧 WSL Detected: Auto-routed DB connection to Windows Host ({gateway_ip})")
+            logger.info(f"WSL Detected: Auto-routed DB connection to Windows Host ({gateway_ip})")
         except Exception as e:
             logger.warning(f"Could not auto-resolve WSL host: {e}")
 
@@ -314,7 +332,7 @@ def init_gee(project_id: str):
             credentials = service_account.Credentials.from_service_account_file(key_path)
             scoped_credentials = credentials.with_scopes(['https://www.googleapis.com/auth/earthengine'])
             ee.Initialize(credentials=scoped_credentials, project=project_id)
-            logger.info(f"✓ GEE Authenticated via Service Account: {key_path}")
+            logger.info(f"âœ“ GEE Authenticated via Service Account: {key_path}")
             return
         except Exception as e:
             logger.warning(f"Service Account auth failed: {e}. Falling back to default.")
@@ -322,7 +340,7 @@ def init_gee(project_id: str):
     # 3. Fallback to Standard Interactive Auth
     try:
         ee.Initialize(project=project_id)
-        logger.info(f"✓ GEE Initialized (Standard Auth)")
+        logger.info(f"âœ“ GEE Initialized (Standard Auth)")
     except Exception as e:
         logger.warning(f"GEE init failed ({e}); attempting Authenticate()...")
         ee.Authenticate()
@@ -389,8 +407,8 @@ class ValidationResult:
         self.warnings.append(warning)
     
     def get_error_message(self) -> str:
-        if self.passed: return f"✓ Phase '{self.phase}' validation passed."
-        lines = [f"❌ Phase '{self.phase}' validation FAILED:"]
+        if self.passed: return f"âœ“ Phase '{self.phase}' validation passed."
+        lines = [f"âŒ Phase '{self.phase}' validation FAILED:"]
         if self.missing_extensions:
             lines.append(f"  Missing PostgreSQL extensions: {', '.join(self.missing_extensions)}")
         if self.missing_tables:
@@ -440,7 +458,7 @@ def validate_pipeline_prerequisites(engine, phase: str, schema: str = SCHEMA) ->
             missing = _check_columns_exist(engine, table, columns, schema)
             if missing: result.add_missing_columns(table, missing)
             
-    if result.passed: logger.info(f"✓ Phase '{phase}' prerequisites validated successfully")
+    if result.passed: logger.info(f"âœ“ Phase '{phase}' prerequisites validated successfully")
     else: logger.error(result.get_error_message())
     return result
 
@@ -450,3 +468,4 @@ def validate_all_phases(engine, schema: str = SCHEMA) -> Dict[str, ValidationRes
     for phase in PHASE_PREREQUISITES.keys():
         results[phase] = validate_pipeline_prerequisites(engine, phase, schema)
     return results
+
