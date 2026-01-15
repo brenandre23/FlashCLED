@@ -1,113 +1,614 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FlashCLED | Conflict Early Warning</title>
-    
-    <!-- MapLibre GL CSS -->
-    <link href="https://unpkg.com/maplibre-gl@3.0.0/dist/maplibre-gl.css" rel="stylesheet" />
-    
-    <!-- Custom CSS -->
-    <link rel="stylesheet" href="style.css">
-    
-    <!-- Dependencies -->
-    <script src="https://unpkg.com/deck.gl@8.9.0/dist.min.js"></script>
-    <script src="https://unpkg.com/maplibre-gl@3.0.0/dist/maplibre-gl.js"></script>
-    <script src="https://unpkg.com/h3-js@3.7.2/dist/h3-js.umd.js"></script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="FlashCLED: Spatio-Temporal Conflict Early Warning System for the Central African Republic" />
+  <title>FlashCLED: Early Warning Conflict Prediction Viewer for the Central African Republic</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+  <link href="https://unpkg.com/maplibre-gl@3.0.0/dist/maplibre-gl.css" rel="stylesheet" />
+  <!-- H3 library (REQUIRED) -->
+  <script src="https://unpkg.com/h3-js@3.7.2/dist/h3-js.umd.js"></script>
+  <!-- Deck.gl -->
+  <script src="https://unpkg.com/deck.gl@8.9.36/dist.min.js"></script>
+  <script src="https://unpkg.com/maplibre-gl@3.0.0/dist/maplibre-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://unpkg.com/feather-icons"></script>
+
+  <link rel="stylesheet" href="style.css" />
 </head>
+
 <body>
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="#top" aria-label="FlashCLED Home">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-text">
+          <span class="brand-title">FlashCLED</span>
+          <span class="brand-subtitle">Conflict Early Warning — CAR</span>
+        </span>
+      </a>
 
-    <div class="app-container">
-        
-        <!-- Sidebar -->
-        <aside class="sidebar">
-            <div class="brand">
-                <h1>FlashCLED</h1>
-                <p>Conflict Early Warning System</p>
-            </div>
+      <nav class="nav" aria-label="Primary">
+        <a href="#problem">Problem</a>
+        <a href="#pipeline">Pipeline</a>
+        <a href="#data-sources">Data Sources</a>
+        <a href="#demo" class="nav-cta">Explorer</a>
+      </nav>
 
-            <div class="controls">
-                <h3>Layers</h3>
-                
-                <div class="control-group">
-                    <label class="toggle">
-                        <input type="checkbox" id="toggle-conflict" checked>
-                        <span class="slider"></span>
-                        <span class="label-text">Conflict Risk (H3)</span>
-                    </label>
-                </div>
-
-                <div class="control-group">
-                    <label class="toggle">
-                        <input type="checkbox" id="toggle-roads">
-                        <span class="slider"></span>
-                        <span class="label-text">GRIP4 Roads</span>
-                    </label>
-                </div>
-
-                <div class="control-group">
-                    <label class="toggle">
-                        <input type="checkbox" id="toggle-rivers">
-                        <span class="slider"></span>
-                        <span class="label-text">Rivers</span>
-                    </label>
-                </div>
-
-                <div class="control-group">
-                    <label class="toggle">
-                        <input type="checkbox" id="toggle-events">
-                        <span class="slider"></span>
-                        <span class="label-text">Conflict Events</span>
-                    </label>
-                </div>
-                
-                <div class="legend">
-                    <h4>Risk Intensity</h4>
-                    <div class="gradient-bar"></div>
-                    <div class="labels">
-                        <span>Low</span>
-                        <span>High</span>
-                    </div>
-                </div>
-
-                <!-- Hex Info Panel -->
-                <div class="hex-info-panel">
-                    <h4>Cell Details</h4>
-                    <div id="hex-info">
-                        <p class="muted">Hover over a hexagon to see details.</p>
-                    </div>
-                </div>
-
-                <!-- API Status -->
-                <div class="api-status">
-                    <span class="status-dot" id="status-dot"></span>
-                    <span class="status-text" id="status-text">Connecting...</span>
-                </div>
-            </div>
-        </aside>
-
-        <!-- Map Container -->
-        <main class="map-wrapper">
-            <div id="map"></div>
-            <div id="tooltip" class="tooltip hidden"></div>
-            
-            <!-- Loading Overlay -->
-            <div id="loading" class="loading-overlay">
-                <div class="spinner"></div>
-                <p>Loading Geospatial Data...</p>
-                <p class="loading-status" id="loading-status">Initializing...</p>
-            </div>
-
-            <!-- Coordinates Display -->
-            <div class="coords-display" id="coords-display">
-                <span id="cursor-coords">Lat: --, Lng: --</span>
-            </div>
-        </main>
-
+      <div class="header-status">
+        <span class="mono" id="status-text">Connecting…</span>
+        <span class="status-dot pulse" id="status-dot"></span>
+      </div>
     </div>
+  </header>
 
-    <!-- JavaScript -->
-    <script src="script.js"></script>
+  <main id="top">
+    <!-- Hero Section -->
+    <section class="hero">
+      <div class="container">
+        <p class="kicker">Master's Thesis</p>
+        <h1>FlashCLED: Early Warning Conflict Prediction Viewer for the Central African Republic</h1>
+        <p class="lead">Three-Map Data Explorer: Predictions, Temporal Features, and Static Context</p>
+        <div class="hero-actions">
+          <a class="btn primary" href="#demo">Open Explorer</a>
+        </div>
+      </div>
+    </section>
+
+  <!-- Problem Section -->
+  <section id="problem" class="section">
+    <div class="container">
+      <h2>Problem Context</h2>
+      <div class="two-col">
+        <div>
+          <p>
+            Conflict dynamics in the Central African Republic are highly local and fast-moving. The goal of this explorer
+            is to surface conflict risk signals at H3 resolution (res 5) with clear data provenance so analysts can track
+            spikes, validate drivers, and communicate risk quickly.
+          </p>
+          <p>
+            Trends we monitor: shifting hotspots, seasonal environmental stressors, market shocks, displacement signals,
+            and news-driven sentiment. Each layer keeps its own lineage so you always know if you are looking at model
+            outputs, upstream drivers, or static context.
+          </p>
+        </div>
+        <div class="callout">
+          <h3>What you see</h3>
+          <ul class="bullets">
+            <li><strong>Predictions:</strong> Conflict probabilities and expected fatalities by hex/date.</li>
+            <li><strong>Temporal inputs:</strong> Time-varying drivers (conflict, markets, news, environment).</li>
+            <li><strong>Static context:</strong> Distances, elevation, admin boundaries.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    </section>
+
+    <!-- Data Sources Section -->
+    <section id="data-sources" class="section">
+      <div class="container">
+        <h2>Data Sources Overview</h2>
+        <p class="muted">21 sources harmonized to H3 resolution 5 (~10km) with 14-day temporal windows.</p>
+        <div class="ds-grid">
+          <article class="ds-card env">
+            <div class="ds-label">Environmental (7)</div>
+            <ul class="ds-list">
+              <li><a href="https://developers.google.com/earth-engine/datasets/catalog/UCSB-CHG_CHIRPS_DAILY" target="_blank" rel="noreferrer"><strong>CHIRPS</strong></a> — daily rainfall / precipitation anomalies</li>
+              <li><a href="https://cds.climate.copernicus.eu/cdsapp#!/dataset/reanalysis-era5-land" target="_blank" rel="noreferrer"><strong>ERA5-Land</strong></a> — temperature, dewpoint, soil moisture</li>
+              <li><a href="https://developers.google.com/earth-engine/datasets/catalog/MODIS_061_MCD43A4" target="_blank" rel="noreferrer"><strong>MODIS NDVI</strong></a> — vegetation health index</li>
+              <li><a href="https://developers.google.com/earth-engine/datasets/catalog/NASA_VIIRS_002_VNP46A2" target="_blank" rel="noreferrer"><strong>VIIRS Nightlights</strong></a> — nighttime light intensity (economic proxy)</li>
+              <li><a href="https://global-surface-water.appspot.com/" target="_blank" rel="noreferrer"><strong>JRC Surface Water</strong></a> — water body coverage and presence</li>
+              <li><a href="https://spacedata.copernicus.eu/collections/copernicus-digital-elevation-model" target="_blank" rel="noreferrer"><strong>Copernicus DEM</strong></a> — elevation, slope, terrain ruggedness</li>
+            </ul>
+          </article>
+          <article class="ds-card conflict">
+            <div class="ds-label">Conflict & Events (3)</div>
+            <ul class="ds-list">
+              <li><a href="https://acleddata.com/data/" target="_blank" rel="noreferrer"><strong>ACLED Events</strong></a> — battles, protests, riots, fatalities</li>
+              <li><a href="https://acleddata.com/data/" target="_blank" rel="noreferrer"><strong>ACLED NLP</strong></a> — 8 semantic themes + 6 conflict drivers</li>
+              <li><a href="https://console.cloud.google.com/bigquery?p=gdelt-bq&d=gdeltv2&t=events&page=table" target="_blank" rel="noreferrer"><strong>GDELT</strong></a> — global news tone and event counts</li>
+            </ul>
+          </article>
+          <article class="ds-card socio">
+            <div class="ds-label">Socio-Political (3)</div>
+            <ul class="ds-list">
+              <li><a href="https://icr.ethz.ch/data/epr/geoepr/GeoEPR-2021.geojson" target="_blank" rel="noreferrer"><strong>EPR</strong></a> — ethnic power relations, excluded groups</li>
+              <li><a href="https://dtmapi.iom.int/v3" target="_blank" rel="noreferrer"><strong>IOM DTM</strong></a> — internal displacement counts</li>
+              <li><a href="https://fdw.fews.net/api/feature/?format=geojson&unit_set_version=3380" target="_blank" rel="noreferrer"><strong>FEWS NET IPC</strong></a> — food security phase (1–5 crisis scale)</li>
+            </ul>
+          </article>
+          <article class="ds-card econ">
+            <div class="ds-label">Economic (6)</div>
+            <ul class="ds-list">
+              <li><em>Global commodities:</em></li>
+              <li><strong>Gold Price (GC=F)</strong> — mining revenue proxy</li>
+              <li><strong>Oil Price (CL=F)</strong> — transport/energy costs</li>
+              <li><strong>S&amp;P 500, EUR/USD</strong> — macro stability indicators</li>
+              <li><em>Local market prices:</em></li>
+              <li><a href="https://api.vam.wfp.org/" target="_blank" rel="noreferrer"><strong>WFP Food Prices</strong></a> — maize, rice, sorghum, oil + shock flags</li>
+            </ul>
+          </article>
+          <article class="ds-card infra">
+            <div class="ds-label">Infrastructure (5)</div>
+            <ul class="ds-list">
+              <li><a href="https://dataportaal.pbl.nl/downloads/GRIP4/GRIP4_Region3_vector_shp.zip" target="_blank" rel="noreferrer"><strong>GRIP4 Roads</strong></a> — distance to nearest road (km)</li>
+              <li><a href="https://data.hydrosheds.org/file/HydroRIVERS/HydroRIVERS_v10_af_shp.zip" target="_blank" rel="noreferrer"><strong>HydroRIVERS</strong></a> — distance to river (order 3+)</li>
+              <li><a href="https://geo.ipisresearch.be/geoserver/public/caf_mines_curated_all_opendata_p_ipis/wfs" target="_blank" rel="noreferrer"><strong>IPIS Mining Sites</strong></a> — distance to diamond/gold mines</li>
+              <li><a href="https://data.humdata.org/dataset/27db004a-4f10-4046-a561-c0b0aea98ef0/resource/6d28d003-333c-442c-9d39-6903bb264814/download/caf_settlements_sigcaf.zip" target="_blank" rel="noreferrer"><strong>OSM Settlements</strong></a> — distance to city/capital</li>
+              <li><a href="https://datacatalog.worldbank.org/search/dataset/0038272/World-Bank-Official-Boundaries" target="_blank" rel="noreferrer"><strong>Country Boundary</strong></a> — distance to border (km)</li>
+            </ul>
+          </article>
+          <article class="ds-card demo">
+            <div class="ds-label">Demographics (1)</div>
+            <ul class="ds-list">
+              <li><a href="https://data.worldpop.org/GIS/Population/Global_2015_2030/R2025A" target="_blank" rel="noreferrer"><strong>WorldPop</strong></a> — 100m population density (log-transformed)</li>
+            </ul>
+          </article>
+          <article class="ds-card temporal">
+            <div class="ds-label">Temporal Context</div>
+            <ul class="ds-list">
+              <li><strong>Seasonal Features</strong> — month_sin/cos, is_dry_season flag</li>
+            </ul>
+          </article>
+          <article class="ds-card summary">
+            <div class="ds-label">96 Features</div>
+            <p class="muted">43 raw + 53 transformed (lags, anomalies, shocks)</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- Pipeline & Guarantees -->
+    <section id="pipeline" class="section alt">
+      <div class="container">
+        <h2 class="section-title">Pipeline & Guarantees</h2>
+        <div class="pipeline-grid">
+          <article class="pipe-card" id="flow">
+            <div class="card-title">
+              <span>Execution Flow</span>
+              <i data-feather="link-2" class="title-link"></i>
+            </div>
+            <ol class="stepper">
+              <li class="step-item" id="step-ingest">
+                <div class="step-badge">1</div>
+                <div class="step-text">
+                  <div class="step-label">Ingest <i data-feather="link-2" class="step-link"></i></div>
+                  <div class="step-desc">ACLED, GDELT, markets, displacement, environment to raw tables.</div>
+                </div>
+              </li>
+              <li class="step-item" id="step-harmonize">
+                <div class="step-badge">2</div>
+                <div class="step-text">
+                  <div class="step-label">Harmonize <i data-feather="link-2" class="step-link"></i></div>
+                  <div class="step-desc">Align to H3 res 5, 14-day spine; validate H3 as BIGINT.</div>
+                </div>
+              </li>
+              <li class="step-item" id="step-engineer">
+                <div class="step-badge">3</div>
+                <div class="step-text">
+                  <div class="step-label">Engineer <i data-feather="link-2" class="step-link"></i></div>
+                  <div class="step-desc">Lags, decays, spatial spillover; conflict, markets, news, seasonal.</div>
+                </div>
+              </li>
+              <li class="step-item" id="step-train">
+                <div class="step-badge">4</div>
+                <div class="step-text">
+                  <div class="step-label">Train <i data-feather="link-2" class="step-link"></i></div>
+                  <div class="step-desc">Horizon models (14d/1m/3m); XGBoost/LightGBM.</div>
+                </div>
+              </li>
+              <li class="step-item" id="step-forecast">
+                <div class="step-badge">5</div>
+                <div class="step-text">
+                  <div class="step-label">Forecast <i data-feather="link-2" class="step-link"></i></div>
+                  <div class="step-desc">Write to <span class="chip"><code>car_cewp.predictions</code><i data-feather="copy" class="copy-icon"></i></span> (prob, fatalities, expected).</div>
+                </div>
+              </li>
+            </ol>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- Demo Section: Three-Map Explorer -->
+    <section id="demo" class="section demo-section">
+      <div class="container-wide">
+        <div class="demo-header">
+          <h2>Data Explorer</h2>
+          <p class="muted">Select a map tab, configure controls, and explore H3 hex cells.</p>
+        </div>
+
+        <!-- Tab Navigation -->
+        <div class="map-tabs" role="tablist">
+          <button class="tab-btn active" data-tab="predictions" role="tab" aria-selected="true">
+            <i data-feather="alert-triangle"></i>
+            <span>Predictions</span>
+            <small>Primary</small>
+          </button>
+          <button class="tab-btn" data-tab="temporal" role="tab" aria-selected="false">
+            <i data-feather="clock"></i>
+            <span>Temporal Features</span>
+          </button>
+          <button class="tab-btn" data-tab="static" role="tab" aria-selected="false">
+            <i data-feather="map-pin"></i>
+            <span>Static Features</span>
+          </button>
+        </div>
+
+        <!-- Map Panels -->
+        <div class="map-panels">
+          
+          <!-- Panel 1: Predictions -->
+          <div class="map-panel active" id="panel-predictions" role="tabpanel">
+            <div class="panel-layout">
+              <aside class="panel-controls">
+                <div class="control-card">
+                  <div class="control-header">
+                    <span class="control-title">Forecast Horizon</span>
+                    <span id="pred-horizon-display" class="mono-badge">3m</span>
+                  </div>
+                  <input type="range" id="pred-horizon-slider" min="0" max="2" value="2" step="1" />
+                  <div class="range-labels">
+                    <span>14d</span>
+                    <span>1m</span>
+                    <span>3m</span>
+                  </div>
+                </div>
+
+                <div class="control-card">
+                  <div class="control-header">
+                    <span class="control-title">Options</span>
+                  </div>
+                  <label class="field">
+                    <span class="field-label">Learner</span>
+                    <select id="pred-learner-select" class="feature-select compact">
+                      <option value="xgboost">XGBoost</option>
+                      <option value="lightgbm">LightGBM</option>
+                    </select>
+                  </label>
+                  <label class="toggle">
+                    <input type="checkbox" id="pred-show-layer" checked />
+                    <span class="toggle-slider"></span>
+                    <span class="toggle-label">Show Risk Layer</span>
+                  </label>
+                  <label class="toggle">
+                    <input type="checkbox" id="pred-show-events" />
+                    <span class="toggle-slider"></span>
+                    <span class="toggle-label">ACLED Events</span>
+                  </label>
+                  <div class="opacity-control">
+                    <span class="small muted">Opacity</span>
+                    <input type="range" id="pred-opacity" min="0" max="1" step="0.1" value="0.8" />
+                  </div>
+                </div>
+
+                <div class="legend-card">
+                  <div class="legend-title">Conflict Risk</div>
+                  <div class="legend-gradient predictions-gradient"></div>
+                  <div class="legend-labels">
+                    <span>0%</span>
+                    <span>100%</span>
+                  </div>
+                </div>
+              </aside>
+
+              <div class="panel-map">
+                <div id="map-predictions" class="map-container"></div>
+                <div id="tooltip-predictions" class="map-tooltip hidden"></div>
+                <div id="loading-predictions" class="loading-overlay">
+                  <div class="spinner"></div>
+                  <span>Loading predictions...</span>
+                </div>
+                <div class="map-coords">
+                  <span id="coords-predictions" class="mono">--.---, --.---</span>
+                </div>
+              </div>
+
+              <aside class="panel-inspector">
+                <div class="inspector-header">
+                  <span class="inspector-title">Cell Inspector</span>
+                  <button class="btn tiny" id="pred-clear-selection">Clear</button>
+                </div>
+                <div id="pred-inspector-content" class="inspector-content">
+                  <p class="muted">Click a hex to inspect.</p>
+                </div>
+                <div class="inspector-section">
+                  <div class="inspector-subtitle">Top Contributors</div>
+                  <div id="pred-explain" class="chart-container small">
+                    <p class="muted">Click a hex to view explanations.</p>
+                  </div>
+                </div>
+              </aside>
+            </div>
+
+            <div class="trend-panel">
+              <div class="trend-header">
+                <span class="trend-title">Forecast & History</span>
+                <div class="trend-controls">
+                  <label class="toggle small">
+                    <input type="checkbox" id="pred-forward-toggle" />
+                    <span class="toggle-slider"></span>
+                    <span class="toggle-label">Show future only</span>
+                  </label>
+                  <label class="small" style="display:flex;align-items:center;gap:6px;">
+                    <span class="toggle-label">History window</span>
+                    <select id="pred-history-window" class="mono-badge">
+                      <option value="all">All</option>
+                      <option value="6">6 steps</option>
+                      <option value="12">12 steps</option>
+                      <option value="24">24 steps</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+              <div class="chart-container small">
+                <canvas id="pred-trend-chart"></canvas>
+              </div>
+            </div>
+          </div>
+
+          <!-- Panel 2: Temporal Features -->
+          <div class="map-panel" id="panel-temporal" role="tabpanel">
+            <div class="panel-layout">
+              <aside class="panel-controls">
+                <div class="control-card">
+                  <div class="control-header">
+                    <span class="control-title">Feature</span>
+                  </div>
+                  <select id="temporal-feature-select" class="feature-select">
+                    <optgroup label="Environmental">
+                      <option value="chirps_precip_anomaly">Precipitation Anomaly</option>
+                      <option value="era5_temp_anomaly">Temperature Anomaly</option>
+                      <option value="era5_soil_moisture_anomaly">Soil Moisture Anomaly</option>
+                      <option value="ndvi_anomaly">NDVI Anomaly</option>
+                      <option value="nightlights_intensity">Nightlights Intensity</option>
+                    </optgroup>
+                    <optgroup label="Conflict">
+                      <option value="fatalities_14d_sum">Fatalities (14d sum)</option>
+                      <option value="fatalities_1m_lag">Fatalities (1m lag)</option>
+                      <option value="protest_count_lag1">Protests (lag 1)</option>
+                      <option value="riot_count_lag1">Riots (lag 1)</option>
+                      <option value="regional_risk_score_lag1">Regional Risk (lag 1)</option>
+                    </optgroup>
+                    <optgroup label="GDELT">
+                      <option value="gdelt_event_count">Event Count</option>
+                      <option value="gdelt_avg_tone">Avg Tone</option>
+                      <option value="gdelt_goldstein_mean">Goldstein Mean</option>
+                      <option value="gdelt_mentions_total">Mentions Total</option>
+                    </optgroup>
+                    <optgroup label="Market">
+                      <option value="price_maize">Price: Maize</option>
+                      <option value="price_rice">Price: Rice</option>
+                      <option value="price_oil">Price: Oil</option>
+                      <option value="price_sorghum">Price: Sorghum</option>
+                      <option value="price_cassava">Price: Cassava</option>
+                      <option value="price_groundnuts">Price: Groundnuts</option>
+                    </optgroup>
+                    <optgroup label="Macroeconomics">
+                      <option value="gold_price_usd_lag1">Gold Price (lag)</option>
+                      <option value="oil_price_usd_lag1">Oil Price (lag)</option>
+                      <option value="sp500_index_lag1">S&P 500 (lag)</option>
+                      <option value="eur_usd_rate_lag1">EUR/USD (lag)</option>
+                    </optgroup>
+                    <optgroup label="Displacement">
+                      <option value="iom_displacement_count_lag1">IOM Displacement</option>
+                    </optgroup>
+                    <optgroup label="EPR">
+                      <option value="epr_excluded_groups_count">Excluded Groups</option>
+                      <option value="epr_discriminated_groups_count">Discriminated Groups</option>
+                      <option value="epr_status_mean">Status Mean</option>
+                      <option value="ethnic_group_count">Ethnic Group Count</option>
+                    </optgroup>
+                    <optgroup label="Population">
+                      <option value="pop_log">Population (log)</option>
+                    </optgroup>
+                  </select>
+                </div>
+
+                <div class="control-card">
+                  <div class="control-header">
+                    <span class="control-title">Date</span>
+                    <span id="temporal-date-display" class="mono-badge">Loading...</span>
+                  </div>
+                  <input type="range" id="temporal-date-slider" min="0" max="0" value="0" disabled />
+                  <div class="range-labels">
+                    <span>Past</span>
+                    <span>Future</span>
+                  </div>
+                </div>
+
+                <div class="control-card">
+                  <button id="temporal-play-btn" class="btn icon full-width">
+                    <i data-feather="play"></i>
+                    <span>Animate</span>
+                  </button>
+                </div>
+
+                <div class="control-card">
+                  <label class="toggle">
+                    <input type="checkbox" id="temporal-show-layer" checked />
+                    <span class="toggle-slider"></span>
+                    <span class="toggle-label">Show Feature Layer</span>
+                  </label>
+                  <div class="opacity-control">
+                    <span class="small muted">Opacity</span>
+                    <input type="range" id="temporal-opacity" min="0" max="1" step="0.1" value="0.8" />
+                  </div>
+                </div>
+
+                <div class="legend-card" id="temporal-legend">
+                  <div class="legend-title" id="temporal-legend-title">Feature Value</div>
+                  <div class="legend-gradient temporal-gradient"></div>
+                  <div class="legend-labels">
+                    <span id="temporal-legend-min">Min</span>
+                    <span id="temporal-legend-max">Max</span>
+                  </div>
+                </div>
+              </aside>
+
+              <div class="panel-map">
+                <div id="map-temporal" class="map-container"></div>
+                <div id="tooltip-temporal" class="map-tooltip hidden"></div>
+                <div id="loading-temporal" class="loading-overlay">
+                  <div class="spinner"></div>
+                  <span>Loading features...</span>
+                </div>
+                <div class="map-coords">
+                  <span id="coords-temporal" class="mono">--.---, --.---</span>
+                </div>
+              </div>
+
+              <aside class="panel-inspector">
+                <div class="inspector-header">
+                  <span class="inspector-title">Cell Inspector</span>
+                  <button class="btn tiny" id="temporal-clear-selection">Clear</button>
+                </div>
+                <div id="temporal-inspector-content" class="inspector-content">
+                  <p class="muted">Click a hex to inspect.</p>
+                </div>
+              </aside>
+            </div>
+
+              <div class="trend-panel">
+                <div class="trend-header">
+                  <span class="trend-title">Trend (last 90 days)</span>
+                  <select id="trend-compare-select" class="feature-select small">
+                    <option value="">Compare with...</option>
+                  </select>
+                  <label class="toggle inline">
+                    <input type="checkbox" id="trend-normalize-toggle" />
+                    <span class="toggle-slider small"></span>
+                    <span class="toggle-label small">Normalize</span>
+                  </label>
+                  <label class="toggle inline">
+                    <input type="checkbox" id="trend-max-toggle" />
+                    <span class="toggle-slider small"></span>
+                    <span class="toggle-label small">Show Max</span>
+                  </label>
+                  <label class="toggle inline">
+                    <input type="checkbox" id="trend-min-toggle" />
+                    <span class="toggle-slider small"></span>
+                    <span class="toggle-label small">Show Min</span>
+                  </label>
+                </div>
+                <div class="chart-container small">
+                  <canvas id="trend-chart"></canvas>
+                </div>
+              </div>
+          </div>
+
+          <!-- Panel 3: Static Features -->
+          <div class="map-panel" id="panel-static" role="tabpanel">
+            <div class="panel-layout">
+              <aside class="panel-controls">
+                <div class="control-card">
+                  <div class="control-header">
+                    <span class="control-title">Static Feature</span>
+                  </div>
+                  <select id="static-feature-select" class="feature-select">
+                    <optgroup label="Distance">
+                      <option value="dist_to_capital">Distance to Capital</option>
+                      <option value="dist_to_border">Distance to Border</option>
+                      <option value="dist_to_city">Distance to City</option>
+                      <option value="dist_to_road">Distance to Road</option>
+                      <option value="dist_to_river">Distance to River</option>
+                      <option value="dist_to_market_km">Distance to Market</option>
+                      <option value="dist_to_diamond_mine">Distance to Diamond Mine</option>
+                      <option value="dist_to_gold_mine">Distance to Gold Mine</option>
+                      <option value="dist_to_large_mine">Distance to Large Mine</option>
+                      <option value="dist_to_controlled_mine">Distance to Controlled Mine</option>
+                      <option value="dist_to_large_gold_mine">Distance to Large Gold Mine</option>
+                    </optgroup>
+                    <optgroup label="Geographic">
+                      <option value="elevation_mean">Elevation (Mean)</option>
+                      <option value="slope_mean">Slope (Mean)</option>
+                      <option value="terrain_ruggedness_index">Terrain Ruggedness</option>
+                    </optgroup>
+                    <optgroup label="Administrative">
+                      <option value="admin1">Admin 1 Code</option>
+                      <option value="admin2">Admin 2 Code</option>
+                      <option value="admin3">Admin 3 Code</option>
+                    </optgroup>
+                  </select>
+                </div>
+
+                <div class="control-card">
+                  <label class="toggle">
+                    <input type="checkbox" id="static-show-layer" checked />
+                    <span class="toggle-slider"></span>
+                    <span class="toggle-label">Show Feature Layer</span>
+                  </label>
+                  <div class="opacity-control">
+                    <span class="small muted">Opacity</span>
+                    <input type="range" id="static-opacity" min="0" max="1" step="0.1" value="0.8" />
+                  </div>
+                </div>
+
+                <div class="legend-card">
+                  <div class="legend-title" id="static-legend-title">Feature Value</div>
+                  <div class="legend-gradient static-gradient"></div>
+                  <div class="legend-labels">
+                    <span id="static-legend-min">Min</span>
+                    <span id="static-legend-max">Max</span>
+                  </div>
+                </div>
+
+                <div class="info-card">
+                  <p class="small muted">
+                    <i data-feather="info" class="inline-icon"></i>
+                    Static features have no time dimension.
+                  </p>
+                </div>
+              </aside>
+
+              <div class="panel-map">
+                <div id="map-static" class="map-container"></div>
+                <div id="tooltip-static" class="map-tooltip hidden"></div>
+                <div id="loading-static" class="loading-overlay">
+                  <div class="spinner"></div>
+                  <span>Loading features...</span>
+                </div>
+                <div class="map-coords">
+                  <span id="coords-static" class="mono">--.---, --.---</span>
+                </div>
+              </div>
+
+              <aside class="panel-inspector">
+                <div class="inspector-header">
+                  <span class="inspector-title">Cell Inspector</span>
+                  <button class="btn tiny" id="static-clear-selection">Clear</button>
+                </div>
+                <div id="static-inspector-content" class="inspector-content">
+                  <p class="muted">Click a hex to inspect.</p>
+                </div>
+              </aside>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <div class="footer-left">
+        <div class="footer-title">FlashCLED</div>
+        <div class="muted small">Master's Thesis — CAR Conflict Early Warning</div>
+      </div>
+      <div class="footer-right">
+        <span class="mono small">Three-Map Architecture v2.0</span>
+      </div>
+    </div>
+  </footer>
+
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="script.js"></script>
 </body>
 </html>

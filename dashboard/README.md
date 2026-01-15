@@ -1,57 +1,120 @@
-# FlashCLED Dashboard
+# FlashCLED Dashboard — Three-Map Architecture
 
-Interactive web dashboard for the Conflict Early Warning Pipeline (CEWP). Visualizes conflict risk predictions across the Central African Republic using a high-performance H3 hexagonal grid.
+Interactive web dashboard for the Conflict Early Warning Pipeline (CEWP). Features **strict data lineage** with three separate maps that never mix data sources.
 
-## Architecture (Refactored)
+## Architecture: Three Isolated Maps
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Frontend                                  │
-│  ┌─────────────┐  ┌──────────────────┐  ┌───────────────────┐  │
-│  │  MapLibre   │  │   Deck.gl        │  │   Responsive      │  │
-│  │  (Base Map) │  │  MapboxOverlay   │  │   Sidebar UI      │  │
-│  └─────────────┘  └──────────────────┘  └───────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼ REST API
-┌─────────────────────────────────────────────────────────────────┐
-│                     Backend (Flask)                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ /api/h3_data │  │ /api/roads   │  │ /api/events          │  │
-│  │              │  │ /api/rivers  │  │                      │  │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼ SQL
-┌─────────────────────────────────────────────────────────────────┐
-│                    PostGIS Database                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │ predictions  │  │ features_    │  │    acled_events      │  │
-│  │  _latest     │  │   static     │  │                      │  │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Frontend                                        │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐             │
+│  │   Map 1         │  │   Map 2         │  │   Map 3         │             │
+│  │   PREDICTIONS   │  │   TEMPORAL      │  │   STATIC        │             │
+│  │   (Primary)     │  │   FEATURES      │  │   FEATURES      │             │
+│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘             │
+│           │                    │                    │                       │
+│           ▼                    ▼                    ▼                       │
+│  /api/predictions      /api/temporal_feature  /api/static_feature          │
+│  /api/dates/predictions /api/dates/temporal                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼ SQL (No Mixing!)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           PostGIS Database                                   │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐             │
+│  │   predictions   │  │ temporal_       │  │ features_       │             │
+│  │                 │  │   features      │  │   static        │             │
+│  │  (Model Output) │  │ (Time-Varying)  │  │ (Time-Invariant)│             │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Key Improvements (v2.0)
+## Data Lineage Rules (Non-Negotiable)
 
-| Issue | Fix |
-|-------|-----|
-| Invisible Hexagons | Robust `ensure_signed_h3()` handles hex-string vs signed-int mismatches |
-| Fragile Connectivity | JSON error responses instead of crashes |
-| Rigid Layout | Flexbox sidebar + map-container responsive design |
-| Deck.gl Integration | MapboxOverlay (modern standard for Deck.gl + MapLibre) |
-| Static Data Performance | `lru_cache` on roads/rivers endpoints |
+| Map | Data Source | Endpoints Used | Never Queries |
+|-----|-------------|----------------|---------------|
+| **Map 1: Predictions** | `car_cewp.predictions` | `/api/predictions`, `/api/dates/predictions` | temporal_features, features_static data |
+| **Map 2: Temporal** | `car_cewp.temporal_features` | `/api/temporal_feature`, `/api/dates/temporal` | predictions |
+| **Map 3: Static** | `car_cewp.features_static` | `/api/static_feature` | predictions, temporal_features |
 
-## Tech Stack
+## Slider Direction Fix
 
-| Component | Technology | Purpose |
-|-----------|------------|---------|
-| Backend | **Flask** | REST API server |
-| Database | PostgreSQL + PostGIS | Spatial data storage |
-| Base Map | MapLibre GL JS | Open-source map rendering |
-| Hex Layer | Deck.gl + H3HexagonLayer | High-performance WebGL visualization |
-| Tile Source | CARTO Dark Matter | Free vector tiles (no API key) |
-| Styling | Custom CSS (Flexbox) | Responsive UI |
+**Problem:** Moving slider right showed earlier dates (descending order).
+
+**Solution:**
+- Dates are sorted **ascending** from the server (`ORDER BY date ASC`)
+- Slider `value=0` → oldest date (left)
+- Slider `value=max` → newest date (right)
+- Moving slider **right** always shows **later dates**
+
+Client-side guard:
+```javascript
+if (dates.length > 1 && dates[0] > dates[1]) {
+    console.warn('Dates were descending, reversing');
+    dates = dates.reverse();
+}
+```
+
+## API Endpoints
+
+### Date Endpoints (Separate by Source)
+
+| Endpoint | Table | Response |
+|----------|-------|----------|
+| `GET /api/dates/predictions` | `predictions` | `{ "dates": ["2020-01-01", "2020-01-15", ...] }` |
+| `GET /api/dates/temporal` | `temporal_features` | `{ "dates": ["2020-01-01", "2020-01-15", ...] }` |
+
+### Map 1: Predictions (Primary)
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/predictions?date=YYYY-MM-DD` | H3 predictions for date |
+| `GET /api/predictions/cube` | Full history for animation |
+| `GET /api/analytics/prediction/hex/<h3>` | Time-series for single hex |
+
+**Response format:**
+```json
+[
+  { "hex": "-8608933471623168", "risk": 0.42, "fatalities": 1.2 }
+]
+```
+
+### Map 2: Temporal Features
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/temporal_feature?feature=<name>&date=YYYY-MM-DD` | Single feature layer |
+| `GET /api/temporal_features/list` | Available features by category |
+| `GET /api/analytics/temporal/hex/<h3>?feature=<name>` | Time-series for hex |
+
+**Allowed features:**
+- Environmental: `chirps_precip_anomaly`, `era5_temp_anomaly`, `ndvi_anomaly`, etc.
+- Conflict: `fatalities_14d_sum`, `protest_count_lag1`, `riot_count_lag1`, etc.
+- GDELT: `gdelt_event_count`, `gdelt_avg_tone`, `gdelt_goldstein_mean`
+- Market: `price_maize`, `price_rice`, `price_oil`, etc.
+- Macroeconomics: `gold_price_usd_lag1`, `oil_price_usd_lag1`, etc.
+
+### Map 3: Static Features
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/static_feature?feature=<name>` | Static feature layer |
+| `GET /api/static_features/list` | Available features |
+
+**Allowed features:**
+- Distance: `dist_to_capital`, `dist_to_border`, `dist_to_road`, `dist_to_city`
+- Geographic: `elevation_mean`, `slope_mean`
+- Population: `population`, `pop_density`
+
+## Color Schemes
+
+| Map | Ramp | Visual |
+|-----|------|--------|
+| Predictions | Light rose → Dark red | Risk probability |
+| Temporal (varies) | Feature-dependent | See code for mappings |
+| Static | Light lavender → Dark purple | Consistent single-hue |
+
+**Normalization:** All features use 5th-95th percentile clipping before color mapping.
 
 ## Quick Start
 
@@ -62,11 +125,10 @@ cd dashboard
 pip install -r requirements_dashboard.txt
 ```
 
-### 2. Configure Database Connection
-
-Ensure your `.env` file (in the project root) contains:
+### 2. Configure Database
 
 ```env
+# .env
 DB_HOST=localhost
 DB_PORT=5433
 DB_NAME=thesis_db
@@ -74,177 +136,99 @@ DB_USER=postgres
 DB_PASS=your_password
 ```
 
-### 3. Run the Server
+### 3. Run Server
 
 ```bash
-# From the dashboard directory
 python app.py
-```
-
-Server runs on: **http://localhost:8000**
-
-### 4. Open the Dashboard
-
-Navigate to: **http://localhost:8000**
-
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Serve dashboard HTML |
-| `/api/health` | GET | Health check |
-| `/api/h3_data` | GET | H3 hexagons with risk scores |
-| `/api/predictions` | GET | Full predictions with geometry (GeoJSON) |
-| `/api/data/predictions` | GET | Lightweight predictions (data only) |
-| `/api/features/hexgrid` | GET | H3 grid geometries only |
-| `/api/roads` | GET | Road geometries (cached) |
-| `/api/rivers` | GET | River geometries (cached) |
-| `/api/events` | GET | ACLED conflict events |
-| `/api/stats` | GET | Summary statistics |
-
-### Query Parameters
-
-**`/api/predictions`**
-- `date` (optional): Target date (YYYY-MM-DD)
-- `horizon` (optional): Forecast horizon (`14d`, `1m`, `3m`)
-
-**`/api/events`**
-- `start_date` (optional): Filter start (YYYY-MM-DD)
-- `end_date` (optional): Filter end (YYYY-MM-DD)
-- `limit` (optional): Max results (default: 1000, max: 5000)
-
-## Features
-
-### Interactive Map
-- **H3 Hexagon Layer**: Color-coded by conflict probability (YlOrRd scale)
-- **Layer Toggles**: Show/hide roads, rivers, conflict events
-- **Hover Tooltips**: View cell-level predictions
-- **Responsive Sidebar**: Controls and legend
-
-### Layer Controls
-- ✅ Conflict Risk (H3) - Hexagonal risk visualization
-- ☐ GRIP4 Roads - Transportation network
-- ☐ Rivers - Hydrological features  
-- ☐ Conflict Events - ACLED point events
-
-### Status Indicators
-- 🟢 Connected - API healthy
-- 🟡 Connecting - Loading
-- 🔴 Disconnected - API unavailable
-
-## File Structure
-
-```
-dashboard/
-├── app.py                    # Flask backend (refactored)
-├── index.html                # Simplified responsive layout
-├── script.js                 # MapboxOverlay + async/await
-├── style.css                 # Flexbox architecture
-├── requirements_dashboard.txt # Python dependencies
-└── README.md                 # This file
+# Server: http://localhost:8000
 ```
 
 ## Database Schema
 
-The dashboard expects these tables in the `car_cewp` schema:
-
 ### Required Tables
 
 ```sql
--- Static features (required for hexgrid)
-CREATE TABLE car_cewp.features_static (
-    h3_index BIGINT PRIMARY KEY
-);
-
--- Predictions (optional - mock data generated if missing)
-CREATE TABLE car_cewp.predictions_latest (
+-- Model predictions (Map 1 source)
+CREATE TABLE car_cewp.predictions (
     h3_index BIGINT,
     date DATE,
     prob_conflict_3m FLOAT,
     expected_fatalities_3m FLOAT,
     PRIMARY KEY (h3_index, date)
 );
-```
 
-### Optional Tables
-
-```sql
--- Rivers
-CREATE TABLE car_cewp.rivers (
-    hyriv_id INTEGER PRIMARY KEY,
-    geometry GEOMETRY(LineString, 32634)
+-- Time-varying features (Map 2 source)
+CREATE TABLE car_cewp.temporal_features (
+    h3_index BIGINT,
+    date DATE,
+    chirps_precip_anomaly FLOAT,
+    era5_temp_anomaly FLOAT,
+    ndvi_anomaly FLOAT,
+    fatalities_14d_sum FLOAT,
+    -- ... other temporal columns
+    PRIMARY KEY (h3_index, date)
 );
 
--- Roads (tries multiple table names)
-CREATE TABLE car_cewp.grip4_roads_h3 (
-    gid SERIAL PRIMARY KEY,
-    geometry GEOMETRY(LineString, 32634)
-);
-
--- ACLED Events
-CREATE TABLE car_cewp.acled_events (
-    event_id_cnty TEXT PRIMARY KEY,
-    event_date DATE,
-    event_type TEXT,
-    sub_event_type TEXT,
-    fatalities INTEGER,
-    latitude FLOAT,
-    longitude FLOAT
+-- Static features (Map 3 source)
+CREATE TABLE car_cewp.features_static (
+    h3_index BIGINT PRIMARY KEY,
+    dist_to_capital FLOAT,
+    dist_to_border FLOAT,
+    elevation_mean FLOAT,
+    population FLOAT,
+    -- ... other static columns
 );
 ```
+
+## File Structure
+
+```
+dashboard/
+├── app.py                      # Flask backend (strict endpoints)
+├── index.html                  # Three-tab UI
+├── script.js                   # Three isolated Deck.gl instances
+├── style.css                   # Modern styling
+├── requirements_dashboard.txt  # Dependencies
+└── README.md                   # This file
+```
+
+## What Changed (v2.0)
+
+### Removed
+- ❌ Mixed `/api/h3_data` endpoint (combined sources)
+- ❌ Mixed `/api/dates` endpoint
+- ❌ Mixed `/api/analytics/hex/<h3>` (combined predictions + drivers)
+- ❌ Mock/fallback data generation
+- ❌ Descending date sorting (caused slider bug)
+
+### Added
+- ✅ `/api/dates/predictions` — predictions dates only
+- ✅ `/api/dates/temporal` — temporal dates only
+- ✅ `/api/predictions` — predictions data only
+- ✅ `/api/temporal_feature` — single temporal feature only
+- ✅ `/api/static_feature` — single static feature only
+- ✅ `/api/analytics/prediction/hex/<h3>` — prediction history only
+- ✅ `/api/analytics/temporal/hex/<h3>` — temporal history only
+- ✅ Feature allowlists with strict validation
+- ✅ Ascending date sorting (slider fix)
+- ✅ Three isolated map instances with separate state
+- ✅ Feature-dependent color ramps
 
 ## Troubleshooting
 
-### "Invisible Hexagons"
-The refactored `ensure_signed_h3()` function handles:
-- Hex strings (e.g., `'852a104ffffffff'`)
-- Unsigned integers from DB
-- Converts to signed 64-bit int for Deck.gl
+### "Feature not in allowlist"
+- Only allowlisted features can be queried (security)
+- Check `/api/temporal_features/list` or `/api/static_features/list`
 
-### "Database connection failed"
-- Verify PostgreSQL is running
-- Check `.env` credentials
-- For WSL: ensure Windows host IP is routable
+### "Slider still shows wrong direction"
+- Clear browser cache
+- Check console for "Dates were descending" warning
+- Verify `/api/dates/*` returns ascending order
 
-### "No prediction data"
-- Dashboard generates mock data if `predictions_latest` doesn't exist
-- Run the modeling pipeline to generate actual predictions
-
-### "Roads/Rivers not showing"
-- Check tables exist: `SELECT to_regclass('car_cewp.rivers')`
-- Backend tries multiple table names for roads
-
-## Development
-
-### Adding New Layers
-
-1. Add data fetching function in `script.js`:
-```javascript
-async function fetchCustomData() {
-    const response = await fetch(`${API_URL}/custom`);
-    return await response.json();
-}
-```
-
-2. Add layer creation function:
-```javascript
-function createCustomLayer(data) {
-    return new deck.GeoJsonLayer({
-        id: 'custom-layer',
-        data: data,
-        // ... options
-    });
-}
-```
-
-3. Add to `renderLayers()`:
-```javascript
-if (layersState.custom && cachedData.custom) {
-    layers.push(createCustomLayer(cachedData.custom));
-}
-```
-
-4. Add toggle in `index.html` and listener in `setupToggleListeners()`
+### "Map shows no data"
+- Check `/api/health` for table status
+- Ensure tables have data for the selected date
+- No fallback data is generated — empty = truly empty
 
 ## License
 

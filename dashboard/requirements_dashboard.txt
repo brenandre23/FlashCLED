@@ -1,29 +1,27 @@
-# CEWP Dashboard Requirements
+# CEWP Dashboard Requirements - Production
 # Install with: pip install -r requirements_dashboard.txt
 
-# Web Framework (Flask-based backend)
+# --- Production Server (MISSING IN YOUR UPLOAD) ---
+gunicorn>=21.2.0
+
+# --- Web Framework ---
 flask>=3.0.0
 flask-cors>=4.0.0
 
-# Database
+# --- Database & Spatial ---
 sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.9
 geoalchemy2>=0.14.0
 
-# Data Processing
+# --- Data Science Core ---
 pandas>=2.0.0
 geopandas>=0.14.0
 numpy>=1.24.0
 shapely>=2.0.0
 
-# H3 Spatial Index
+# --- H3 Spatial Index ---
 h3>=3.7.6
 
-# Environment
+# --- Utilities ---
 python-dotenv>=1.0.0
-
-# Optional: Fast JSON serialization
-orjson>=3.9.0
-
-# Optional: Development
-httpx>=0.26.0  # For testing
+orjson>=3.9.0      # Required for the Data Cube optimization
