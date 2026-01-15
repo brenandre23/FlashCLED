@@ -234,7 +234,8 @@ def process_year_batch(year: int, all_cells: list, collections_cfg: dict, window
 
                         daily_rows.append({
                             "h3_index": h3_idx,
-                            "date": start_dt.strftime("%Y-%m-%d"),
+                            # Shift window label forward one step so [T, T+13] is stored at T+14
+                            "date": (start_dt + timedelta(days=14)).strftime("%Y-%m-%d"),
                             "precip_mean_depth_mm": get_prop(c_props, ["precip_depth_mm", "precip_depth_mm_mean"]),
                             "temp_mean": get_prop(c_props, ["temp", "temp_mean"]),
                             "dew_mean": get_prop(c_props, ["dew", "dew_mean"]),
