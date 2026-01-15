@@ -52,7 +52,7 @@ FlashCLED/
 
 # 3. Manual Downloads
 
-A. ACLED Data
+# A. ACLED Data
 
 Go to the ACLED Export Tool.
 
@@ -91,3 +91,4 @@ Why? The pipeline's legacy spatial_disaggregation.py logic looks for an "Admin 3
 Google BigQuery (GDELT): The pipeline queries the public GDELT dataset. This falls under the BigQuery free tier (1TB/month), but repeated full-history ingestion may incur costs. The pipeline implements caching to minimize this.
 
 Google Earth Engine: Requires an enabled GEE account linked to your Google Cloud Project.
+
