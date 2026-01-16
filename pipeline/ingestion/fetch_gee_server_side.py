@@ -6,6 +6,7 @@ Purpose: Server-side environmental data aggregation.
 UPDATES:
 - Uses centralized 'init_gee' from utils.py for silent Service Account auth.
 - DYNAMIC END DATE: Automatically trims query to data availability.
+- PUBLICATION LAG: Config-driven via data.yaml publication_lag_steps.
 """
 
 import sys
@@ -24,7 +25,6 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-# Import centralized auth function
 from utils import logger, get_db_engine, load_configs, upload_to_postgis, ensure_h3_int64, init_gee
 
 # --- Constants ---
@@ -37,6 +37,26 @@ MAX_WORKERS = 12
 H3_BATCH_SIZE = 300
 MAX_RETRIES = 5
 BATCH_SLEEP = 1
+
+
+def get_publication_lag_days(data_cfg, features_cfg):
+    """
+    Calculate publication lag in days from config.
+    
+    Reads:
+      - data.yaml:     gee.publication_lag_steps (default: 1)
+      - features.yaml: temporal.step_days (default: 14)
+    
+    Returns:
+      int: Number of days to shift stored dates forward
+    """
+    step_days = features_cfg.get('temporal', {}).get('step_days', 14)
+    lag_steps = data_cfg.get('gee', {}).get('publication_lag_steps', 1)
+    lag_days = lag_steps * step_days
+    
+    logger.info(f"Publication lag: {lag_steps} steps × {step_days} days = {lag_days} days")
+    return lag_days
+
 
 # -------------------------------------------------------------------------
 # 1. DATABASE & TYPE HELPERS
@@ -66,6 +86,7 @@ def ensure_environmental_table_exists(engine, schema="car_cewp"):
         conn.execute(create_sql)
     logger.info(f"✓ Table {schema}.environmental_features is ready.")
 
+
 def get_h3_grid_data(engine):
     logger.info("Loading H3 Grid from PostGIS...")
     sql = f"SELECT to_hex(h3_index::bigint) AS h3_id, ST_AsGeoJSON(geometry) AS geom FROM {SCHEMA}.{GRID_TABLE}"
@@ -74,9 +95,11 @@ def get_h3_grid_data(engine):
     logger.info(f"Loaded {len(grid_data)} H3 cells.")
     return grid_data
 
+
 def make_ee_feature_collection(grid_subset):
     features = [ee.Feature(ee.Geometry(c['geom']), {"h3_index": c['h3_id']}) for c in grid_subset]
     return ee.FeatureCollection(features)
+
 
 # -------------------------------------------------------------------------
 # 2. DATE LOGIC & DYNAMIC LIMITS
@@ -93,6 +116,7 @@ def get_collection_last_date(collection_id):
         logger.warning(f"Could not verify end date for {collection_id}: {e}")
     return None
 
+
 def build_14day_spine(start_year: int, end_year: int):
     epoch = datetime(2000, 1, 1)
     req_start = datetime(start_year, 1, 1)
@@ -106,14 +130,17 @@ def build_14day_spine(start_year: int, end_year: int):
         curr += timedelta(days=14)
     return spine
 
+
 def window_strs(start_dt: datetime, end_dt: datetime):
     return start_dt.strftime("%Y-%m-%d"), (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
 
 def get_prop(props: dict, keys, default=None):
     for k in keys:
         if k in props and props[k] is not None:
             return props[k]
     return default
+
 
 # -------------------------------------------------------------------------
 # 3. GEE PROCESSING LOGIC
@@ -152,6 +179,7 @@ def get_water_image(start_dt, end_dt):
         .rename("water")
         .toByte()
     )
+
 
 def process_single_batch(batch_cells, s_str, e_excl_str, collections_cfg, start_dt, end_dt):
     chirps_id = collections_cfg.get("chirps", "UCSB-CHG/CHIRPS/DAILY")
@@ -198,12 +226,19 @@ def process_single_batch(batch_cells, s_str, e_excl_str, collections_cfg, start_
                 time.sleep(2)
     raise RuntimeError("Worker failed")
 
+
 # -------------------------------------------------------------------------
 # 4. MAIN ORCHESTRATOR
 # -------------------------------------------------------------------------
 
-def process_year_batch(year: int, all_cells: list, collections_cfg: dict, windows, engine):
+def process_year_batch(year: int, all_cells: list, collections_cfg: dict, windows, engine, lag_days: int):
+    """
+    Process a year's worth of windows with publication lag applied.
+    
+    lag_days: Number of days to shift stored date forward (from config)
+    """
     logger.info(f"--- Processing {len(windows)} windows for Year {year} (Parallel: {MAX_WORKERS} threads) ---")
+    logger.info(f"    Publication lag: {lag_days} days")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     out_path = DATA_DIR / f"CEWP_Env_Res5_Year_{year}.csv"
     header_written = out_path.exists()
@@ -232,10 +267,13 @@ def process_year_batch(year: int, all_cells: list, collections_cfg: dict, window
                         h3_idx = props.get("h3_index")
                         c_props = c_map.get(h3_idx, {})
 
+                        # PUBLICATION LAG: Shift stored date forward by lag_days
+                        # Data from window [start_dt, end_dt] becomes "available" at (start_dt + lag_days)
+                        lagged_date = start_dt + timedelta(days=lag_days)
+
                         daily_rows.append({
                             "h3_index": h3_idx,
-                            # Shift window label forward one step so [T, T+13] is stored at T+14
-                            "date": (start_dt + timedelta(days=14)).strftime("%Y-%m-%d"),
+                            "date": lagged_date.strftime("%Y-%m-%d"),
                             "precip_mean_depth_mm": get_prop(c_props, ["precip_depth_mm", "precip_depth_mm_mean"]),
                             "temp_mean": get_prop(c_props, ["temp", "temp_mean"]),
                             "dew_mean": get_prop(c_props, ["dew", "dew_mean"]),
@@ -263,16 +301,20 @@ def process_year_batch(year: int, all_cells: list, collections_cfg: dict, window
 
         gc.collect()
 
+
 def run(configs, engine):
     data_cfg = configs["data"]
+    features_cfg = configs["features"]
     project_id = data_cfg["gee"]["project_id"]
     g_start = int(data_cfg["global_date_window"]["start_date"][:4])
     g_end = int(data_cfg["global_date_window"]["end_date"][:4])
 
     ensure_environmental_table_exists(engine)
     
+    # --- GET PUBLICATION LAG FROM CONFIG ---
+    lag_days = get_publication_lag_days(data_cfg, features_cfg)
+    
     # --- AUTHENTICATE ---
-    # This now uses the Service Account method if key is available
     init_gee(project_id)
 
     era5_id = data_cfg["gee"]["collections"].get("era5", "ECMWF/ERA5_LAND/HOURLY")
@@ -299,15 +341,24 @@ def run(configs, engine):
         out_path = DATA_DIR / f"CEWP_Env_Res5_Year_{year}.csv"
         processed = set()
         if out_path.exists():
-            try: processed = set(pd.read_csv(out_path, usecols=["date"])["date"].unique())
-            except: pass
+            try:
+                existing_df = pd.read_csv(out_path, usecols=["date"])
+                processed = set(existing_df["date"].unique())
+            except:
+                pass
 
-        windows_to_run = [w for w in valid_spine if w[0].strftime("%Y-%m-%d") not in processed]
+        # Check against LAGGED dates (what we would store)
+        windows_to_run = []
+        for w in valid_spine:
+            lagged_date = (w[0] + timedelta(days=lag_days)).strftime("%Y-%m-%d")
+            if lagged_date not in processed:
+                windows_to_run.append(w)
 
         if windows_to_run:
-            process_year_batch(year, all_cells, data_cfg["gee"]["collections"], windows_to_run, engine)
+            process_year_batch(year, all_cells, data_cfg["gee"]["collections"], windows_to_run, engine, lag_days)
         else:
             logger.info(f"Year {year} complete.")
+
 
 if __name__ == "__main__":
     cfgs = load_configs()

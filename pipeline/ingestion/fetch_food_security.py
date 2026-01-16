@@ -2,7 +2,11 @@
 ingest_food_security.py
 =======================
 Consolidated Food Security Ingestion.
-FIXED: Parsing logic now handles both (lat,lon) and [lat,lon] centroid formats.
+
+UPDATES:
+- FIXED: Parsing logic now handles both (lat,lon) and [lat,lon] centroid formats.
+- PUBLICATION LAG: Config-driven via data.yaml fews_net.publication_lag_steps.
+  FEWS NET prices have ~45-60 day publication delay (4 steps × 14 days = 56 days).
 """
 
 import sys
@@ -23,8 +27,27 @@ from utils import logger, upload_to_postgis, load_configs, get_db_engine
 
 SCHEMA = "car_cewp"
 TABLE_PRICES = "food_security"
-# TABLE_IPC removed - static/irrelevant for dynamic modeling
 TABLE_LOCATIONS = "market_locations"
+
+
+def get_publication_lag_days(data_cfg, features_cfg):
+    """
+    Calculate publication lag in days from config.
+    
+    Reads:
+      - data.yaml:     fews_net.publication_lag_steps (default: 4)
+      - features.yaml: temporal.step_days (default: 14)
+    
+    Returns:
+      int: Number of days to shift stored dates forward
+    """
+    step_days = features_cfg.get('temporal', {}).get('step_days', 14)
+    lag_steps = data_cfg.get('fews_net', {}).get('publication_lag_steps', 4)
+    lag_days = lag_steps * step_days
+    
+    logger.info(f"Food Security publication lag: {lag_steps} steps × {step_days} days = {lag_days} days")
+    return lag_days
+
 
 # --- AUTHENTICATION HELPER ---
 def get_fews_token():
@@ -37,6 +60,7 @@ def get_fews_token():
     response = requests.post(auth_url, json={"username": username, "password": password}, timeout=30)
     response.raise_for_status()
     return response.json().get("token")
+
 
 def ensure_tables_exist(engine):
     logger.info("Verifying Food Security tables...")
@@ -65,8 +89,7 @@ def ensure_tables_exist(engine):
                 PRIMARY KEY (date, market, commodity, indicator)
             );
         """))
-        
-        # IPC table removed - static/irrelevant for dynamic modeling
+
 
 def fetch_all_pages(url, params, headers, label="Data"):
     all_results = []
@@ -89,6 +112,7 @@ def fetch_all_pages(url, params, headers, label="Data"):
             logger.error(f"  Error fetching {label}: {e}")
             break
     return all_results
+
 
 def fetch_market_locations_remote(engine, data_config):
     url = data_config.get("fews_net", {}).get("markets_geojson_url")
@@ -157,8 +181,18 @@ def fetch_market_locations_remote(engine, data_config):
     
     return market_lookup
 
-def fetch_fews_market_prices(data_config, market_lookup, auth_token):
+
+def fetch_fews_market_prices(data_config, features_config, market_lookup, auth_token):
+    """
+    Fetch market prices and apply publication lag.
+    
+    FEWS NET prices are collected monthly but published with ~45-60 day delay.
+    We shift dates forward by the configured lag to ensure operational validity.
+    """
     if not auth_token: return pd.DataFrame()
+    
+    # Get publication lag from config
+    lag_days = get_publication_lag_days(data_config, features_config)
     
     url = "https://fdw.fews.net/api/marketpricefacts/"
     start_date = data_config.get("global_date_window", {}).get("start_date", "2015-01-01")
@@ -190,18 +224,21 @@ def fetch_fews_market_prices(data_config, market_lookup, auth_token):
         if not commodity and p.get("dataseries_name"):
             ds_parts = [x.strip() for x in str(p.get("dataseries_name")).split(",")]
             
-            # CRITICAL CHECK: Is the first part just the market name?
-            # If ds_name is "Bambari, Maize (White)", parts[0] is "Bambari"
             if len(ds_parts) > 1 and (ds_parts[0] == m_name or ds_parts[0] in market_lookup.values()):
-                commodity = ds_parts[1] # Take the second part
+                commodity = ds_parts[1]
             else:
-                commodity = ds_parts[0] # Take the first part
+                commodity = ds_parts[0]
 
         if not commodity: commodity = "Unknown"
         
         if date and val is not None:
+            # PUBLICATION LAG: Shift date forward by lag_days
+            # Prices observed on 'date' become "available" at (date + lag_days)
+            original_date = pd.to_datetime(date)
+            lagged_date = original_date + pd.Timedelta(days=lag_days)
+            
             records.append({
-                "date": pd.to_datetime(date).date(),
+                "date": lagged_date.date(),
                 "market": m_name,  
                 "commodity": commodity,
                 "indicator": "market_price",
@@ -218,20 +255,24 @@ def fetch_fews_market_prices(data_config, market_lookup, auth_token):
         'value': 'mean', 'currency': 'first', 'unit': 'first', 'source': 'first'
     })
     
-    logger.info(f"Loaded {len(df_fused)} price records. Sample commodities: {df_fused['commodity'].unique()[:5]}")
+    logger.info(f"Loaded {len(df_fused)} price records (with {lag_days}-day publication lag applied).")
+    logger.info(f"Sample commodities: {df_fused['commodity'].unique()[:5]}")
     return df_fused
 
-# IPC fetch function removed - static/irrelevant for dynamic modeling
 
 def run(configs, engine):
-    logger.info("FOOD SECURITY INGESTION (Corrected Parsing)")
+    logger.info("FOOD SECURITY INGESTION (With Publication Lag)")
     token = get_fews_token()
     ensure_tables_exist(engine)
     
-    market_lookup = fetch_market_locations_remote(engine, configs["data"])
+    # Extract both data and features configs
+    data_cfg = configs.get("data", configs)
+    features_cfg = configs.get("features", {})
     
-    # Prices
-    df_prices = fetch_fews_market_prices(configs["data"], market_lookup, token)
+    market_lookup = fetch_market_locations_remote(engine, data_cfg)
+    
+    # Prices - now with publication lag
+    df_prices = fetch_fews_market_prices(data_cfg, features_cfg, market_lookup, token)
     if not df_prices.empty:
         df_prices = df_prices.drop_duplicates(subset=["date", "market", "commodity"])
         upload_to_postgis(engine, df_prices, TABLE_PRICES, SCHEMA, ["date", "market", "commodity", "indicator"])
@@ -239,14 +280,19 @@ def run(configs, engine):
     else:
         logger.warning("No Market Price data loaded.")
 
+
 def main():
     try:
         cfgs = load_configs()
-        configs = {"data": cfgs[0]} if isinstance(cfgs, tuple) else cfgs
+        if isinstance(cfgs, tuple):
+            configs = {"data": cfgs[0], "features": cfgs[1], "models": cfgs[2]}
+        else:
+            configs = cfgs
         engine = get_db_engine()
         run(configs, engine)
     finally:
         if 'engine' in locals(): engine.dispose()
+
 
 if __name__ == "__main__":
     main()

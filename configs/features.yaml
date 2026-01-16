@@ -17,6 +17,26 @@ temporal:
       steps: 2.14
     half_life_90d:
       steps: 6.43
+  # Publication lags by source (in steps)
+  # Applied at ingestion to ensure operational validity
+  publication_lags:
+    GEE: 1              # ERA5 ~5-7 days, CHIRPS ~2-3 days
+    DynamicWorld: 1     # Sentinel-2 ~2-5 days latency
+    CHIRPS: 1
+    ERA5: 1
+    MODIS: 1
+    VIIRS: 1
+    JRC_Landsat: 1
+    ACLED: 1            # ~6 day weekly release cycle
+    ACLED_Hybrid: 1
+    GDELT: 0            # Near real-time (<1 hour)
+    Food_Security: 4    # ~45-60 day delay
+    IOM_DTM: 2          # ~2-4 week delay
+    Economy: 1          # End-of-day close
+    IODA: 0             # Near real-time
+    EPR: 0              # Static/historical
+    WorldPop: 0         # Annual static
+    Static_Geography: 0
 imputation:
   defaults:
     method: "forward_fill"
@@ -39,6 +59,10 @@ registry:
   source: CHIRPS
   transformation: mean
   output_col: chirps_precip_mean
+# - raw: precip_mean_depth_mm
+#   source: CHIRPS
+#   transformation: mean
+#   output_col: chirps_precip_mean  # not in current temporal_features
 - raw: temp_mean
   source: ERA5
   transformation: anomaly
@@ -47,6 +71,10 @@ registry:
   source: ERA5
   transformation: mean
   output_col: era5_temp_mean
+# - raw: temp_mean
+#   source: ERA5
+#   transformation: mean
+#   output_col: era5_temp_mean  # not in current temporal_features
 - raw: soil_moisture_mean
   source: ERA5
   transformation: anomaly
@@ -55,6 +83,10 @@ registry:
   source: ERA5
   transformation: mean
   output_col: era5_soil_moisture_mean
+# - raw: soil_moisture_mean
+#   source: ERA5
+#   transformation: mean
+#   output_col: era5_soil_moisture_mean  # not in current temporal_features
 - raw: ndvi_max
   source: MODIS
   transformation: anomaly
@@ -67,6 +99,31 @@ registry:
   source: VIIRS
   transformation: mean
   output_col: nightlights_intensity
+# Dynamic World Land Cover (Sentinel-2)
+- raw: dw_grass_frac
+  source: DynamicWorld
+  transformation: none
+  output_col: landcover_grass
+  description: "Grassland/savanna fraction - pastoralist zones"
+- raw: dw_crops_frac
+  source: DynamicWorld
+  transformation: none
+  output_col: landcover_crops
+  description: "Cultivated land fraction - farmer-herder interface"
+- raw: dw_trees_frac
+  source: DynamicWorld
+  transformation: none
+  output_col: landcover_trees
+  description: "Forest/woodland fraction - remote areas, rebel hideouts"
+- raw: dw_bare_frac
+  source: DynamicWorld
+  transformation: none
+  output_col: landcover_bare
+  description: "Bare ground fraction - mining activity proxy"
+- raw: landcover_avail
+  source: DynamicWorld
+  transformation: none
+  output_col: landcover_avail
 - raw: month_sin
   source: Temporal
   transformation: none
@@ -131,6 +188,14 @@ registry:
   source: IODA
   transformation: none
   output_col: ioda_data_available_flag
+- raw: ioda_outage_score
+  source: IODA
+  transformation: none
+  output_col: ioda_outage_score
+- raw: ioda_outage_score
+  source: IODA
+  transformation: lag_1_step
+  output_col: ioda_outage_score_lag1
 - raw: cw_score_local
   source: CrisisWatch
   transformation: none
@@ -345,14 +410,6 @@ registry:
   source: GDELT
   transformation: none
   output_col: gdelt_mentions_total
-- raw: ioda_outage_score
-  source: IODA
-  transformation: none
-  output_col: ioda_outage_score
-- raw: ioda_outage_score
-  source: IODA
-  transformation: lag_1_step
-  output_col: ioda_outage_score_lag1
 - raw: water_local_max
   source: JRC_Landsat
   transformation: none

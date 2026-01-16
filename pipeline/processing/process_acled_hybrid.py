@@ -8,6 +8,10 @@ Methodology: Semi-Supervised Semantic Projection
 2. RESIDUAL CLUSTERING: Clusters the 'Context' of events, automatically 
    labeling topics based on TF-IDF centroids.
 
+UPDATES:
+- PUBLICATION LAG: Config-driven via data.yaml acled_hybrid.publication_lag_steps.
+  ACLED has ~6 day release cycle (1 step × 14 days = 14 days).
+
 Output: Continuous risk scores (0.0-1.0) rather than binary flags.
 """
 
@@ -27,10 +31,10 @@ from sqlalchemy import text
 # --- Setup ---
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT_DIR))
-from utils import logger, get_db_engine, upload_to_postgis, SCHEMA
+from utils import logger, get_db_engine, upload_to_postgis, SCHEMA, load_configs
 
 # --- CONFIG ---
-MODEL_NAME = "all-MiniLM-L6-v2" # Fast, efficient sentence transformer
+MODEL_NAME = "all-MiniLM-L6-v2"  # Fast, efficient sentence transformer
 N_CLUSTERS = 8 
 BATCH_SIZE = 64
 
@@ -79,6 +83,26 @@ DRIVERS = {
     }
 }
 
+
+def get_publication_lag_days(data_cfg, features_cfg):
+    """
+    Calculate publication lag in days from config.
+    
+    Reads:
+      - data.yaml:     acled_hybrid.publication_lag_steps (default: 1)
+      - features.yaml: temporal.step_days (default: 14)
+    
+    Returns:
+      int: Number of days to shift stored dates forward
+    """
+    step_days = features_cfg.get('temporal', {}).get('step_days', 14)
+    lag_steps = data_cfg.get('acled_hybrid', {}).get('publication_lag_steps', 1)
+    lag_days = lag_steps * step_days
+    
+    logger.info(f"ACLED Hybrid publication lag: {lag_steps} steps × {step_days} days = {lag_days} days")
+    return lag_days
+
+
 # -----------------------------------------------------------------------------
 # 1. CORE LOGIC
 # -----------------------------------------------------------------------------
@@ -87,6 +111,7 @@ def get_device():
     if torch.cuda.is_available(): return "cuda"
     elif torch.backends.mps.is_available(): return "mps"
     return "cpu"
+
 
 def compute_soft_scores(model, texts, driver_anchors):
     """
@@ -101,9 +126,10 @@ def compute_soft_scores(model, texts, driver_anchors):
     # Cosine Similarity (Events x Anchors)
     # We take the MAX similarity to any of the anchors for that driver
     sim_matrix = cosine_similarity(event_embeddings, anchor_embeddings)
-    scores = np.max(sim_matrix, axis=1) # Max across anchors
+    scores = np.max(sim_matrix, axis=1)  # Max across anchors
     
     return scores, event_embeddings
+
 
 def get_cluster_labels(df, vectorizer, n_top_words=3):
     """
@@ -122,8 +148,7 @@ def get_cluster_labels(df, vectorizer, n_top_words=3):
             labels_map[label] = f"theme_minor_{label}"
             continue
             
-        # Fit TF-IDF on this cluster vs others (conceptually)
-        # Simply getting top words for this cluster
+        # Fit TF-IDF on this cluster
         tfidf = vectorizer.fit_transform(cluster_text)
         feature_names = np.array(vectorizer.get_feature_names_out())
         
@@ -138,6 +163,7 @@ def get_cluster_labels(df, vectorizer, n_top_words=3):
         
     return labels_map
 
+
 # -----------------------------------------------------------------------------
 # 2. PIPELINE
 # -----------------------------------------------------------------------------
@@ -146,8 +172,6 @@ def process_data(df):
     if df.empty: return df
 
     # A. Cleaning (Keep syntax for BERT, but lower case)
-    # Unlike Masters-level, we DO NOT remove stop words for the embeddings 
-    # because Transformers need context ("Man kills bear" != "Bear kills man")
     df['notes_clean'] = df['notes'].astype(str).fillna("").str.lower().str.strip()
     
     # B. Init Model
@@ -171,24 +195,19 @@ def process_data(df):
         if all_embeddings is None: all_embeddings = embeddings
             
         # 3. Ensemble (Soft Voting)
-        # Logic: If Regex finds it, it's a 1.0. If not, we trust the semantic score.
-        # We boost the semantic score slightly to make it impactful.
         final_score = np.maximum(regex_score, semantic_score)
         
         # 4. Filter Noise (Clip low semantic matches that aren't regex matches)
-        # If score < 0.25 and regex is 0, it's probably noise.
         final_score = np.where((regex_score == 0) & (final_score < 0.25), 0.0, final_score)
         
         df[driver] = final_score
 
     # D. Residual Clustering (The "Context")
-    # We cluster the embeddings to find themes NOT captured by drivers
     logger.info("🔍 Clustering Contextual Themes...")
     kmeans = MiniBatchKMeans(n_clusters=N_CLUSTERS, random_state=42, batch_size=256)
     df['cluster_id'] = kmeans.fit_predict(all_embeddings)
     
     # E. Dynamic Labeling
-    # We use TF-IDF just for naming the clusters, strictly removing stop words here
     tfidf_vec = TfidfVectorizer(stop_words='english', max_features=1000)
     cluster_names = get_cluster_labels(df, tfidf_vec)
     
@@ -199,7 +218,13 @@ def process_data(df):
 
     return df
 
-def aggregate_and_upload(df, engine):
+
+def aggregate_and_upload(df, engine, lag_days):
+    """
+    Aggregate driver scores and upload with publication lag applied.
+    
+    lag_days: Number of days to shift stored date forward (from config)
+    """
     # Select columns
     driver_cols = list(DRIVERS.keys())
     theme_cols = [c for c in df.columns if c.startswith('theme_ctx_')]
@@ -209,8 +234,13 @@ def aggregate_and_upload(df, engine):
     logger.info(f"📉 Aggregating {len(feature_cols)} features (Summing Probabilities)...")
     
     # Group by Date/Location
-    # Note: Summing probabilities works as an "Intensity" score per day/cell
     df_agg = df.groupby(['event_date', 'h3_index'])[feature_cols].sum().reset_index()
+    
+    # PUBLICATION LAG: Shift event_date forward by lag_days
+    # Events occurring on 'event_date' become "available" at (event_date + lag_days)
+    df_agg['event_date'] = pd.to_datetime(df_agg['event_date']) + pd.Timedelta(days=lag_days)
+    
+    logger.info(f"Applied {lag_days}-day publication lag to event dates.")
     
     # Rename for DB safety (truncate long generated names if needed)
     df_agg.columns = [c.replace(" ", "_") for c in df_agg.columns]
@@ -234,8 +264,23 @@ def aggregate_and_upload(df, engine):
     upload_to_postgis(engine, df_agg, "features_acled_hybrid", "car_cewp", 
                      primary_keys=['event_date', 'h3_index'])
 
-def run():
+
+def run(configs=None):
     engine = get_db_engine()
+    
+    # Load configs if not provided
+    if configs is None:
+        cfgs = load_configs()
+        if isinstance(cfgs, tuple):
+            configs = {"data": cfgs[0], "features": cfgs[1], "models": cfgs[2]}
+        else:
+            configs = cfgs
+    
+    data_cfg = configs.get("data", {})
+    features_cfg = configs.get("features", {})
+    
+    # Get publication lag from config
+    lag_days = get_publication_lag_days(data_cfg, features_cfg)
     
     # Fetch Data (Standard ACLED fetch)
     query = """
@@ -243,7 +288,6 @@ def run():
         FROM car_cewp.acled_events 
         WHERE notes IS NOT NULL
     """
-    # In production, add: AND event_date > (SELECT max(event_date) FROM features_acled_hybrid)
     
     try:
         df = pd.read_sql(query, engine)
@@ -251,11 +295,12 @@ def run():
         
         if not df.empty:
             df_processed = process_data(df)
-            aggregate_and_upload(df_processed, engine)
+            aggregate_and_upload(df_processed, engine, lag_days)
             
     except Exception as e:
         logger.error(f"ACLED Hybrid process failed: {e}")
         raise e
+
 
 if __name__ == "__main__":
     run()

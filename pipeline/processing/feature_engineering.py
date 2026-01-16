@@ -28,6 +28,31 @@ from utils import (
 )
 
 
+# ------------------------------------------------------------------------------
+# PUBLICATION LAG UTIL
+# ------------------------------------------------------------------------------
+
+def get_publication_lag_steps(features_config, source_key):
+    """
+    Get publication lag in steps from features.yaml config.
+    
+    Parameters
+    ----------
+    features_config : dict
+        The features configuration dictionary
+    source_key : str
+        Key in publication_lags (e.g., 'ACLED', 'GEE', 'Food_Security')
+        
+    Returns
+    -------
+    int
+        Number of steps to lag (0 if not specified)
+    """
+    temporal_cfg = features_config.get('temporal', {}) if isinstance(features_config, dict) else {}
+    pub_lags = temporal_cfg.get('publication_lags', {})
+    return pub_lags.get(source_key, 0)
+
+
 # ==============================================================================
 # DATA SANITIZATION UTILITIES (FIX FOR SHAP CRASH)
 # ==============================================================================
@@ -425,6 +450,7 @@ def parse_registry(features_config):
     source_map = {
         'CHIRPS': 'environmental', 'ERA5': 'environmental', 
         'MODIS': 'environmental', 'VIIRS': 'environmental', 'JRC_Landsat': 'environmental',
+        'DynamicWorld': 'environmental',  # Land cover fractions
         'ACLED': 'conflict', 'GDELT': 'conflict',
         'NLP_ACLED': 'nlp', 'NLP_CrisisWatch': 'nlp',
         'YahooFinance': 'economic', 'Economy': 'economic',
@@ -797,9 +823,11 @@ def process_food_security(engine, spine, social_specs, feat_cfg):
                 if 'nearest_market' in spine.columns:
                     spine.drop(columns=['nearest_market'], inplace=True)
                 
-                # G. Food Price Index (simple average across available prices)
-                spine['food_price_index'] = spine[price_cols].mean(axis=1, skipna=True)
-                spine['index_exists'] = (spine[price_cols].notna().any(axis=1)).astype(int)
+                # G. Food Price Index (average across available, non-zero prices)
+                price_frame = spine[price_cols]
+                mask = price_frame.gt(0) & price_frame.notna()
+                spine['food_price_index'] = price_frame.where(mask).mean(axis=1, skipna=True)
+                spine['index_exists'] = mask.any(axis=1).astype(int)
                 spine['food_price_index'] = apply_forward_fill(spine, 'food_price_index', config=impute_cfg, domain="economic").fillna(0)
                 spine['index_exists'] = spine['index_exists'].fillna(0)
                 
@@ -1056,6 +1084,10 @@ def process_environment(engine, spine, env_specs, feat_cfg):
     # Create any synthesized/missing raws as NaN so downstream fill can handle
     for raw in synthesized:
         spine[raw] = np.nan
+
+    # DynamicWorld availability flag (data begins 2015-06-27)
+    if any(spec.get('source') == 'DynamicWorld' for spec in env_specs):
+        spine['landcover_avail'] = (spine['date'] >= pd.Timestamp("2015-06-27")).astype(int)
     
     # 3. Calculate Climatology (Baselines) - for anomaly features only
     anomaly_specs = [spec for spec in env_specs if 'anomaly' in spec.get('transformation', '')]
@@ -1361,6 +1393,30 @@ def process_conflict(engine, spine, conflict_specs, features_config):
 
     # 3. Merge onto Spine
     spine = safe_merge(spine, acled_local_agg, on=['h3_index', 'date'], how='left')
+    
+    # --- PUBLICATION LAG: Apply to ACLED feature columns (NOT targets) ---
+    acled_lag_steps = get_publication_lag_steps(features_config, 'ACLED')
+    if acled_lag_steps > 0:
+        logger.info(f"  Applying {acled_lag_steps}-step publication lag to ACLED features...")
+        
+        # Feature columns that need lagging (observed counts)
+        acled_feature_cols = [
+            'fatalities', 'protest_count', 'riot_count',
+            'acled_count_battles', 'acled_count_vac', 'acled_count_explosions',
+            'acled_count_protests', 'acled_count_riots'
+        ]
+        
+        # Apply lag to feature columns only
+        spine = spine.sort_values(['h3_index', 'date'])
+        for col in acled_feature_cols:
+            if col in spine.columns:
+                spine[col] = spine.groupby('h3_index')[col].shift(acled_lag_steps).fillna(0)
+        
+        logger.info(f"  ✓ ACLED features lagged by {acled_lag_steps} step(s)")
+        
+        # NOTE: target_fatalities and target_binary are NOT lagged
+        # They represent what we're predicting, not operational features
+    
     if admin_col in spine.columns:
         spine = safe_merge(spine, acled_regional_agg[[admin_col, 'date', 'regional_risk_score_lag1']], on=[admin_col, 'date'], how='left')
     spine = safe_merge(spine, gdelt_event_agg, on=['h3_index', 'date'], how='left')
@@ -1400,7 +1456,7 @@ def process_conflict(engine, spine, conflict_specs, features_config):
             else:
                 spine[col] = apply_forward_fill(spine, col, config=impute_cfg, domain="conflict")
     
-    # 5. Create fatalities_14d_sum (raw per-step)
+    # 5. Create fatalities_14d_sum (raw per-step) after publication lag is applied
     spine['fatalities_14d_sum'] = spine['fatalities']
 
     # 6. Shock + Stress pipeline with spatial diffusion

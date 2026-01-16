@@ -47,6 +47,7 @@ from pipeline.ingestion import (
     fetch_population,
     fetch_acled,
     fetch_gee_server_side,
+    fetch_dynamic_world,
     fetch_mines,
     fetch_dem,
     fetch_grip4_roads,
@@ -265,6 +266,10 @@ class CEWPPipeline:
 
         # 5. Environmental Variables (Google Earth Engine)
         fetch_gee_server_side.run(self.configs, self.engine)
+
+        # 6. Land Cover (Dynamic World via GEE)
+        logger.info(">> Dynamic World Land Cover")
+        fetch_dynamic_world.run(self.configs, self.engine)
 
         logger.info("✓ Dynamic Ingestion Phase Complete.")
 

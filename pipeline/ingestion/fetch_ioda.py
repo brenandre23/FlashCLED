@@ -2,23 +2,37 @@
 fetch_ioda.py
 =============
 Source: IODA API (Georgia Tech)
-Variable: Active Probing (ping_slash24_up)
-Logic: Hybrid Overlay (National Baseline + Regional Precision)
+Strategy: Event-Based Outage Detection
+
+CRITICAL API NOTE (2024):
+-------------------------
+The IODA API no longer provides raw time-series signals via /v2/signals endpoint.
+Only discrete outage EVENTS are available via /v2/outages/events.
+
+This script converts discrete outage events into a continuous connectivity index
+by aggregating event scores and durations within 14-day temporal windows.
+
+DATA LIMITATIONS FOR CAR:
+- Data starts 2022 (no earlier data available)
+- Only national-level events are meaningful (regional data only exists for Bangui)
+- ~270 events over 2022-2024 = sparse signal
+
+Output Variable: ioda_outage_score
+- Higher values = more/worse outages in the period
+- 0 = no detected outages
 
 ALIGNMENT & CONFIG:
 - Dates: Pulled from data.yaml (global_date_window)
 - Spines: Pulled from features.yaml (temporal.alignment_date, step_days)
-- Logic: Resamples raw 10-min data -> 14-day averages aligned to 2000-01-01.
 """
 
 import sys
 import time
 import requests
 import pandas as pd
-import unicodedata
-import re
+import numpy as np
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 # --- SETUP ---
@@ -30,7 +44,10 @@ except ImportError:
     import logging
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    SCHEMA = "public"
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    logger.addHandler(handler)
+    SCHEMA = "car_cewp"
 
     def load_configs():
         return None
@@ -40,20 +57,20 @@ load_dotenv()
 # --- CONSTANTS ---
 IODA_COUNTRY_CODE = "CF"
 TABLE_NAME = "internet_outages"
-VARIABLE_NAME = "ioda_connectivity_index"
-IODA_MIN_YEAR = 2014  # API returns 404s before this year
+VARIABLE_NAME = "ioda_outage_score"
+
+# IODA data for CAR starts 2022
+IODA_MIN_YEAR = 2022
+
+# API Configuration
+API_BASE = "https://api.ioda.inetintel.cc.gatech.edu/v2"
+API_TIMEOUT = 60
+MAX_RETRIES = 3
+
 
 # -----------------------------------------------------------------------------
-# 1. GEOGRAPHIC UTILS
+# 1. GRID LOADER
 # -----------------------------------------------------------------------------
-
-
-def normalize_name(name):
-    if not isinstance(name, str):
-        return ""
-    n = name.lower().strip()
-    n = unicodedata.normalize("NFKD", n).encode("ASCII", "ignore").decode("utf-8")
-    return re.sub(r"[^a-z0-9]", "", n)
 
 
 def get_full_grid_set(engine):
@@ -67,106 +84,121 @@ def get_full_grid_set(engine):
         return []
 
 
-def get_admin_map_from_static(engine):
-    """
-    Maps admin2 names in features_static -> List of H3 cells.
-    Uses direct equality on admin2 names (normalized) and drops NULL/NaN rows.
-    """
-    try:
-        df = pd.read_sql(f"SELECT admin2, h3_index FROM {SCHEMA}.features_static", engine)
-    except Exception as e:
-        logger.error(f"Could not load admin2 mapping from features_static: {e}")
-        return {}, {}
-
-    if "admin2" not in df.columns:
-        logger.error("Column admin2 not found on features_static.")
-        return {}, {}
-
-    df = df[df["admin2"].notna()]
-    df = df[df["admin2"].astype(str).str.lower() != "nan"]  # Ignore stray literal NaN entry
-    if df.empty:
-        logger.warning("No admin2 values found on features_static.")
-        return {}, {}
-
-    df["admin2_norm"] = df["admin2"].apply(normalize_name)
-    mapping = df.groupby("admin2_norm")["h3_index"].apply(list).to_dict()
-    display_names = df.groupby("admin2_norm")["admin2"].apply(lambda s: sorted(set(s))).to_dict()
-    return mapping, display_names
-
-
 # -----------------------------------------------------------------------------
 # 2. IODA API CLIENT
 # -----------------------------------------------------------------------------
 
 
-def fetch_raw_signal(entity_type, entity_code, start_ts, end_ts):
+def api_request(endpoint, params, timeout=API_TIMEOUT):
+    """Make API request with retry logic."""
+    url = f"{API_BASE}/{endpoint}"
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r.json().get("data", [])
+            elif r.status_code == 404:
+                return []
+            else:
+                logger.warning(f"API returned {r.status_code} for {endpoint}")
+        except requests.exceptions.Timeout:
+            logger.warning(f"API timeout (attempt {attempt + 1}/{MAX_RETRIES})")
+        except Exception as e:
+            logger.warning(f"API error (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+        
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(2 ** attempt)
+    
+    return []
+
+
+def fetch_outage_events(start_ts, end_ts):
     """
-    Fetches RAW time-series (10-min resolution) for 'active_probing'.
+    Fetches national-level outage events from IODA API.
+    
+    Each event has:
+    - start: Unix timestamp
+    - duration: Seconds
+    - score: Severity score
+    - datasource: bgp, gtr, ping-slash24, etc.
     """
-    url = "https://api.ioda.inetintel.cc.gatech.edu/v2/signals/raw"
     params = {
-        "entityType": entity_type,
-        "entityCode": entity_code,
-        "signal": "active_probing",
+        "entityType": "country",
+        "entityCode": IODA_COUNTRY_CODE,
         "from": start_ts,
         "until": end_ts,
     }
-
-    for attempt in range(3):
-        try:
-            r = requests.get(url, params=params, timeout=60)
-            if r.status_code == 200:
-                data = r.json()
-                return data.get("data", {}).get("values", [])  # Returns [[ts, val], ...]
-            time.sleep(1)
-        except Exception as e:
-            logger.warning(f"API retry {attempt + 1}: {e}")
-            time.sleep(2)
-    return []
-
-
-def get_ioda_regions(country_code):
-    """Gets list of available sub-regions (Bangui, Ouham, etc.) defined by IODA."""
-    url = "https://api.ioda.inetintel.cc.gatech.edu/v2/entities/query"
-    try:
-        r = requests.get(
-            url, params={"entityType": "region", "relatedTo": f"country/{country_code}"}, timeout=20
-        )
-        if r.status_code == 200:
-            return [(x["code"], x["name"]) for x in r.json().get("data", [])]
-    except Exception as e:
-        logger.warning(f"Could not fetch IODA regions: {e}")
-    return []
+    return api_request("outages/events", params)
 
 
 # -----------------------------------------------------------------------------
-# 3. SPINE ALIGNMENT
+# 3. TEMPORAL SPINE & AGGREGATION
 # -----------------------------------------------------------------------------
 
 
-def process_to_spine(raw_values, start_ts, end_ts, align_date, step_days):
+def generate_spine(start_date, end_date, align_date, step_days):
     """
-    Converts raw IODA samples -> 14-Day Averages aligned to global spine.
+    Generate a list of (window_start, window_end) tuples aligned to the global spine.
     """
-    if not raw_values:
-        return None
+    align_dt = pd.Timestamp(align_date)
+    start_dt = pd.Timestamp(start_date)
+    end_dt = pd.Timestamp(end_date)
+    
+    # Find the first aligned window that contains or follows start_dt
+    delta = (start_dt - align_dt).days
+    periods_since_origin = delta // step_days
+    first_window_start = align_dt + timedelta(days=periods_since_origin * step_days)
+    
+    if first_window_start < start_dt:
+        first_window_start += timedelta(days=step_days)
+    
+    windows = []
+    current = first_window_start
+    while current < end_dt:
+        window_end = current + timedelta(days=step_days)
+        windows.append((current, min(window_end, end_dt)))
+        current = window_end
+    
+    return windows
 
-    df = pd.DataFrame(raw_values, columns=["timestamp", "val"])
-    df["dt"] = pd.to_datetime(df["timestamp"], unit="s")
-    df.set_index("dt", inplace=True)
 
-    # --- CRITICAL: Use 'origin' from features.yaml ---
-    resampled = df.resample(f"{step_days}D", origin=pd.Timestamp(align_date)).mean()
-
-    # Trim to requested year window
-    s_dt = datetime.fromtimestamp(start_ts)
-    e_dt = datetime.fromtimestamp(end_ts)
-    resampled = resampled[(resampled.index >= s_dt) & (resampled.index <= e_dt)]
-
-    if resampled.empty:
-        return None
-
-    return resampled.reset_index().rename(columns={"dt": "date"})
+def aggregate_events_to_windows(events, windows):
+    """
+    Aggregate discrete outage events into temporal windows.
+    
+    For each window, computes the sum of severity scores (weighted by overlap).
+    """
+    records = []
+    
+    for window_start, window_end in windows:
+        w_start_ts = window_start.timestamp()
+        w_end_ts = window_end.timestamp()
+        
+        total_score = 0.0
+        
+        for event in events:
+            event_start = event["start"]
+            event_end = event_start + event.get("duration", 0)
+            
+            # Check if event overlaps with window
+            if event_end > w_start_ts and event_start < w_end_ts:
+                # Weight score by fraction of event in this window
+                overlap_start = max(event_start, w_start_ts)
+                overlap_end = min(event_end, w_end_ts)
+                overlap_duration = overlap_end - overlap_start
+                
+                event_duration = event.get("duration", 1)
+                fraction = overlap_duration / event_duration if event_duration > 0 else 1.0
+                
+                total_score += event.get("score", 0) * fraction
+        
+        records.append({
+            "date": window_start.date(),
+            "value": total_score,
+        })
+    
+    return pd.DataFrame(records)
 
 
 # -----------------------------------------------------------------------------
@@ -175,12 +207,17 @@ def process_to_spine(raw_values, start_ts, end_ts, align_date, step_days):
 
 
 def run(configs=None, engine=None):
+    """Main entry point for IODA ingestion."""
+    
     # Load Configs
     if configs is None:
         configs = load_configs()
+    
+    if configs is None:
+        logger.error("Could not load configs. Ensure data.yaml and features.yaml exist.")
+        return
 
     # --- EXTRACT CONFIGURATION ---
-    # 1. Dates from data.yaml
     try:
         data_cfg = configs.data if hasattr(configs, "data") else configs.get("data", {})
     except Exception:
@@ -192,131 +229,96 @@ def run(configs=None, engine=None):
 
     global_start_str = data_cfg.get("global_date_window", {}).get("start_date")
     global_end_str = data_cfg.get("global_date_window", {}).get("end_date")
-
-    # 2. Spine from features.yaml
     align_date = feat_cfg.get("temporal", {}).get("alignment_date")
-    step_days = feat_cfg.get("temporal", {}).get("step_days")
+    step_days = feat_cfg.get("temporal", {}).get("step_days", 14)
+
+    if not all([global_start_str, global_end_str, align_date]):
+        logger.error("Missing required config: global_date_window or temporal.alignment_date")
+        return
 
     # --- CLAMP DATES FOR IODA ---
-    # IODA API starts ~2014. If config starts 2000, we clamp to 2014 to save API calls.
-    # But we keep alignment_date=2000 to ensure bins match.
     g_start_dt = pd.to_datetime(global_start_str)
     g_end_dt = pd.to_datetime(global_end_str)
+    
+    # IODA data for CAR starts 2022
+    effective_start = max(g_start_dt, pd.Timestamp(f"{IODA_MIN_YEAR}-01-01"))
+    effective_end = g_end_dt
 
-    start_year = max(g_start_dt.year, IODA_MIN_YEAR)
-    end_year = g_end_dt.year
-
-    logger.info("Starting IODA Hybrid Ingestion.")
-    logger.info(f"   Window: {start_year}-{end_year} (Config requested: {g_start_dt.year})")
-    logger.info(f"   Alignment: {step_days} days from {align_date}")
+    logger.info("Starting IODA Ingestion.")
+    logger.info(f"   Config window: {g_start_dt.date()} to {g_end_dt.date()}")
+    logger.info(f"   Effective window: {effective_start.date()} to {effective_end.date()} (IODA data starts {IODA_MIN_YEAR})")
+    logger.info(f"   Temporal alignment: {step_days} days from {align_date}")
 
     engine = engine or get_db_engine()
 
-    # A. PREPARE GEOGRAPHY
+    # A. LOAD GRID
     full_grid = get_full_grid_set(engine)
     if not full_grid:
         logger.error("Static grid is empty. Run features_static ingestion first.")
         return
+    
+    logger.info(f"   Loaded {len(full_grid):,} H3 cells.")
 
-    admin_map, admin_display_names = get_admin_map_from_static(engine)
-    if not admin_map:
-        logger.error("Admin2 mapping missing; cannot apply regional overlays.")
+    # B. GENERATE TEMPORAL SPINE
+    windows = generate_spine(effective_start, effective_end, align_date, step_days)
+    logger.info(f"   Generated {len(windows)} temporal windows.")
+
+    if not windows:
+        logger.warning("No temporal windows to process.")
         return
 
-    ioda_regions = get_ioda_regions(IODA_COUNTRY_CODE)
-    logger.info(f"   Found {len(ioda_regions)} IODA-defined regions.")
-    unmatched_regions = []
+    # C. FETCH EVENTS
+    s_ts = int(effective_start.timestamp())
+    e_ts = int(effective_end.timestamp())
+    
+    logger.info("   Fetching outage events from IODA API...")
+    events = fetch_outage_events(s_ts, e_ts)
+    logger.info(f"   Found {len(events)} outage events.")
 
-    # B. PROCESS YEAR BY YEAR
-    for year in range(start_year, end_year + 1):
-        logger.info(f"   Processing Year {year}...")
+    # D. AGGREGATE TO WINDOWS
+    agg = aggregate_events_to_windows(events, windows)
+    
+    if agg.empty:
+        logger.warning("No data aggregated. Creating zero-filled baseline.")
+        agg = pd.DataFrame({
+            "date": [w[0].date() for w in windows],
+            "value": [0.0] * len(windows),
+        })
+    
+    non_zero = (agg["value"] > 0).sum()
+    logger.info(f"   Aggregated to {len(agg)} windows ({non_zero} with outages).")
 
-        # Timestamps for API
-        s_ts = int(datetime(year, 1, 1).replace(tzinfo=timezone.utc).timestamp())
-        e_ts = int(datetime(year, 12, 31).replace(tzinfo=timezone.utc).timestamp())
+    # E. BROADCAST TO ALL CELLS
+    n_dates = len(agg)
+    n_cells = len(full_grid)
+    
+    dates_vec = np.tile(agg["date"].values, n_cells)
+    vals_vec = np.tile(agg["value"].values, n_cells)
+    cells_vec = np.repeat(full_grid, n_dates)
+    
+    result_df = pd.DataFrame({
+        "h3_index": cells_vec,
+        "date": dates_vec,
+        "value": vals_vec,
+    })
 
-        # 1. FETCH NATIONAL BASELINE
-        raw_country = fetch_raw_signal("country", IODA_COUNTRY_CODE, s_ts, e_ts)
-        df_country = process_to_spine(raw_country, s_ts, e_ts, align_date, step_days)
+    # F. FINALIZE AND UPLOAD
+    result_df["variable"] = VARIABLE_NAME
+    result_df["date"] = pd.to_datetime(result_df["date"]).dt.date
+    result_df["h3_index"] = result_df["h3_index"].astype("int64")
+    result_df["value"] = result_df["value"].astype("float64")
 
-        if df_country is None:
-            logger.info(f"      No data for {year}. Skipping.")
-            continue
+    logger.info(f"   Uploading {len(result_df):,} rows...")
 
-        # 2. BROADCAST NATIONAL BASELINE (In Memory)
-        # Create Cartesian Product: (All Cells) x (All Time Steps in Year)
-        n_dates = len(df_country)
-        n_cells = len(full_grid)
+    upload_to_postgis(
+        engine, 
+        result_df, 
+        TABLE_NAME, 
+        SCHEMA, 
+        primary_keys=["h3_index", "date", "variable"]
+    )
 
-        dates_vec = df_country["date"].repeat(n_cells).values
-        vals_vec = df_country["val"].repeat(n_cells).values
-        cells_vec = full_grid * n_dates
-
-        year_df = pd.DataFrame({"h3_index": cells_vec, "date": dates_vec, "value": vals_vec})
-
-        # 3. REGIONAL OVERLAY (The Hybrid Step)
-        regions_applied = 0
-        for r_code, r_name in ioda_regions:
-            norm_name = normalize_name(r_name)
-            target_cells = admin_map.get(norm_name)
-            if not target_cells:
-                unmatched_regions.append(r_name)
-                continue
-
-            # Fetch & Resample
-            raw_region = fetch_raw_signal("region", r_code, s_ts, e_ts)
-            df_region = process_to_spine(raw_region, s_ts, e_ts, align_date, step_days)
-
-            if df_region is not None:
-                # Expand region data to its specific cells
-                r_dates = df_region["date"].repeat(len(target_cells)).values
-                r_vals = df_region["val"].repeat(len(target_cells)).values
-                r_cells = target_cells * len(df_region)
-
-                region_overlay = pd.DataFrame(
-                    {"h3_index": r_cells, "date": r_dates, "val_region": r_vals}
-                )
-
-                # Merge & Overwrite
-                year_df = year_df.merge(region_overlay, on=["h3_index", "date"], how="left")
-
-                mask = year_df["val_region"].notna()
-                year_df.loc[mask, "value"] = year_df.loc[mask, "val_region"]
-
-                year_df.drop(columns=["val_region"], inplace=True)
-                regions_applied += 1
-
-        # 4. UPLOAD
-        year_df["variable"] = VARIABLE_NAME
-        year_df["date"] = pd.to_datetime(year_df["date"]).dt.date
-
-        logger.info(f"      Saving {len(year_df):,} rows (Regions overlaid: {regions_applied})...")
-
-        upload_to_postgis(
-            engine, year_df, TABLE_NAME, SCHEMA, primary_keys=["h3_index", "date", "variable"]
-        )
-
-        del year_df, df_country
-
-    if unmatched_regions:
-        logger.warning(
-            f"No admin2 match for IODA regions: {sorted(set(unmatched_regions))}"
-        )
-    extra_static = set(admin_map.keys()) - {normalize_name(name) for _, name in ioda_regions}
-    if extra_static:
-        extras_display = sorted(
-            {
-                name
-                for key, names in admin_display_names.items()
-                if key in extra_static
-                for name in names
-            }
-        )
-        logger.info(
-            "Admin2 values present in features_static without an IODA region match: "
-            f"{extras_display}"
-        )
-    logger.info("IODA ingestion complete.")
+    logger.info("✓ IODA Ingestion Complete.")
 
 
 if __name__ == "__main__":
