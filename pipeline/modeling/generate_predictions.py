@@ -73,10 +73,12 @@ def generate_single_run(horizon_name, learner_name):
     pred_df["predicted_fatalities"] = fatalities
 
     if bccp:
-        intervals = bccp.predict_intervals(fatalities)
-        pred_df["fatalities_lower"] = np.maximum(0, intervals.lower)
-        pred_df["fatalities_upper"] = np.maximum(0, intervals.upper)
-        pred_df["risk_score"] = intervals.upper
+        # Transform Poisson count predictions to log-space for BCCP intervals, then back
+        fatalities_log = np.log1p(fatalities)
+        intervals = bccp.predict_intervals(fatalities_log)
+        pred_df["fatalities_lower"] = np.expm1(np.maximum(0, intervals.lower))
+        pred_df["fatalities_upper"] = np.expm1(np.maximum(0, intervals.upper))
+        pred_df["risk_score"] = pred_df["fatalities_upper"]
     else:
         pred_df["fatalities_lower"] = 0
         pred_df["fatalities_upper"] = fatalities

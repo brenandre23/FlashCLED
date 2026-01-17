@@ -1,13 +1,14 @@
 """
 two_stage_ensemble.py
 =====================
-Two-stage stacked ensemble for conflict prediction with isotonic calibration.
+Two-stage stacked ensemble for conflict prediction with calibrated probabilities
+(sigmoid default, isotonic optional).
 
 Thesis Methodology Enforced:
 1. Stage 2 Regressor is strictly PoissonRegressor (Count Model).
 2. Non-negativity constraints applied to all inputs and outputs.
 3. Validation uses time-series splits to prevent leakage.
-4. Isotonic calibration applied post-hoc for probability reliability.
+4. Calibration layer applied post-hoc for probability reliability.
 """
 
 import logging
@@ -32,11 +33,11 @@ class TwoStageEnsemble:
     Architecture:
     - Level 1: Theme-specific base learners (classifiers + regressors)
     - Level 2: Meta-learners (LogisticRegression for binary, PoissonRegressor for counts)
-    - Level 3: Isotonic calibration for reliable probability estimates
+    - Level 3: Calibration layer (sigmoid default, isotonic optional) for reliable probability estimates
     
-    The isotonic calibration layer addresses the probability compression issue
-    common with extreme class imbalance. It maps the meta-learner's raw 
-    probabilities to empirically calibrated values using a monotonic function.
+    The calibration layer addresses the probability compression issue common with
+    extreme class imbalance. Sigmoid (Platt scaling) is the default; isotonic
+    remains available for legacy compatibility.
     """
 
     def __init__(
@@ -44,7 +45,7 @@ class TwoStageEnsemble:
         theme_models: List[Dict],
         n_folds: int = 5,
         random_state: int = 42,
-        calibration_method: str = "isotonic",  # "isotonic" | "none"
+        calibration_method: str = "sigmoid",  # "sigmoid" | "isotonic" | "none"
         calibration_fraction: float = 0.2,     # Fraction of training data for calibration
     ) -> None:
         self.theme_models = theme_models
@@ -55,7 +56,7 @@ class TwoStageEnsemble:
 
         self.meta_binary: Optional[LogisticRegression] = None
         self.meta_regress: Optional[PoissonRegressor] = None
-        self.calibrator: Optional[IsotonicRegression] = None
+        self.calibrator: Optional[Any] = None
         self.is_fitted: bool = False
         
         # Calibration diagnostics
@@ -148,10 +149,11 @@ class TwoStageEnsemble:
         y_cal: pd.Series,
     ) -> None:
         """
-        Fit isotonic calibration on held-out calibration set.
+        Fit calibration on held-out calibration set.
         
-        Uses Level-1 predictions -> Meta-learner -> Raw probabilities,
-        then fits IsotonicRegression to map raw probs to calibrated probs.
+        Uses Level-1 predictions -> Meta-learner -> Raw probabilities, then fits
+        the requested calibrator (sigmoid default, isotonic optional) to map raw
+        probs to calibrated probs.
         """
         if self.calibration_method == "none":
             self.calibrator = None
@@ -173,18 +175,26 @@ class TwoStageEnsemble:
         # Get raw meta-learner probabilities
         raw_probs = self.meta_binary.predict_proba(l1_binary)[:, 1]
         
-        # Fit isotonic calibration
-        # y_min/y_max bounds ensure output stays in [0, 1]
-        self.calibrator = IsotonicRegression(
-            y_min=0.0,
-            y_max=1.0,
-            out_of_bounds="clip",
-            increasing=True,
-        )
-        self.calibrator.fit(raw_probs, y_cal.values)
-        
-        # Compute diagnostics
-        cal_probs = self.calibrator.predict(raw_probs)
+        if self.calibration_method == "sigmoid":
+            # Platt scaling (Logistic Regression on raw scores)
+            from sklearn.linear_model import LogisticRegression as LR_Calib
+
+            self.calibrator = LR_Calib(solver="lbfgs")
+            self.calibrator.fit(raw_probs.reshape(-1, 1), y_cal.values)
+            cal_probs = self.calibrator.predict_proba(raw_probs.reshape(-1, 1))[:, 1]
+
+        elif self.calibration_method == "isotonic":
+            # y_min/y_max bounds ensure output stays in [0, 1]
+            self.calibrator = IsotonicRegression(
+                y_min=0.0,
+                y_max=1.0,
+                out_of_bounds="clip",
+                increasing=True,
+            )
+            self.calibrator.fit(raw_probs, y_cal.values)
+            cal_probs = self.calibrator.predict(raw_probs)
+        else:
+            raise ValueError(f"Unsupported calibration method: {self.calibration_method}")
         
         self.calibration_diagnostics = {
             "n_calibration_samples": n_cal,
@@ -220,7 +230,7 @@ class TwoStageEnsemble:
         4. Retrain base models on full training portion
         5. Fit calibrator on calibration portion
         """
-        logger.info("Fitting TwoStageEnsemble (Methodology: Poisson + Hurdle + Isotonic)...")
+        logger.info("Fitting TwoStageEnsemble (Methodology: Poisson + Hurdle + Sigmoid Calibration)...")
 
         y_binary = pd.Series(y_binary).astype(int).reset_index(drop=True)
         y_fatalities = pd.Series(y_fatalities).astype(float).reset_index(drop=True)
@@ -254,7 +264,7 @@ class TwoStageEnsemble:
         if conflict_mask.sum() > 0:
             self.meta_regress = PoissonRegressor(alpha=1.0, max_iter=1000)
             y_fat_conflict = np.maximum(y_fat_train[conflict_mask], 0)
-            X_regress = np.log1p(np.maximum(oof_regress[conflict_mask.values, :], 0))
+            X_regress = np.maximum(oof_regress[conflict_mask.values, :], 0)
             self.meta_regress.fit(X_regress, y_fat_conflict)
         else:
             self.meta_regress = None
@@ -321,13 +331,16 @@ class TwoStageEnsemble:
 
         # Level 3: Calibration
         if self.calibrator is not None:
-            prob = self.calibrator.predict(raw_prob)
+            if self.calibration_method == "sigmoid":
+                prob = self.calibrator.predict_proba(raw_prob.reshape(-1, 1))[:, 1]
+            else:
+                prob = self.calibrator.predict(raw_prob)
         else:
             prob = raw_prob
 
         # Fatality predictions
         if self.meta_regress:
-            regress_inputs = np.log1p(np.maximum(l1_regress, 0))
+            regress_inputs = np.maximum(l1_regress, 0)
             mu_fatal = self.meta_regress.predict(regress_inputs)
             mu_fatal = np.clip(mu_fatal, 0.0, None)
         else:

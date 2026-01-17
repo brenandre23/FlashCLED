@@ -11,9 +11,9 @@ horizons:
 - name: 3m
   steps: 6
 
-# Isotonic calibration for probability reliability
+# Sigmoid (Platt) calibration for probability reliability (isotonic optional)
 calibration:
-  method: isotonic    # "isotonic" | "none"
+  method: sigmoid     # "sigmoid" | "isotonic" | "none"
   fraction: 0.2       # Fraction of training data held out for calibration
 
 # Bin-Conditional Conformal Prediction for uncertainty intervals
@@ -78,11 +78,6 @@ submodels:
     - fatalities_14d_sum       # Added: Immediate intensity signal
     - protest_count_lag1       # Added: Civil unrest signal
     - riot_count_lag1          # Added: Violent demonstration signal
-    - gdelt_avg_tone_decay_30d
-    - gdelt_decay_30d          # Added: Short-term media volume
-    - gdelt_goldstein_mean     # Added: Event stability score
-    - gdelt_mentions_total     # Added: Event salience/importance
-    - ioda_outage_score_lag1   # Added: Internet outage signal (lagged score)
     - conflict_density_10km
     - regional_risk_score_lag1
 
@@ -109,6 +104,8 @@ submodels:
     - chirps_precip_mean
     - era5_temp_anomaly
     - era5_temp_mean
+    - era5_dewpoint_anomaly
+    - era5_dewpoint_mean
     - era5_soil_moisture_anomaly
     - era5_soil_moisture_mean
     - ndvi_anomaly
@@ -157,17 +154,23 @@ submodels:
   news_ops:
     enabled: true
     features:
-    - ioda_outage_score_lag1
-
-  broad_pca:
-    enabled: true
-    variance_retention: 0.9
-
-  acled_hybrid:
-    enabled: true
-    features:
-    - driver_resource_cattle
+    - gdelt_avg_tone_decay_30d       # Media tone (GDELT)
+    - gdelt_decay_30d                # Short-term media volume (GDELT)
+    - gdelt_goldstein_mean           # Event stability score (GDELT)
+    - gdelt_mentions_total           # Event salience/importance (GDELT)
+    - ioda_outage_score_lag1          # IODA outages (lagged)
+    - cw_score_local                  # CrisisWatch local score
+    - cw_score_local_spatial_lag
+    - cw_score_local_lag1
+    - cw_score_local_spatial_lag_lag1
+    - cw_score_local_lag1_decay_30d
+    - cw_score_local_spatial_lag_lag1_decay_30d
+    - driver_resource_cattle          # ACLED hybrid NLP drivers
     - driver_resource_mining
     - driver_econ_taxation
     - driver_political_coup
     - driver_civilian_abuse
+
+  broad_pca:
+    enabled: true
+    variance_retention: 0.9

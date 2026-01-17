@@ -71,6 +71,14 @@ registry:
   source: ERA5
   transformation: mean
   output_col: era5_temp_mean
+- raw: dew_mean
+  source: ERA5
+  transformation: anomaly
+  output_col: era5_dewpoint_anomaly
+- raw: dew_mean
+  source: ERA5
+  transformation: mean
+  output_col: era5_dewpoint_mean
 # - raw: temp_mean
 #   source: ERA5
 #   transformation: mean
@@ -120,6 +128,11 @@ registry:
   transformation: none
   output_col: landcover_bare
   description: "Bare ground fraction - mining activity proxy"
+- raw: dw_built_frac
+  source: DynamicWorld
+  transformation: none
+  output_col: landcover_built
+  description: "Built-up area fraction"
 - raw: landcover_avail
   source: DynamicWorld
   transformation: none

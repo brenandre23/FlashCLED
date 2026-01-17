@@ -1154,24 +1154,71 @@ def process_environment(engine, spine, env_specs, feat_cfg):
 # ==============================================================================
 # PHASE 4: CONFLICT DATA (Config-Driven Decay)
 # ==============================================================================
-def compute_time_since_last_fatal_event(spine, acled_raw):
+def compute_time_since_last_fatal_event(spine, engine):
     """
     Computes 'time_since_last_fatal_event' (in days) per H3 cell.
     
-    FIX FOR 9999 BUG:
-    - Explicitly casts both spine['date'] and event['date'] to pd.Timestamp
-    - Uses merge_asof with direction='backward' to find most recent prior fatal event
-    - Returns 9999 only for cells with NO historical fatal event
+    Offloaded to SQL to avoid pandas OOM: for each (h3_index, date), finds the most
+    recent fatal event on/before that date and returns the day difference. Cells with
+    no prior fatal event get 9999.
     """
     logger.info("  Computing time_since_last_fatal_event...")
+
+    temp_table = "tmp_spine_tsle"
+    spine_tmp = spine[['h3_index', 'date']].copy()
+    spine_tmp['date'] = pd.to_datetime(spine_tmp['date']).dt.date
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {temp_table};"))
+    spine_tmp.to_sql(temp_table, engine, if_exists="replace", index=False)
     
-    # Filter to fatal events only
-    fatal_events = acled_raw[acled_raw['fatalities'] > 0][['h3_index', 'date']].copy()
-    
-    if fatal_events.empty:
-        logger.warning("  No fatal events found - filling with 9999")
-        spine['time_since_last_fatal_event'] = 9999
+    try:
+        sql = f"""
+        WITH spine AS (
+            SELECT h3_index::bigint AS h3_index, date::date AS date
+            FROM {temp_table}
+        ),
+        fatals AS (
+            SELECT h3_index::bigint AS h3_index, event_date::date AS date
+            FROM {SCHEMA}.acled_events
+            WHERE fatalities > 0
+        ),
+        last_fatal AS (
+            SELECT
+                s.h3_index,
+                s.date,
+                MAX(f.date) AS last_date
+            FROM spine s
+            LEFT JOIN fatals f
+              ON f.h3_index = s.h3_index
+             AND f.date <= s.date
+            GROUP BY s.h3_index, s.date
+        )
+        SELECT
+            h3_index,
+            date,
+            CASE
+                WHEN last_date IS NULL THEN 9999
+                ELSE GREATEST((date - last_date), 0)
+            END AS time_since_last_fatal_event
+        FROM last_fatal
+        """
+        tsle_df = pd.read_sql(sql, engine)
+        tsle_df['date'] = pd.to_datetime(tsle_df['date'])
+        tsle_df['time_since_last_fatal_event'] = tsle_df['time_since_last_fatal_event'].astype(int)
+        
+        # Assign without building a large merge frame
+        tsle_df['h3_index'] = tsle_df['h3_index'].astype('int64')
+        tsle_df = tsle_df.set_index(['h3_index', 'date'])['time_since_last_fatal_event']
+        spine_index = spine.set_index(['h3_index', 'date']).index
+        spine['time_since_last_fatal_event'] = tsle_df.reindex(spine_index).values
+        spine['time_since_last_fatal_event'] = spine['time_since_last_fatal_event'].fillna(9999).astype(int)
+        
+        non_default = (spine['time_since_last_fatal_event'] < 9999).sum()
+        logger.info(f"  ✓ time_since_last_fatal_event: {non_default:,} non-default values")
         return spine
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS {temp_table};"))
     
     # CRITICAL FIX: Explicit timestamp casting to prevent type mismatch
     fatal_events['date'] = pd.to_datetime(fatal_events['date'])
@@ -1436,8 +1483,8 @@ def process_conflict(engine, spine, conflict_specs, features_config):
     spine['gdelt_data_available'] = (spine['date'] >= pd.Timestamp("2015-02-18")).astype(int)
     # Ensure registry output column exists (passthrough flag)
     spine['gdelt_data_available_flag'] = spine.get('gdelt_data_available', 0)
-    # Flag IODA availability (API coverage starts ~2014)
-    spine['ioda_data_available'] = (spine['date'] >= pd.Timestamp("2014-01-01")).astype(int)
+    # Flag IODA availability (API coverage starts 2022-02-01)
+    spine['ioda_data_available'] = (spine['date'] >= pd.Timestamp("2022-02-01")).astype(int)
     spine['ioda_data_available_flag'] = spine.get('ioda_data_available', 0)
     
     # 4. Initialize missing conflict columns with 0 and apply forward-fill
@@ -1500,7 +1547,7 @@ def process_conflict(engine, spine, conflict_specs, features_config):
         spine = apply_halflife_decay(spine, f"{spatial_col}_lag1", features_config)
 
     # 7. Compute time_since_last_fatal_event
-    spine = compute_time_since_last_fatal_event(spine, acled_raw)
+    spine = compute_time_since_last_fatal_event(spine, engine)
 
     # Ensure regional_risk_score_lag1 exists even if spec was removed (backwards safety)
     if 'regional_risk_score_lag1' not in spine.columns:

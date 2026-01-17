@@ -10,7 +10,9 @@ import os
 import gc
 from pathlib import Path
 import pandas as pd
+import numpy as np
 import joblib
+from sklearn.metrics import mean_squared_error, mean_poisson_deviance
 
 # Add root to path
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -119,14 +121,24 @@ def build_theme_models(config, learner_name):
     learner_cfg = config["learners"][learner_name]
     learner_type = learner_cfg["type"]
     base_params = learner_cfg["params"].copy()
+    reg_params = base_params.copy()
 
     if learner_type == "xgboost":
         Cls, Reg = XGBClassifier, XGBRegressor
         base_params["n_jobs"] = 1
+        reg_params["n_jobs"] = 1
+        base_params["objective"] = "binary:logistic"
+        base_params["eval_metric"] = "logloss"
+        reg_params["objective"] = "count:poisson"
+        reg_params["eval_metric"] = "poisson-nloglik"
     elif learner_type == "lightgbm":
         Cls, Reg = LGBMClassifier, LGBMRegressor
         base_params["num_threads"] = 1
         base_params["verbose"] = -1
+        reg_params["num_threads"] = 1
+        reg_params["verbose"] = -1
+        base_params["objective"] = "binary"
+        reg_params["objective"] = "poisson"
 
     hurdle_cfg = config.get("hurdle_params", {})
     scale_pos_weight = hurdle_cfg.get("classifier_scale_pos_weight", 1.0)
@@ -145,7 +157,7 @@ def build_theme_models(config, learner_name):
                 "name": name,
                 "features": info["features"],
                 "binary_model": Cls(**clf_params),
-                "regress_model": Reg(**base_params),
+                "regress_model": Reg(**reg_params),
             }
         )
     return theme_models
@@ -199,11 +211,27 @@ def run_single_training(horizon, learner_name):
 
         logger.info("🔮 Fitting Conformal Intervals...")
         _, cal_preds_fatal = ensemble.predict(df)
+
+        # Stage 2 diagnostic: MPD (Poisson deviance) + RMSE on counts
+        y_true_clip = np.clip(y_reg.values, 0, None)
+        y_pred_clip = np.clip(cal_preds_fatal, 0, None)
+        rmse = np.sqrt(mean_squared_error(y_true_clip, y_pred_clip))
+        try:
+            mpd = mean_poisson_deviance(y_true_clip, np.maximum(y_pred_clip, 1e-9))
+        except ValueError:
+            mpd = float("nan")
+        logger.info(f"Intensity metrics -> RMSE: {rmse:.4f}, Mean Poisson Deviance: {mpd:.4f}")
+
+        # BCCP operates on log-scale to better capture multiplicative error in counts
+        y_reg_log = np.log1p(y_reg.values)
+        cal_preds_fatal_log = np.log1p(cal_preds_fatal)
+
         bccp = BinConditionalConformalPredictor(
             bins=create_default_fatality_bins(),
             alpha=models_cfg["conformal_prediction"]["alpha"],
+            log_scale=True,
         )
-        bccp.fit(y_reg.values, cal_preds_fatal)
+        bccp.fit(y_reg_log, cal_preds_fatal_log)
 
         save_dict = {
             "ensemble": ensemble,
