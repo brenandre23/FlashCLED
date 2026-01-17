@@ -53,6 +53,7 @@ DW_CLASSES = {
     'crops': 4,      # Cultivated land - farmer zones
     'trees': 1,      # Forest/woodland
     'bare': 7,       # Bare ground - mining proxy
+    'built': 6,      # Built-up area
 }
 
 
@@ -71,6 +72,7 @@ def ensure_landcover_table_exists(engine, schema="car_cewp"):
         dw_crops_frac FLOAT,
         dw_trees_frac FLOAT,
         dw_bare_frac FLOAT,
+        dw_built_frac FLOAT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (h3_index, date)
     );
@@ -177,9 +179,9 @@ def process_single_batch(batch_cells, s_str, e_excl_str):
                 return None
             
             # Select probability bands for our classes
-            # Dynamic World bands: water, trees, grass, flooded_vegetation, crops, 
+            # Dynamic World bands: water, trees, grass, flooded_vegetation, crops,
             #                      shrub_and_scrub, built, bare, snow_and_ice
-            dw_mean = dw.select(['grass', 'crops', 'trees', 'bare']).mean()
+            dw_mean = dw.select(['grass', 'crops', 'trees', 'bare', 'built']).mean()
             
             # Reduce to H3 cells
             results = dw_mean.reduceRegions(
@@ -244,6 +246,7 @@ def process_year_batch(year: int, all_cells: list, windows, engine, lag_days: in
                             "dw_crops_frac": props.get("crops"),
                             "dw_trees_frac": props.get("trees"),
                             "dw_bare_frac": props.get("bare"),
+                            "dw_built_frac": props.get("built"),
                         })
                         
                 except Exception as e:

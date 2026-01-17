@@ -8,6 +8,9 @@ Complete installation and setup instructions for the Conflict Early Warning Pipe
 - [Database Setup](#database-setup)
 - [Google Earth Engine Setup](#google-earth-engine-setup)
 - [Configuration Files](#configuration-files)
+- [API Keys & Credentials](#api-keys--credentials)
+- [Manual Data Downloads](#manual-data-downloads)
+- [Admin Boundary Configuration](#admin-boundary-configuration)
 - [Verification](#verification)
 - [Troubleshooting](#troubleshooting)
 
@@ -30,6 +33,9 @@ Complete installation and setup instructions for the Conflict Early Warning Pipe
 ### External Accounts Needed
 - [Google Earth Engine](https://earthengine.google.com/) (free for research/education)
 - [ACLED](https://acleddata.com/) API access (free tier available)
+- [IOM DTM](https://dtm.iom.int/data/api) API access (request required)
+- [FEWS NET](https://fdw.fews.net/) Data Warehouse access
+- [Sentinel Hub](https://www.sentinel-hub.com/) (for Copernicus DEM)
 
 ---
 
@@ -208,26 +214,7 @@ For automated/scheduled runs, use a service account:
 cp .env.example .env
 ```
 
-### Step 2: Edit .env
-
-Required variables:
-```bash
-# Database
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=car_cewp
-DB_USER=cewp_user
-DB_PASS=your_secure_password
-
-# ACLED API (get from https://acleddata.com/dashboard/)
-ACLED_EMAIL=your.email@domain.com
-ACLED_KEY=your_api_key_here
-
-# Optional: Other API keys
-WFP_KEY=your_wfp_api_key
-```
-
-### Step 3: Review Configuration YAMLs
+### Step 2: Review Configuration YAMLs
 
 The pipeline is controlled by three config files in `configs/`:
 
@@ -240,7 +227,7 @@ The pipeline is controlled by three config files in `configs/`:
 - Feature engineering parameters
 - H3 resolution (default: 5 ≈ 10km hexagons)
 - Temporal window (default: 14 days)
-- Registry of all features to compute
+- Registry of all 109 features to compute
 
 **configs/models.yaml:**
 - Model architectures (XGBoost, LightGBM)
@@ -253,6 +240,116 @@ global_date_window:
   start_date: "2000-01-01"  # Adjust to your needs
   end_date: "2025-12-31"    # Adjust to your needs
 ```
+
+---
+
+## API Keys & Credentials
+
+Create a `.env` file in the project root with the following credentials:
+
+```bash
+# --- Database ---
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=car_cewp
+DB_USER=cewp_user
+DB_PASS=your_password
+
+# --- ACLED (Required) ---
+# Register at: https://developer.acleddata.com/
+ACLED_EMAIL=your_email
+ACLED_KEY=your_api_key
+
+# --- IOM DTM (Required for displacement data) ---
+# Request access at: https://dtm.iom.int/data/api
+IOM_PRIMARY_KEY=your_key
+
+# --- IPC-CH API (Required for food security) ---
+# Request access at: https://www.ipcinfo.org/ipc-country-analysis/api/
+IPC_API_KEY=your_key
+
+# --- Sentinel Hub (Required for Copernicus DEM) ---
+# Register at: https://www.sentinel-hub.com/
+SH_CLIENT_ID=your_client_id
+SH_CLIENT_SECRET=your_client_secret
+
+# --- FEWS NET (Required for market prices) ---
+# Register at: https://fdw.fews.net/
+FEWS_NET_EMAIL=your_email
+FEWS_NET_PASSWORD=your_password
+
+# --- Google Cloud (Required for BigQuery/Earth Engine) ---
+# Path to your JSON service account key
+GOOGLE_APPLICATION_CREDENTIALS="C:/path/to/gcp_key.json"
+```
+
+---
+
+## Manual Data Downloads
+
+Due to licensing restrictions and API limits, several datasets must be downloaded manually.
+
+### Directory Structure
+
+Ensure your project contains the following structure:
+```
+CEWP-CAR/
+├── data/
+│   ├── raw/
+│   │   ├── acled.csv                 # Manual download
+│   │   ├── EPR-2021.csv              # Manual download
+│   │   ├── wbgCAFadmin1.geojson      # Manual download
+│   │   └── wbgCAFadmin3.geojson      # Manual download (see Section 8)
+```
+
+### A. ACLED Data
+
+1. Go to the [ACLED Export Tool](https://acleddata.com/data-export-tool/)
+2. Set filters:
+   - **Country:** Central African Republic
+   - **Event Date:** 2000-01-01 to Present
+3. Export the file and rename it to `acled.csv`
+4. Place in `data/raw/`
+
+### B. Ethnic Power Relations (EPR)
+
+1. Go to the [ETH Zürich EPR Dataset](https://icr.ethz.ch/data/epr/)
+2. Download the **Core Dataset (CSV)** - Version 2021
+3. Rename to `EPR-2021.csv`
+4. Place in `data/raw/`
+
+> **Note:** The GeoEPR polygons are handled automatically by the pipeline's caching system, but the Core CSV is required manually.
+
+---
+
+## Admin Boundary Configuration
+
+⚠️ **CRITICAL CONFIGURATION STEP**
+
+The pipeline relies on a specific mapping between OCHA/HDX standards and World Bank standards for administrative boundaries.
+
+### The Problem
+
+| Standard | Admin 1 | Admin 2 |
+|----------|---------|---------|
+| World Bank | Region | Prefecture |
+| OCHA/HDX | Prefecture | Sub-prefecture |
+
+### The Solution
+
+To resolve this mismatch, perform the following file renaming:
+
+1. Download **OCHA Admin 1 (Prefectures)** boundaries for CAR (GeoJSON)
+   - Save as: `wbgCAFadmin1.geojson`
+
+2. Download **OCHA Admin 2 (Sub-prefectures)** boundaries for CAR (GeoJSON)
+   - Save as: `wbgCAFadmin3.geojson`
+
+> **Why?** The pipeline's `spatial_disaggregation.py` logic looks for an "Admin 3" file to find sub-prefectures. Saving the Admin 2 file with this name bridges the gap.
+
+### Download Links
+
+- [HDX CAR Admin Boundaries](https://data.humdata.org/dataset/cod-ab-caf)
 
 ---
 
@@ -353,13 +450,21 @@ DB_HOST=172.x.x.x  # Use IP from above, not 'localhost'
 
 ---
 
+## Quotas & Limits
+
+- **Google BigQuery (GDELT):** The pipeline queries the public GDELT dataset. This falls under the BigQuery free tier (1TB/month), but repeated full-history ingestion may incur costs. The pipeline implements caching to minimize this.
+
+- **Google Earth Engine:** Requires an enabled GEE account linked to your Google Cloud Project.
+
+---
+
 ## Next Steps
 
 After successful installation:
 
-1. **Review documentation:** Read [DATA_SETUP.md](DATA_SETUP.md) for data source details
-2. **Run full pipeline:** Execute `python main.py` for complete workflow
-3. **Explore outputs:** Check `data/processed/` for feature matrices and predictions
-4. **Customize:** Modify `configs/*.yaml` to experiment with different parameters
+1. **Run full pipeline:** Execute `python main.py` for complete workflow
+2. **Explore outputs:** Check `data/processed/` for feature matrices and predictions
+3. **Customize:** Modify `configs/*.yaml` to experiment with different parameters
+4. **Usage guide:** See [USAGE.md](USAGE.md) for CLI examples and workflows
 
 For questions or issues not covered here, please [open an issue](https://github.com/YOUR_USERNAME/CEWP-CAR/issues).

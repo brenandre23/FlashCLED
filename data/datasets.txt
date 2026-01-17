@@ -14,7 +14,7 @@ FAOSTAT CPI (All items),2000–present,Quarterly releases (monthly indices),High
 EPR (Ethnic Power Relations),1946–2021,Static (annual data up to 2021),High
 IOM DTM (Displacement Tracking),2000s–present,Continuous (typically monthly or periodic updates),Medium
 GDELT Event Database,1979–present,Every 15 minutes (near real-time),High
-IODA (Internet Outages),2016–present,Continuous (real-time updates),Low
+IODA (Internet Outages),2022–present (outage events),Continuous (near real-time updates),Low
 ERA5 Reanalysis,1940–present,Daily updates with about 5-day latency,High
 ESA CCI Soil Moisture,1978–2023,Annual releases (v09.1 covers to 2023),Medium
 CHIRPS Precipitation,1981–present,About 3 times per month (pentadal updates) plus monthly products,High
