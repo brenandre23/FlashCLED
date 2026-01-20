@@ -421,9 +421,60 @@ def run_full_analysis(
 
 
 def run():
-    """Main entry point for standalone execution."""
+    """
+    Main entry point for standalone execution.
+    
+    By default, excludes structural break flags from analysis.
+    Use --include-structural-breaks to include them.
+    """
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="VIF and correlation analysis for feature selection.")
+    parser.add_argument(
+        "--parquet", 
+        type=Path, 
+        default=None, 
+        help="Path to feature matrix parquet file."
+    )
+    parser.add_argument(
+        "--exclude-structural-breaks",
+        action="store_true",
+        default=True,
+        help="Exclude structural break flags from analysis (default: True)."
+    )
+    parser.add_argument(
+        "--include-structural-breaks",
+        action="store_true",
+        help="Include structural break flags in analysis."
+    )
+    parser.add_argument(
+        "--exclude-cols",
+        type=str,
+        default=None,
+        help="Comma-separated list of additional columns to exclude."
+    )
+    parser.add_argument(
+        "--vif-threshold",
+        type=float,
+        default=5.0,
+        help="VIF threshold for flagging (default: 5.0)."
+    )
+    parser.add_argument(
+        "--corr-threshold",
+        type=float,
+        default=0.8,
+        help="Correlation threshold for flagging pairs (default: 0.8)."
+    )
+    args = parser.parse_args()
+    
+    # Resolve options
+    exclude_structural = not args.include_structural_breaks
+    extra_exclusions = []
+    if args.exclude_cols:
+        extra_exclusions = [c.strip() for c in args.exclude_cols.split(",") if c.strip()]
+    
     # Load feature matrix
-    matrix_path = PATHS.get("data_proc", Path("data/processed")) / "feature_matrix.parquet"
+    matrix_path = args.parquet or PATHS.get("data_proc", Path("data/processed")) / "feature_matrix.parquet"
     
     if not matrix_path.exists():
         logger.error(f"Feature matrix not found: {matrix_path}")
@@ -434,8 +485,37 @@ def run():
     df = pd.read_parquet(matrix_path)
     logger.info(f"Loaded {len(df):,} rows, {len(df.columns)} columns")
     
+    # Apply diagnostic filtering
+    if exclude_structural or extra_exclusions:
+        try:
+            from pipeline.common.diagnostic_utils import filter_diagnostic_columns
+            df = filter_diagnostic_columns(
+                df,
+                exclude_structural_breaks=exclude_structural,
+                extra_exclusions=extra_exclusions,
+                verbose=True
+            )
+        except ImportError:
+            logger.warning("diagnostic_utils not available; using basic filtering")
+            # Basic filtering fallback
+            structural_flags = {
+                "is_worldpop_v1", "iom_data_available", "econ_data_available",
+                "ioda_data_available", "landcover_data_available",
+                "viirs_data_available", "gdelt_data_available",
+                "food_data_available"
+            }
+            cols_to_drop = (structural_flags if exclude_structural else set()) | set(extra_exclusions)
+            cols_to_drop = cols_to_drop & set(df.columns)
+            if cols_to_drop:
+                logger.info(f"Dropping columns: {sorted(cols_to_drop)}")
+                df = df.drop(columns=list(cols_to_drop))
+    
     # Run analysis
-    results = run_full_analysis(df)
+    results = run_full_analysis(
+        df,
+        vif_threshold=args.vif_threshold,
+        corr_threshold=args.corr_threshold
+    )
     
     return results
 

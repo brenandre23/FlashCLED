@@ -1,5 +1,5 @@
 from . import process_terrain
-from . import process_criseswatch
+from . import process_crisiswatch
 from . import calculate_static_distances
 from . import spatial_disaggregation
 from . import process_acled_hybrid

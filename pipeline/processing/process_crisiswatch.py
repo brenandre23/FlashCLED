@@ -1,5 +1,5 @@
 """
-pipeline/processing/process_criseswatch.py
+pipeline/processing/process_crisiswatch.py
 ==========================================
 CrisisWatch NLP Feature Extraction Pipeline.
 
@@ -459,13 +459,13 @@ def run():
     input_files = (
         list(raw_dir.glob("*crisiswatch*.txt"))
         + list(raw_dir.glob("*CrisisWatch*.txt"))
-        + list(raw_dir.glob("*criseswatchdata*.txt"))  # e.g., criseswatchdataNOV25.txt
+        + list(raw_dir.glob("*crisiswatchdata*.txt"))  # e.g., crisiswatchdataNOV25.txt
         + list(raw_dir.glob("*CrisesWatchData*.txt"))
     )
     
     if not input_files:
         # Fallback: any txt file with "crisis" in name
-        input_files = [f for f in raw_dir.glob("*.txt") if "crisis" in f.name.lower() or "criseswatchdata" in f.name.lower()]
+        input_files = [f for f in raw_dir.glob("*.txt") if "crisis" in f.name.lower() or "crisiswatchdata" in f.name.lower()]
         
     if not input_files:
         logger.error("No CrisisWatch txt file found in data/raw/")

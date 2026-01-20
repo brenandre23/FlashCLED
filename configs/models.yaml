@@ -74,11 +74,15 @@ submodels:
   conflict_history:
     enabled: true
     features:
-    - fatalities_1m_lag
     - fatalities_14d_sum       # Added: Immediate intensity signal
+    - acled_count_battles
+    - acled_count_vac
+    - acled_count_explosions
+    - acled_count_protests
+    - acled_count_riots
     - protest_count_lag1       # Added: Civil unrest signal
     - riot_count_lag1          # Added: Violent demonstration signal
-    - conflict_density_10km
+    - gdelt_event_count        # Event volume (news)
     - regional_risk_score_lag1
 
   economics:
@@ -94,8 +98,7 @@ submodels:
     - oil_price_usd_lag1       # Added: Global crude oil price      
     - eur_usd_rate_lag1        # Added: Purchasing power parity
     - dist_to_city             # Market access proxy
-    - food_data_available      # Added: Structural flag for zero-filled food prices
-    - econ_data_available      # Added: Structural flag for zero-filled macro indicators
+    - food_price_index
 
   environmental:
     enabled: true
@@ -111,8 +114,15 @@ submodels:
     - ndvi_anomaly
     - ndvi_max
     - nightlights_intensity
+    - viirs_data_available
     - water_local_max
     - water_local_mean
+    - landcover_grass
+    - landcover_crops
+    - landcover_trees
+    - landcover_bare
+    - landcover_built
+    - landcover_data_available
     - dist_to_market_km        # Access/Infrastructure overlap
 
   epr:
@@ -121,8 +131,8 @@ submodels:
     - epr_excluded_groups_count
     - epr_discriminated_groups_count # Added: Active discrimination
     - ethnic_group_count             # Added: Diversity proxy
+    - epr_status_mean
     - iom_displacement_count_lag1    # Added: Displacement dynamics
-    - iom_data_available             # Added: Structural flag for zero-filled survey gaps
 
   demographic:
     enabled: true
@@ -158,13 +168,21 @@ submodels:
     - gdelt_decay_30d                # Short-term media volume (GDELT)
     - gdelt_goldstein_mean           # Event stability score (GDELT)
     - gdelt_mentions_total           # Event salience/importance (GDELT)
-    - ioda_outage_score_lag1          # IODA outages (lagged)
+    - gdelt_event_count              # Event counts (GDELT)
+    - ioda_outage_score               # IODA outages (current)
     - cw_score_local                  # CrisisWatch local score
     - cw_score_local_spatial_lag
     - cw_score_local_lag1
     - cw_score_local_spatial_lag_lag1
     - cw_score_local_lag1_decay_30d
     - cw_score_local_spatial_lag_lag1_decay_30d
+    # CrisisWatch topic pivots (semantic names)
+    - cw_rebel_coalition
+    - cw_transhumance_militia
+    - cw_resource_predation
+    - cw_foreign_influence
+    - cw_state_vacuum
+    - cw_sectarian_cleansing
     - driver_resource_cattle          # ACLED hybrid NLP drivers
     - driver_resource_mining
     - driver_econ_taxation

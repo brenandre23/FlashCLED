@@ -6,6 +6,7 @@ Practical examples for running the Conflict Early Warning Pipeline.
 - [Basic Usage](#basic-usage)
 - [Phase Control](#phase-control)
 - [Date Range Specification](#date-range-specification)
+- [Diagnostic Modes](#diagnostic-modes)
 - [Advanced Workflows](#advanced-workflows)
 - [Output Interpretation](#output-interpretation)
 - [Command Reference](#command-reference)
@@ -117,6 +118,199 @@ python main.py \
 
 ---
 
+## Diagnostic Modes
+
+The pipeline includes specialized diagnostic modes for analyzing feature quality before model training. These modes **automatically exclude structural break flags** (data availability indicators) that add noise to VIF/correlation analysis.
+
+### Prerequisites
+
+**Important:** Diagnostic modes require an existing feature matrix. You must run the pipeline first:
+
+```bash
+# Option 1: Full pipeline
+python main.py
+
+# Option 2: Build matrix without modeling (faster)
+python main.py --skip-modeling --skip-analysis
+```
+
+### Run Full Diagnostics
+
+```bash
+# Run all diagnostics (VIF, correlation, stability analysis)
+# Structural break flags excluded by default
+python main.py --run-diagnostics-only
+```
+
+Output files in `analysis/diagnostics/`:
+- `pairwise_dependence.csv` - Feature pairs with |ρ| ≥ 0.6
+- `theme_redundancy.csv` - Per-theme VIF, condition number, PCA variance
+- `temporal_stability.csv` - Correlation stability across time periods
+- `interpretability_checks.csv` - Per-feature variance, entropy, max correlation
+- `excluded_columns.csv` - Columns excluded and reasons
+
+### Run Collinearity Check Only
+
+```bash
+# Just VIF and correlation analysis
+python main.py --run-collinearity-only
+```
+
+Output files in `data/processed/`:
+- `vif_analysis.csv` - Full VIF analysis
+- `correlation_matrix.parquet` - Complete correlation matrix
+- `feature_clusters.json` - Hierarchical clustering of correlated features
+- `suggested_removals.json` - Features flagged for potential removal
+
+### Control Structural Break Filtering
+
+```bash
+# Include structural break flags (for comparison)
+python main.py --run-diagnostics-only --include-structural-breaks
+
+# Exclude additional columns beyond structural breaks
+python main.py --run-diagnostics-only --diagnostic-exclude-cols "cw_score_local,gdelt_goldstein_mean"
+
+# Use sampling for faster analysis on large datasets
+python main.py --run-diagnostics-only --diagnostic-sample-frac 0.3
+```
+
+### List Structural Break Flags
+
+```bash
+# Show all configured structural break flags and their coverage
+python main.py --list-structural-breaks
+```
+
+Example output:
+```
+============================================================
+STRUCTURAL BREAK FLAGS
+============================================================
+
+Total configured flags: 10
+
+  - econ_data_available
+  - food_data_available
+  - gdelt_data_available
+  - ioda_data_available
+  - iom_data_available
+  - is_viirs_available
+  - is_worldpop_v1
+  - landcover_avail
+
+------------------------------------------------------------
+Checking feature matrix for structural break flags...
+  Present in matrix: 7
+    ✓ econ_data_available
+    ✓ ioda_data_available
+    ✓ iom_data_available
+    ...
+
+Coverage summary:
+  econ_data_available: 85.2% coverage (values: [0, 1])
+  iom_data_available: 72.3% coverage (values: [0, 1])
+  ...
+```
+
+### Standalone Diagnostic Scripts
+
+```bash
+# Run feature diagnostics directly
+python -m scripts.diagnostics.feature_diagnostics --exclude-structural-breaks
+
+# Run collinearity check with custom thresholds
+python -m scripts.collinearity_check \
+  --vif-threshold 5.0 \
+  --corr-threshold 0.8 \
+  --exclude-structural-breaks
+
+# Specify custom parquet file
+python -m scripts.diagnostics.feature_diagnostics \
+  --parquet data/processed/custom_matrix.parquet
+```
+
+### Programmatic Usage
+
+```python
+from pipeline.common.diagnostic_utils import (
+    filter_diagnostic_columns,
+    load_feature_matrix_for_diagnostics,
+    get_structural_break_flags,
+    summarize_structural_flags
+)
+
+# Load pre-filtered matrix
+df = load_feature_matrix_for_diagnostics(
+    exclude_structural_breaks=True,
+    extra_exclusions=["col1", "col2"],
+    sample_frac=0.5
+)
+
+# Or filter an existing DataFrame
+df_filtered = filter_diagnostic_columns(
+    df,
+    exclude_structural_breaks=True,
+    extra_exclusions=["col1"]
+)
+
+# List configured flags
+flags = get_structural_break_flags()
+print(f"Structural break flags: {flags}")
+
+# Get coverage summary
+summary = summarize_structural_flags(df)
+print(summary)
+```
+
+### Configuration
+
+Structural break flags are configured in `configs/features.yaml`:
+
+```yaml
+diagnostics:
+  structural_break_flags:
+    - is_worldpop_v1
+    - iom_data_available
+    - econ_data_available
+    - ioda_data_available
+    - landcover_avail
+    - is_viirs_available
+    - gdelt_data_available
+    - food_data_available
+  
+  exclude_from_diagnostics: []  # Add columns here
+  
+  thresholds:
+    vif_warning: 5.0
+    vif_severe: 10.0
+    correlation_warning: 0.7
+    correlation_severe: 0.9
+```
+
+### Why Filter Structural Break Flags?
+
+Structural break flags are binary (0/1) columns indicating data availability periods:
+
+| Flag | Purpose |
+|------|--------|
+| `is_worldpop_v1` | WorldPop V1 vs V2 methodology (pre-2015) |
+| `iom_data_available` | IOM DTM coverage start (2015-01-31) |
+| `econ_data_available` | Yahoo Finance coverage (2003-12-01) |
+| `ioda_data_available` | IODA monitoring start (2022-02-01) |
+| `landcover_avail` | Dynamic World start (2015-06-27) |
+| `is_viirs_available` | VIIRS coverage start (2012-01-28) |
+
+These flags are **essential for XGBoost training** (teaching the model when data becomes available) but:
+
+1. **Inflate VIF artificially** - Binary flags with high prevalence correlate spuriously with many features
+2. **Pollute correlation matrices** - Show up as "highly correlated" with unrelated features
+3. **Distort clustering** - Create artificial feature clusters based on data availability
+
+By default, diagnostic modes exclude them to give you a cleaner picture of actual feature relationships. Use `--include-structural-breaks` to include them when needed.
+
+---
+
 ## Advanced Workflows
 
 ### Scenario 1: Update Data Only
@@ -127,7 +321,7 @@ You have existing models but want to refresh with latest data:
 # Step 1: Ingest new data
 python main.py \
   --start-date 2025-01-01 \
-  --end-date 2025-12-31 \
+  --end-date 2025-12-04 \
   --skip-modeling \
   --skip-analysis
 
@@ -256,16 +450,31 @@ Generated plots include:
 python main.py --help
 
 Options:
-  --start-date TEXT      Override start date (YYYY-MM-DD)
-  --end-date TEXT        Override end date (YYYY-MM-DD)
-  --reset-schema         Drop and recreate database schema
-  --skip-static          Skip static data ingestion
-  --skip-dynamic         Skip dynamic data ingestion
-  --skip-features        Skip feature engineering
-  --skip-modeling        Skip model training and predictions
-  --skip-analysis        Skip post-run analysis
-  --validate-only        Check prerequisites without running
-  --help                 Show this message and exit
+  --start-date TEXT              Override start date (YYYY-MM-DD)
+  --end-date TEXT                Override end date (YYYY-MM-DD)
+  --reset-schema                 Drop and recreate database schema
+  --skip-static                  Skip static data ingestion
+  --skip-dynamic                 Skip dynamic data ingestion
+  --skip-gdelt-themes            Skip GDELT themes fetch (BigQuery)
+  --skip-features                Skip feature engineering
+  --skip-modeling                Skip model training and predictions
+  --skip-analysis                Skip post-run analysis
+  --stop-after-features          Run feature engineering, write schema summary, exit
+  --stop-after-feature-matrix    Build feature matrix, then exit before modeling
+  --step [acled_hybrid|build_matrix]
+                                 Run a single pipeline step and exit
+  --validate-only                Check prerequisites without running
+  
+  # Diagnostic Options
+  --run-diagnostics-only         Run VIF/correlation diagnostics and exit
+  --run-collinearity-only        Run collinearity check only and exit
+  --exclude-structural-breaks    Exclude data availability flags from diagnostics (default)
+  --include-structural-breaks    Include structural break flags in diagnostics
+  --diagnostic-exclude-cols TEXT Comma-separated columns to exclude from diagnostics
+  --diagnostic-sample-frac FLOAT Sample fraction for diagnostics (0.0-1.0)
+  --list-structural-breaks       List all structural break flags and exit
+  
+  --help                         Show this message and exit
 ```
 
 ### Individual Script Execution
@@ -302,9 +511,37 @@ python pipeline/analysis/analyze_feature_importance.py
 
 ### Issue: "Feature matrix not found"
 
-**Solution:** You skipped too many phases. Run:
+**Cause:** You skipped too many phases or are running diagnostics without building the matrix first.
+
+**Solution:**
 ```bash
-python main.py --skip-static --skip-dynamic
+# Build the feature matrix
+python main.py --skip-modeling --skip-analysis
+
+# Or rebuild just the matrix from existing DB
+python main.py --step build_matrix
+```
+
+### Issue: "Feature matrix not found" when running --run-diagnostics-only
+
+**Cause:** Diagnostic modes require an existing feature matrix. They don't build one from scratch.
+
+**Solution:**
+```bash
+# Step 1: Build the pipeline first
+python main.py --skip-modeling --skip-analysis
+
+# Step 2: Then run diagnostics
+python main.py --run-diagnostics-only
+```
+
+### Issue: "Missing required features" when building feature matrix
+
+**Cause:** The database tables haven't been populated yet.
+
+**Solution:** Run the full pipeline from the beginning:
+```bash
+python main.py
 ```
 
 ### Issue: "Model file not found"
@@ -324,6 +561,25 @@ python main.py --start-date 2023-01-01 --end-date 2024-01-01
 ### Issue: "Google Earth Engine quota exceeded"
 
 **Solution:** GEE has daily limits. Wait 24 hours or use service account for higher quota.
+
+### Issue: VIF values seem artificially high
+
+**Cause:** Structural break flags may be included in the analysis.
+
+**Solution:** Ensure you're excluding them (default behavior):
+```bash
+python main.py --run-diagnostics-only
+
+# Or explicitly exclude
+python main.py --run-collinearity-only --exclude-structural-breaks
+```
+
+### Issue: Diagnostics taking too long
+
+**Solution:** Use sampling for faster iteration:
+```bash
+python main.py --run-diagnostics-only --diagnostic-sample-frac 0.3
+```
 
 ---
 

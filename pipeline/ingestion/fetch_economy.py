@@ -181,7 +181,7 @@ def run(configs, engine):
     
     data_cfg = configs['data']
     start_date = data_cfg.get('global_date_window', {}).get('start_date', '2000-01-01')
-    end_date = data_cfg.get('global_date_window', {}).get('end_date', '2025-12-31')
+    end_date = data_cfg.get('global_date_window', {}).get('end_date', None)
     
     # Enforce lower bound to avoid stale pre-2003 data
     min_start = pd.to_datetime("2003-12-01").date()

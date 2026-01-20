@@ -203,6 +203,84 @@ The pipeline explicitly tracks data availability shifts:
 | `econ_data_available` | Pre-2003-12-01 | Yahoo Finance coverage start |
 | `ioda_data_available` | Pre-2022-02-01 | IODA internet monitoring start |
 | `landcover_avail` | Pre-2015-06-27 | Dynamic World landcover start |
+| `is_viirs_available` | Pre-2012-01-28 | VIIRS nighttime lights coverage start |
+| `gdelt_data_available` | Pre-2015 | GDELT v2 coverage start |
+| `food_data_available` | varies | FEWS NET food price coverage |
+
+> **Note:** These flags are **essential for model training** (teaching XGBoost about data availability) but **add noise to diagnostic analysis** (VIF, correlation). The diagnostic modes automatically exclude them by default. See [Diagnostic Modes](#-diagnostic-modes) below.
+
+---
+
+## 🔬 Diagnostic Modes
+
+The pipeline includes specialized diagnostic modes for feature quality analysis, with **automatic filtering of structural break flags** to avoid noise in VIF/correlation analysis.
+
+### Quick Reference
+
+```bash
+# Run full diagnostics (VIF, correlation, stability) - excludes structural break flags by default
+python main.py --run-diagnostics-only
+
+# Run collinearity check only
+python main.py --run-collinearity-only
+
+# Include structural break flags in diagnostics (for comparison)
+python main.py --run-diagnostics-only --include-structural-breaks
+
+# Exclude additional columns
+python main.py --run-diagnostics-only --diagnostic-exclude-cols "col1,col2,col3"
+
+# List all structural break flags
+python main.py --list-structural-breaks
+```
+
+### Prerequisites
+
+Diagnostic modes require an **existing feature matrix**. Run the pipeline first:
+
+```bash
+# Build feature matrix (skip modeling for faster iteration)
+python main.py --skip-modeling --skip-analysis
+
+# Then run diagnostics
+python main.py --run-diagnostics-only
+```
+
+### Diagnostic Outputs
+
+Generated in `analysis/diagnostics/`:
+
+| File | Description |
+|------|-------------|
+| `pairwise_dependence.csv` | Feature pairs with \|ρ\| ≥ 0.6 |
+| `theme_redundancy.csv` | Per-theme VIF, condition number, PCA variance |
+| `temporal_stability.csv` | Correlation stability across time periods |
+| `interpretability_checks.csv` | Per-feature variance, entropy, max correlation |
+| `excluded_columns.csv` | Columns excluded from diagnostics and why |
+| `vif_analysis.csv` | Full VIF analysis (collinearity check) |
+| `correlation_matrix.parquet` | Complete correlation matrix |
+| `suggested_removals.json` | Features flagged for potential removal |
+
+### Configuration
+
+Structural break flags are configured in `configs/features.yaml`:
+
+```yaml
+diagnostics:
+  structural_break_flags:
+    - is_worldpop_v1
+    - iom_data_available
+    - econ_data_available
+    # ... see features.yaml for full list
+  
+  thresholds:
+    vif_warning: 5.0
+    vif_severe: 10.0
+    correlation_warning: 0.7
+    correlation_severe: 0.9
+```
+
+See [docs/DIAGNOSTIC_FILTERING.md](docs/DIAGNOSTIC_FILTERING.md) for complete documentation.
 
 ---
 

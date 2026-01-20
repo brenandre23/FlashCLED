@@ -65,7 +65,7 @@ from pipeline.processing import (
     spatial_disaggregation,
     feature_engineering as master_fe,
     calculate_epr_features,
-    process_criseswatch,
+    process_crisiswatch,
     process_acled_hybrid,
 )
 
@@ -312,7 +312,7 @@ class CEWPPipeline:
 
             # 3.3 CrisisWatch NLP Features
             logger.info(">> Generating CrisisWatch NLP Features...")
-            process_criseswatch.run()
+            process_crisiswatch.run()
 
             # 3.4 EPR Features (Sidecar)
             calculate_epr_features.main()
@@ -322,6 +322,20 @@ class CEWPPipeline:
             self._write_feature_schema_summary()
             logger.info("stop-after-features set; exiting before modeling. Review summary and prune as needed.")
             return "STOP_AFTER_FEATURES"
+
+        # Optional: stop after building feature matrix (no modeling/predictions)
+        if getattr(self.args, "stop_after_feature_matrix", False):
+            logger.info("stop-after-feature-matrix set; building feature matrix, then exiting before modeling.")
+            if self.configs["data"].get("validation", {}).get("run_assertions", False):
+                logger.info("Running data contract assertions before building feature matrix...")
+                run_assertions.run_checks()
+            build_feature_matrix.run(
+                self.configs,
+                self.engine,
+                str(self.start_date),
+                str(self.end_date)
+            )
+            return "STOP_AFTER_FEATURE_MATRIX"
 
         # Optional collinearity diagnostics before modeling
         if getattr(self.args, "run_collinearity_only", False):
@@ -459,32 +473,21 @@ class CEWPPipeline:
         try:
             self.setup()
             
+            # Handle list-structural-breaks mode
+            if self.args.list_structural_breaks:
+                return self._list_structural_breaks()
+            
             # Handle validation-only mode
             if self.args.validate_only:
                 return self.run_validation_only()
 
             # Handle diagnostics-only mode
             if self.args.run_diagnostics_only:
-                logger.info("Diagnostics-only mode: ensuring feature matrix exists, then running diagnostics.")
-                # Build matrix if missing
-                matrix_path = Path("data/processed/feature_matrix.parquet")
-                if not matrix_path.exists():
-                    logger.info("Feature matrix missing; building before diagnostics.")
-                    build_feature_matrix.run(
-                        self.configs,
-                        self.engine,
-                        str(self.start_date),
-                        str(self.end_date)
-                    )
-                try:
-                    from scripts.diagnostics import feature_diagnostics, visualize_diagnostics
-                except ImportError as e:
-                    logger.error(f"Diagnostics modules not found: {e}")
-                    return 1
-
-                feature_diagnostics.main()
-                visualize_diagnostics.main()
-                return 0
+                return self._run_diagnostics_mode()
+            
+            # Handle collinearity-only mode
+            if self.args.run_collinearity_only:
+                return self._run_collinearity_mode()
 
             # Handle single-step mode
             if self.args.step:
@@ -554,6 +557,211 @@ class CEWPPipeline:
         except Exception as e:
             logger.warning(f"Could not write feature schema summary: {e}")
 
+    def _get_diagnostic_options(self) -> Dict[str, Any]:
+        """
+        Extract diagnostic options from CLI args into a dict.
+        """
+        # Determine if structural breaks should be excluded
+        exclude_structural = not getattr(self.args, "include_structural_breaks", False)
+        
+        # Parse extra exclusions
+        extra_exclusions = []
+        if self.args.diagnostic_exclude_cols:
+            extra_exclusions = [
+                c.strip() for c in self.args.diagnostic_exclude_cols.split(",")
+                if c.strip()
+            ]
+        
+        return {
+            "exclude_structural_breaks": exclude_structural,
+            "extra_exclusions": extra_exclusions,
+            "sample_frac": self.args.diagnostic_sample_frac,
+        }
+
+    def _list_structural_breaks(self) -> int:
+        """
+        List all structural break flags defined in config and exit.
+        """
+        try:
+            from pipeline.common.diagnostic_utils import (
+                get_structural_break_flags,
+                summarize_structural_flags
+            )
+        except ImportError as e:
+            logger.error(f"diagnostic_utils not found: {e}")
+            return 1
+        
+        features_cfg = self.configs.get("features", {})
+        flags = get_structural_break_flags(features_cfg)
+        
+        logger.info("\n" + "=" * 60)
+        logger.info("STRUCTURAL BREAK FLAGS")
+        logger.info("=" * 60)
+        logger.info(f"\nTotal configured flags: {len(flags)}\n")
+        
+        for flag in sorted(flags):
+            logger.info(f"  - {flag}")
+        
+        # If feature matrix exists, show which flags are present
+        matrix_path = Path("data/processed/feature_matrix.parquet")
+        if matrix_path.exists():
+            logger.info("\n" + "-" * 60)
+            logger.info("Checking feature matrix for structural break flags...")
+            df = pd.read_parquet(matrix_path)
+            present_flags = [f for f in flags if f in df.columns]
+            missing_flags = [f for f in flags if f not in df.columns]
+            
+            logger.info(f"  Present in matrix: {len(present_flags)}")
+            for f in present_flags:
+                logger.info(f"    ✓ {f}")
+            
+            if missing_flags:
+                logger.info(f"  Not in matrix: {len(missing_flags)}")
+                for f in missing_flags:
+                    logger.info(f"    ✗ {f}")
+            
+            # Show coverage summary
+            logger.info("\nCoverage summary:")
+            summary_df = summarize_structural_flags(df)
+            if not summary_df.empty:
+                for _, row in summary_df.iterrows():
+                    logger.info(
+                        f"  {row['flag_name']}: {row['coverage_pct']:.1f}% coverage "
+                        f"(values: {row['unique_values']})"
+                    )
+        
+        logger.info("\n" + "=" * 60)
+        return 0
+
+    def _run_diagnostics_mode(self) -> int:
+        """
+        Run diagnostics-only mode with structural break filtering.
+        """
+        logger.info("\n" + "=" * 60)
+        logger.info("DIAGNOSTICS-ONLY MODE")
+        logger.info("=" * 60)
+        
+        # Check if matrix exists - don't try to build from empty DB
+        matrix_path = Path("data/processed/feature_matrix.parquet")
+        if not matrix_path.exists():
+            logger.error(
+                f"Feature matrix not found: {matrix_path}\n\n"
+                "The --run-diagnostics-only mode requires an existing feature matrix.\n"
+                "To create one, run the full pipeline first:\n\n"
+                "    python main.py\n\n"
+                "Or run specific phases:\n\n"
+                "    python main.py --skip-modeling --skip-analysis\n\n"
+                "Then re-run diagnostics:\n\n"
+                "    python main.py --run-diagnostics-only"
+            )
+            return 1
+        
+        # Get diagnostic options
+        diag_opts = self._get_diagnostic_options()
+        
+        logger.info(f"\nDiagnostic options:")
+        logger.info(f"  Exclude structural breaks: {diag_opts['exclude_structural_breaks']}")
+        if diag_opts['extra_exclusions']:
+            logger.info(f"  Additional exclusions: {diag_opts['extra_exclusions']}")
+        if diag_opts['sample_frac']:
+            logger.info(f"  Sample fraction: {diag_opts['sample_frac']}")
+        
+        try:
+            from scripts.diagnostics import feature_diagnostics, visualize_diagnostics
+            from pipeline.common.diagnostic_utils import (
+                load_feature_matrix_for_diagnostics,
+                get_structural_break_flags
+            )
+        except ImportError as e:
+            logger.error(f"Diagnostics modules not found: {e}")
+            return 1
+        
+        # Log which flags will be excluded
+        if diag_opts['exclude_structural_breaks']:
+            flags = get_structural_break_flags(self.configs.get("features", {}))
+            logger.info(f"\nStructural break flags to exclude ({len(flags)}):")
+            for f in sorted(flags):
+                logger.info(f"  - {f}")
+        
+        # Run diagnostics with filtered data
+        # Pass options via environment variables
+        import os
+        os.environ["CEWP_DIAG_EXCLUDE_STRUCTURAL"] = str(diag_opts['exclude_structural_breaks'])
+        os.environ["CEWP_DIAG_EXTRA_EXCLUSIONS"] = ",".join(diag_opts['extra_exclusions'] or [])
+        if diag_opts['sample_frac']:
+            os.environ["CEWP_DIAG_SAMPLE_FRAC"] = str(diag_opts['sample_frac'])
+        
+        feature_diagnostics.main(diag_opts=diag_opts)
+        visualize_diagnostics.main()
+        
+        # Clean up environment
+        for key in ["CEWP_DIAG_EXCLUDE_STRUCTURAL", "CEWP_DIAG_EXTRA_EXCLUSIONS", "CEWP_DIAG_SAMPLE_FRAC"]:
+            os.environ.pop(key, None)
+        
+        return 0
+
+    def _run_collinearity_mode(self) -> int:
+        """
+        Run collinearity-only mode with structural break filtering.
+        """
+        logger.info("\n" + "=" * 60)
+        logger.info("COLLINEARITY-ONLY MODE")
+        logger.info("=" * 60)
+        
+        # Check if matrix exists - don't try to build from empty DB
+        matrix_path = Path("data/processed/feature_matrix.parquet")
+        if not matrix_path.exists():
+            logger.error(
+                f"Feature matrix not found: {matrix_path}\n\n"
+                "The --run-collinearity-only mode requires an existing feature matrix.\n"
+                "To create one, run the full pipeline first:\n\n"
+                "    python main.py\n\n"
+                "Or run specific phases:\n\n"
+                "    python main.py --skip-modeling --skip-analysis\n\n"
+                "Then re-run collinearity check:\n\n"
+                "    python main.py --run-collinearity-only"
+            )
+            return 1
+        
+        # Get diagnostic options
+        diag_opts = self._get_diagnostic_options()
+        
+        logger.info(f"\nDiagnostic options:")
+        logger.info(f"  Exclude structural breaks: {diag_opts['exclude_structural_breaks']}")
+        if diag_opts['extra_exclusions']:
+            logger.info(f"  Additional exclusions: {diag_opts['extra_exclusions']}")
+        
+        try:
+            from pipeline.common.diagnostic_utils import (
+                load_feature_matrix_for_diagnostics,
+                get_structural_break_flags
+            )
+            from scripts import collinearity_check
+        except ImportError as e:
+            logger.error(f"Required modules not found: {e}")
+            return 1
+        
+        # Log which flags will be excluded
+        if diag_opts['exclude_structural_breaks']:
+            flags = get_structural_break_flags(self.configs.get("features", {}))
+            logger.info(f"\nStructural break flags to exclude ({len(flags)}):")
+            for f in sorted(flags):
+                logger.info(f"  - {f}")
+        
+        # Load filtered matrix and run collinearity check
+        df = load_feature_matrix_for_diagnostics(
+            parquet_path=matrix_path,
+            exclude_structural_breaks=diag_opts['exclude_structural_breaks'],
+            extra_exclusions=diag_opts['extra_exclusions'],
+            sample_frac=diag_opts['sample_frac']
+        )
+        
+        # Run analysis on filtered data
+        collinearity_check.run_full_analysis(df)
+        
+        logger.info("Collinearity check complete. Exiting before modeling.")
+        return 0
+
 
 # ---------------------------------------------------------
 # 4) ENTRY POINT
@@ -580,6 +788,11 @@ def parse_args():
         help="Run feature engineering, write schema summary, and exit before modeling."
     )
     parser.add_argument(
+        "--stop-after-feature-matrix",
+        action="store_true",
+        help="Run through feature engineering, build the feature matrix, then exit before modeling."
+    )
+    parser.add_argument(
         "--step",
         choices=["acled_hybrid", "build_matrix"],
         help="Run a single pipeline step and exit (bypasses full orchestration)."
@@ -600,6 +813,41 @@ def parse_args():
         "--run-diagnostics-only",
         action="store_true",
         help="Run consolidated diagnostics (correlation/VIF) and exit before modeling."
+    )
+    
+    # =========================================================================
+    # DIAGNOSTIC OPTIONS
+    # =========================================================================
+    parser.add_argument(
+        "--exclude-structural-breaks",
+        action="store_true",
+        default=True,
+        help="Exclude structural break flags (data availability indicators) from diagnostics. "
+             "Default: True. These flags (is_worldpop_v1, iom_data_available, etc.) add noise "
+             "to VIF/correlation analysis."
+    )
+    parser.add_argument(
+        "--include-structural-breaks",
+        action="store_true",
+        help="Include structural break flags in diagnostics (overrides default exclusion)."
+    )
+    parser.add_argument(
+        "--diagnostic-exclude-cols",
+        type=str,
+        default=None,
+        help="Comma-separated list of additional columns to exclude from diagnostics. "
+             "Example: --diagnostic-exclude-cols 'col1,col2,col3'"
+    )
+    parser.add_argument(
+        "--diagnostic-sample-frac",
+        type=float,
+        default=None,
+        help="Sample fraction for diagnostics (0.0-1.0). Use for faster analysis on large datasets."
+    )
+    parser.add_argument(
+        "--list-structural-breaks",
+        action="store_true",
+        help="List all structural break flags defined in config and exit."
     )
     
     return parser.parse_args()

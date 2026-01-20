@@ -238,7 +238,7 @@ The pipeline is controlled by three config files in `configs/`:
 ```yaml
 global_date_window:
   start_date: "2000-01-01"  # Adjust to your needs
-  end_date: "2025-12-31"    # Adjust to your needs
+  end_date: "2025-12-04"    # Adjust to your needs
 ```
 
 ---

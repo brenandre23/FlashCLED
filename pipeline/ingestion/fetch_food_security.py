@@ -196,7 +196,7 @@ def fetch_fews_market_prices(data_config, features_config, market_lookup, auth_t
     
     url = "https://fdw.fews.net/api/marketpricefacts/"
     start_date = data_config.get("global_date_window", {}).get("start_date", "2015-01-01")
-    end_date = data_config.get("global_date_window", {}).get("end_date", "2025-12-31")
+    end_date = data_config.get("global_date_window", {}).get("end_date", None)
     
     params = {"country_code": "CF", "start_date": start_date, "end_date": end_date, "format": "json"}
     headers = {"Authorization": f"JWT {auth_token}", "Content-Type": "application/json"}
