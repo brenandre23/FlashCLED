@@ -2623,199 +2623,256 @@ def process_conflict(engine, spine, conflict_specs, features_config):
 
     # results in identical risk scores, which triggered the "Equality = Leakage" alarm.
 
-    
-
-    # 2. Load GDELT
-
-    gdelt_vars = ['gdelt_event_count', 'gdelt_avg_tone', 'gdelt_goldstein_mean', 'gdelt_mentions_total']
-
+    # 2. Load GDELT (Full Dataset: CAR + Buffer)
+    gdelt_vars = [
+        'gdelt_event_count', 'gdelt_avg_tone', 'gdelt_goldstein_mean', 
+        'gdelt_mentions_total', 'gdelt_predatory_action_count', 'gdelt_border_buffer_flag',
+        'gdelt_theme_resource_predation_count', 'gdelt_theme_displacement_count', 'gdelt_theme_governance_breakdown_count'
+    ]
     gdelt_vars_sql = ", ".join(f"'{v}'" for v in gdelt_vars)
-
-    gdelt_raw = pd.read_sql(
-
-        f"""
-
-        SELECT h3_index, date, variable, value
-
-        FROM {SCHEMA}.features_dynamic_daily
-
-        WHERE variable IN ({gdelt_vars_sql})
-
-        """,
-
-        engine
-
-    )
+    
+    if insp.has_table("features_dynamic_daily", schema=SCHEMA):
+        gdelt_raw = pd.read_sql(
+            f"""
+            SELECT h3_index, date, variable, value
+            FROM {SCHEMA}.features_dynamic_daily
+            WHERE variable IN ({gdelt_vars_sql})
+            """,
+            engine
+        )
+    else:
+        logger.warning("  Table features_dynamic_daily not found (skipped?). Proceeding without GDELT.")
+        gdelt_raw = pd.DataFrame()
 
     if not gdelt_raw.empty:
-
         gdelt_raw['h3_index'] = gdelt_raw['h3_index'].astype('int64')
-
-    # IODA signals now stored separately (internet_outages)
-
-    try:
-
-        ioda_raw = pd.read_sql(
-
-            f"SELECT h3_index, date, variable, value FROM {SCHEMA}.internet_outages",
-
-            engine,
-
-        )
-
-    except Exception:
-
-        ioda_raw = pd.DataFrame(columns=["h3_index", "date", "variable", "value"])
-
-    gdelt_raw['date'] = pd.to_datetime(gdelt_raw['date'])
-
-    gdelt_raw['spine_date'] = pd.cut(gdelt_raw['date'], bins=dates, labels=dates[1:], right=True)
-
-    if not ioda_raw.empty:
-
-        ioda_raw['date'] = pd.to_datetime(ioda_raw['date'])
-
-        ioda_raw['spine_date'] = pd.cut(ioda_raw['date'], bins=dates, labels=dates[1:], right=True)
-
-    else:
-
-        ioda_raw['spine_date'] = pd.Series(dtype='datetime64[ns]')
-
-    
-
-    gdelt_event = gdelt_raw[gdelt_raw['variable'] == 'gdelt_event_count']
-
-    gdelt_tone = gdelt_raw[gdelt_raw['variable'] == 'gdelt_avg_tone']
-
-    gdelt_goldstein = gdelt_raw[gdelt_raw['variable'] == 'gdelt_goldstein_mean']
-
-    gdelt_mentions = gdelt_raw[gdelt_raw['variable'] == 'gdelt_mentions_total']
-
-    # Prefer new outage score; fallback to legacy detected flag
-
-    ioda_outage = ioda_raw[ioda_raw['variable'].isin(['ioda_outage_score', 'ioda_outage_detected'])]
-
-    ioda_connectivity = ioda_raw[ioda_raw['variable'] == 'ioda_connectivity_index'] if not ioda_raw.empty else pd.DataFrame(columns=['h3_index','spine_date','value'])
-
-    
-
-    gdelt_event_agg = gdelt_event.groupby(['h3_index', 'spine_date'], observed=True)['value'].sum().reset_index()
-    gdelt_event_agg = gdelt_event_agg.rename(columns={'spine_date': 'date', 'value': 'gdelt_event_count'})
-    gdelt_event_agg['h3_index'] = gdelt_event_agg['h3_index'].astype('int64')
-    gdelt_event_agg['date'] = pd.to_datetime(gdelt_event_agg['date'])
-
-    gdelt_tone_agg = gdelt_tone.groupby(['h3_index', 'spine_date'], observed=True)['value'].mean().reset_index()
-    gdelt_tone_agg = gdelt_tone_agg.rename(columns={'spine_date': 'date', 'value': 'gdelt_avg_tone'})
-    gdelt_tone_agg['h3_index'] = gdelt_tone_agg['h3_index'].astype('int64')
-    gdelt_tone_agg['date'] = pd.to_datetime(gdelt_tone_agg['date'])
-
-    gdelt_goldstein_agg = gdelt_goldstein.groupby(['h3_index', 'spine_date'], observed=True)['value'].mean().reset_index()
-    gdelt_goldstein_agg = gdelt_goldstein_agg.rename(columns={'spine_date': 'date', 'value': 'gdelt_goldstein_mean'})
-    gdelt_goldstein_agg['h3_index'] = gdelt_goldstein_agg['h3_index'].astype('int64')
-    gdelt_goldstein_agg['date'] = pd.to_datetime(gdelt_goldstein_agg['date'])
-
-    gdelt_mentions_agg = gdelt_mentions.groupby(['h3_index', 'spine_date'], observed=True)['value'].sum().reset_index()
-    gdelt_mentions_agg = gdelt_mentions_agg.rename(columns={'spine_date': 'date', 'value': 'gdelt_mentions_total'})
-    gdelt_mentions_agg['h3_index'] = gdelt_mentions_agg['h3_index'].astype('int64')
-    gdelt_mentions_agg['date'] = pd.to_datetime(gdelt_mentions_agg['date'])
-
-
-    ioda_outage_agg = pd.DataFrame(columns=['h3_index','date','ioda_outage_score'])
-    if not ioda_outage.empty:
-        ioda_outage_agg = (
-            ioda_outage
-            .groupby(['h3_index', 'spine_date'], observed=True)['value']
-            .max()
-
-            .reset_index()
-            .rename(columns={'spine_date': 'date', 'value': 'ioda_outage_score'})
-        )
-        ioda_outage_agg['h3_index'] = ioda_outage_agg['h3_index'].astype('int64')
-        ioda_outage_agg['date'] = pd.to_datetime(ioda_outage_agg['date'])
-
-    ioda_conn_agg = pd.DataFrame(columns=['h3_index','date','ioda_connectivity_index'])
-    if not ioda_connectivity.empty:
-        ioda_conn_agg = (
-            ioda_connectivity
-
-            .groupby(['h3_index','spine_date'], observed=True)['value']
-
-            .mean()
-
-            .reset_index()
-            .rename(columns={'spine_date':'date','value':'ioda_connectivity_index'})
-        )
-        ioda_conn_agg['h3_index'] = ioda_conn_agg['h3_index'].astype('int64')
-        ioda_conn_agg['date'] = pd.to_datetime(ioda_conn_agg['date'])
-
-
-    # 3. Merge onto Spine
-
-    spine = safe_merge(spine, acled_local_agg, on=['h3_index', 'date'], how='left')
-
-    
-
-    # --- PUBLICATION LAG: Apply to ACLED feature columns (NOT targets) ---
-
-    acled_lag_steps = get_publication_lag_steps(features_config, 'ACLED')
-
-    if acled_lag_steps > 0:
-
-        logger.info(f"  Applying {acled_lag_steps}-step publication lag to ACLED features...")
-
+        gdelt_raw['date'] = pd.to_datetime(gdelt_raw['date'])
         
-
-        # Feature columns that need lagging (observed counts)
-
-        acled_feature_cols = [
-
-            'fatalities', 'protest_count', 'riot_count',
-
-            'acled_count_battles', 'acled_count_vac', 'acled_count_explosions',
-
-            'acled_count_protests', 'acled_count_riots'
-
+        # Bin to Spine Dates
+        gdelt_raw['spine_date'] = pd.cut(gdelt_raw['date'], bins=dates, labels=dates[1:], right=True)
+        
+        # Pivot to Wide Format
+        gdelt_wide = gdelt_raw.pivot_table(
+            index=['h3_index', 'spine_date'], 
+            columns='variable', 
+            values='value', 
+            aggfunc='mean'
+        ).reset_index().rename(columns={'spine_date': 'date'})
+        
+        gdelt_wide['date'] = pd.to_datetime(gdelt_wide['date'])
+        
+        # Ensure count and predatory_action_count are sums, not means
+        count_vars = [
+            'gdelt_event_count', 'gdelt_predatory_action_count',
+            'gdelt_theme_resource_predation_count', 'gdelt_theme_displacement_count', 'gdelt_theme_governance_breakdown_count'
         ]
-
+        for count_var in count_vars:
+            if count_var in gdelt_raw['variable'].unique():
+                agg_sum = gdelt_raw[gdelt_raw['variable'] == count_var].pivot_table(
+                    index=['h3_index', 'spine_date'], 
+                    values='value', 
+                    aggfunc='sum'
+                ).reset_index().rename(columns={'spine_date': 'date', 'value': count_var})
+                agg_sum['date'] = pd.to_datetime(agg_sum['date'])
+                
+                if count_var in gdelt_wide.columns:
+                    gdelt_wide.drop(columns=[count_var], inplace=True)
+                gdelt_wide = pd.merge(gdelt_wide, agg_sum, on=['h3_index', 'date'], how='outer')
         
-
-        # Apply lag to feature columns only
-
-        spine = spine.sort_values(['h3_index', 'date'])
-
-        for col in acled_feature_cols:
-
-            if col in spine.columns:
-
-                spine[col] = spine.groupby('h3_index')[col].shift(acled_lag_steps).fillna(0)
-
+        # --- SPATIAL LAG CALCULATION ON FULL GDELT DATA (Ghost Lookup) ---
+        logger.info("  Calculating GDELT Spatial Lags on Full (CAR+Buffer) Dataset...")
+        gdelt_targets = [
+            'gdelt_event_count', 'gdelt_avg_tone', 'gdelt_predatory_action_count',
+            'gdelt_theme_resource_predation_count', 'gdelt_theme_displacement_count', 'gdelt_theme_governance_breakdown_count'
+        ]
+        for col in gdelt_targets:
+            if col in gdelt_wide.columns:
+                gdelt_wide = add_spatial_diffusion_features(gdelt_wide, col, k=1)
         
-
-        logger.info(f"  ✓ ACLED features lagged by {acled_lag_steps} step(s)")
-
+        # --- NATIONAL HEAT (AGGREGATION) ---
+        logger.info("  Calculating National Heat Levels...")
+        nat_cols = [c for c in gdelt_targets if c in gdelt_wide.columns and 'avg_tone' not in c]
+        if nat_cols:
+            # Sum across all H3 cells per date
+            nat_agg = gdelt_wide.groupby('date')[nat_cols].sum().reset_index()
+            # Rename
+            rename_map = {c: f"national_{c.replace('gdelt_', '').replace('_count', '')}_sum" for c in nat_cols}
+            nat_agg.rename(columns=rename_map, inplace=True)
+            # Merge to spine
+            spine = safe_merge(spine, nat_agg, on='date', how='left')
+            # Apply Lags & Decays
+            for n_col in rename_map.values():
+                spine[n_col] = spine[n_col].fillna(0)
+                spine[f"{n_col}_lag1"] = spine.groupby('h3_index')[n_col].shift(1).fillna(0)
+                spine = apply_halflife_decay(spine, f"{n_col}_lag1", features_config)
+                
+        # Now merge the enriched GDELT data (with lags) onto the spine
+        spine = safe_merge(spine, gdelt_wide, on=['h3_index', 'date'], how='left')
         
+    else:
+        logger.warning("  GDELT data empty.")
 
-        # NOTE: target_fatalities and target_binary are NOT lagged
-
-        # They represent what we're predicting, not operational features
+        # IODA signals now stored separately (internet_outages)
 
     
 
-    if admin_col in spine.columns:
+        try:
 
-        spine = safe_merge(spine, acled_regional_agg[[admin_col, 'date', 'regional_risk_score_lag1']], on=[admin_col, 'date'], how='left')
+    
 
-    spine = safe_merge(spine, gdelt_event_agg, on=['h3_index', 'date'], how='left')
+            ioda_raw = pd.read_sql(
 
-    spine = safe_merge(spine, gdelt_tone_agg, on=['h3_index', 'date'], how='left')
+    
 
-    spine = safe_merge(spine, gdelt_goldstein_agg, on=['h3_index', 'date'], how='left')
+                f"SELECT h3_index, date, variable, value FROM {SCHEMA}.internet_outages",
 
-    spine = safe_merge(spine, gdelt_mentions_agg, on=['h3_index', 'date'], how='left')
+    
 
-    spine = safe_merge(spine, ioda_outage_agg, on=['h3_index', 'date'], how='left')
+                engine,
 
-    spine = safe_merge(spine, ioda_conn_agg, on=['h3_index', 'date'], how='left')
+    
+
+            )
+
+    
+
+        except Exception:
+
+    
+
+            ioda_raw = pd.DataFrame(columns=["h3_index", "date", "variable", "value"])
+
+    
+
+    
+
+    
+
+        if not ioda_raw.empty:
+
+    
+
+            ioda_raw['date'] = pd.to_datetime(ioda_raw['date'])
+
+    
+
+            ioda_raw['spine_date'] = pd.cut(ioda_raw['date'], bins=dates, labels=dates[1:], right=True)
+
+    
+
+            
+
+    
+
+            ioda_outage = ioda_raw[ioda_raw['variable'].isin(['ioda_outage_score', 'ioda_outage_detected'])]
+
+    
+
+            ioda_connectivity = ioda_raw[ioda_raw['variable'] == 'ioda_connectivity_index']
+
+    
+
+    
+
+    
+
+            ioda_outage_agg = (
+
+    
+
+                ioda_outage
+
+    
+
+                .groupby(['h3_index', 'spine_date'], observed=True)['value']
+
+    
+
+                .max()
+
+    
+
+                .reset_index()
+
+    
+
+                .rename(columns={'spine_date': 'date', 'value': 'ioda_outage_score'})
+
+    
+
+            )
+
+    
+
+            ioda_outage_agg['date'] = pd.to_datetime(ioda_outage_agg['date'])
+
+    
+
+            ioda_outage_agg['h3_index'] = ioda_outage_agg['h3_index'].astype('int64')
+
+    
+
+    
+
+    
+
+            ioda_conn_agg = (
+
+    
+
+                ioda_connectivity
+
+    
+
+                .groupby(['h3_index','spine_date'], observed=True)['value']
+
+    
+
+                .mean()
+
+    
+
+                .reset_index()
+
+    
+
+                .rename(columns={'spine_date':'date','value':'ioda_connectivity_index'})
+
+    
+
+            )
+
+    
+
+            ioda_conn_agg['date'] = pd.to_datetime(ioda_conn_agg['date'])
+
+    
+
+            ioda_conn_agg['h3_index'] = ioda_conn_agg['h3_index'].astype('int64')
+
+    
+
+    
+
+    
+
+            spine = safe_merge(spine, ioda_outage_agg, on=['h3_index', 'date'], how='left')
+
+    
+
+            spine = safe_merge(spine, ioda_conn_agg, on=['h3_index', 'date'], how='left')
+
+    
+
+    
+
+    
+
+        # 3. Merge onto Spine (ACLED already loaded above)
+
+    
+
+        spine = safe_merge(spine, acled_local_agg, on=['h3_index', 'date'], how='left')
 
 
 
@@ -2874,42 +2931,32 @@ def process_conflict(engine, spine, conflict_specs, features_config):
     
 
     # 5. Create fatalities_14d_sum (raw per-step) after publication lag is applied
-
     spine['fatalities_14d_sum'] = spine['fatalities']
 
-
-
     # 6. Shock + Stress pipeline with spatial diffusion
-
     target_cols = [
-
         'cw_score_local',
-
         'fatalities_14d_sum',
-
         'protest_count',
-
         'riot_count',
-
         'acled_count_battles',
-
         'acled_count_vac',
-
         'acled_count_explosions',
-
         'acled_count_protests',
-
         'acled_count_riots',
-
         'driver_resource_cattle',
-
         'driver_civilian_abuse',
-
         'gdelt_event_count',
-
-        'gdelt_avg_tone'
-
+        'gdelt_avg_tone',
+        'gdelt_predatory_action_count',
+        'gdelt_theme_resource_predation_count',
+        'gdelt_theme_displacement_count',
+        'gdelt_theme_governance_breakdown_count'
     ]
+
+
+
+    
 
 
 
@@ -3340,8 +3387,44 @@ def run():
         # PHASE 4B: NLP Signals (Topic Pivoting)
         spine = process_crisiswatch_nlp(engine, spine, specs['nlp'])
         gc.collect()
+
+        # ==================================================================
+        # PHASE 4C: NLP FUSION (SHOCKS & VELOCITY) - Predatory Ecosystem
+        # ==================================================================
+        logger.info("PHASE 4C: Processing NLP Fusion (Shocks & Velocity)...")
         
-        # --- Final Optimization ---
+        # 1. Narrative Velocity Broadcast
+        if insp.has_table("features_crisiswatch", schema=SCHEMA):
+            vel_query = f"SELECT date, spatial_confidence AS narrative_velocity_lag1 FROM {SCHEMA}.features_crisiswatch WHERE cw_topic_id = 99"
+            vel_df = pd.read_sql(vel_query, engine)
+            if not vel_df.empty:
+                vel_df['date'] = pd.to_datetime(vel_df['date'])
+                # Shift by 1 period for 'lag1'
+                vel_df = vel_df.sort_values('date')
+                vel_df['narrative_velocity_lag1'] = vel_df['narrative_velocity_lag1'].shift(1)
+                spine = spine.merge(vel_df, on='date', how='left')
+                spine['narrative_velocity_lag1'] = spine['narrative_velocity_lag1'].fillna(0)
+                logger.info("  ✓ Broadcasted National Narrative Velocity (Lag1).")
+        
+        # 2. GDELT Shock Signal
+        # Logic: High Panic (Neg Tone) - High Risk (CW) = Shock
+        if 'gdelt_avg_tone' in spine.columns:
+            # We need cw_regime_* features which should be in spine from process_crisiswatch_nlp
+            regime_cols = ['regime_parallel_governance', 'regime_transnational_predation']
+            existing_regime = [c for c in regime_cols if c in spine.columns]
+            
+            if existing_regime:
+                logger.info(f"  Calculating GDELT Shock Signal using {existing_regime}...")
+                # Invert tone so higher is "worse" (more negative)
+                # gdelt_avg_tone is usually -10 to 10.
+                spine['gdelt_shock_signal'] = (
+                    (spine['gdelt_avg_tone'] * -1) - 
+                    spine[existing_regime].sum(axis=1)
+                )
+                spine['gdelt_shock_signal'] = spine['gdelt_shock_signal'].fillna(0)
+                logger.info("  ✓ Generated gdelt_shock_signal.")
+    
+    # --- Final Optimization ---
         logger.info("Optimizing data types...")
 
         # Drop admin metadata columns (including suffixed merge variants) before sanitization/upload

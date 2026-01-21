@@ -255,10 +255,44 @@ registry:
     source: GDELT
     transformation: decay_30d
     output_col: gdelt_decay_30d
+  - raw: gdelt_predatory_action_count
+    source: GDELT
+    transformation: decay_30d
+    output_col: gdelt_predatory_action_decay_30d
+  - raw: gdelt_theme_resource_predation_count
+    source: GDELT
+    transformation: decay_30d
+    output_col: gdelt_theme_resource_predation_decay_30d
+  - raw: gdelt_theme_displacement_count
+    source: GDELT
+    transformation: decay_30d
+    output_col: gdelt_theme_displacement_decay_30d
+  - raw: gdelt_theme_governance_breakdown_count
+    source: GDELT
+    transformation: decay_30d
+    output_col: gdelt_theme_governance_breakdown_decay_30d
   - raw: gdelt_avg_tone
     source: GDELT
     transformation: decay_30d
     output_col: gdelt_avg_tone_decay_30d
+  
+  # GDELT National Heat (Aggregated)
+  - raw: national_predatory_action_sum
+    source: GDELT
+    transformation: decay_30d
+    output_col: national_predatory_action_sum_decay_30d
+  - raw: national_theme_resource_predation_sum
+    source: GDELT
+    transformation: decay_30d
+    output_col: national_theme_resource_predation_sum_decay_30d
+  - raw: national_theme_displacement_sum
+    source: GDELT
+    transformation: decay_30d
+    output_col: national_theme_displacement_sum_decay_30d
+  - raw: national_theme_governance_breakdown_sum
+    source: GDELT
+    transformation: decay_30d
+    output_col: national_theme_governance_breakdown_sum_decay_30d
   - raw: gdelt_goldstein_mean
     source: GDELT
     transformation: none
@@ -585,3 +619,83 @@ registry:
     source: Temporal
     transformation: none
     output_col: is_dry_season
+
+  # ---------------------------------------------------------------------------
+  # H. NLP Refactor (Predatory Ecosystem)
+  # ---------------------------------------------------------------------------
+  # CrisisWatch New Pillars (10-13)
+  - name: "Regime Parallel Governance"
+    source: "NLP_CrisisWatch"
+    raw: "cw_topic_id"
+    transformation: "pivot_topic"
+    output_col: "regime_parallel_governance"
+    transformation_params:
+      topic_id: 10
+      value_column: "spatial_confidence"
+  - name: "Regime Transnational Predation"
+    source: "NLP_CrisisWatch"
+    raw: "cw_topic_id"
+    transformation: "pivot_topic"
+    output_col: "regime_transnational_predation"
+    transformation_params:
+      topic_id: 11
+      value_column: "spatial_confidence"
+  - name: "Regime Guerrilla Fragmentation"
+    source: "NLP_CrisisWatch"
+    raw: "cw_topic_id"
+    transformation: "pivot_topic"
+    output_col: "regime_guerrilla_fragmentation"
+    transformation_params:
+      topic_id: 12
+      value_column: "spatial_confidence"
+  - name: "Regime Ethno-Pastoral Rupture"
+    source: "NLP_CrisisWatch"
+    raw: "cw_topic_id"
+    transformation: "pivot_topic"
+    output_col: "regime_ethno_pastoral_rupture"
+    transformation_params:
+      topic_id: 13
+      value_column: "spatial_confidence"
+
+  # CrisisWatch Narrative Velocity
+  - name: "Narrative Velocity"
+    source: "NLP_CrisisWatch"
+    raw: "cw_topic_id"
+    transformation: "pivot_topic"
+    output_col: "narrative_velocity_lag1"
+    transformation_params:
+      topic_id: 99
+      value_column: "spatial_confidence"
+
+  # ACLED Hybrid Mechanisms
+  - raw: mech_gold_pivot
+    source: ACLED_Hybrid
+    transformation: lag_1_step
+    output_col: mech_gold_pivot_lag1
+  - raw: mech_predatory_tax
+    source: ACLED_Hybrid
+    transformation: lag_1_step
+    output_col: mech_predatory_tax_lag1
+  - raw: mech_factional_infighting
+    source: ACLED_Hybrid
+    transformation: lag_1_step
+    output_col: mech_factional_infighting_lag1
+  - raw: mech_collective_punishment
+    source: ACLED_Hybrid
+    transformation: lag_1_step
+    output_col: mech_collective_punishment_lag1
+
+  # ---------------------------------------------------------------------------
+  # I. Phase 2: Border Shocks & Fusion
+  # ---------------------------------------------------------------------------
+  - name: "GDELT Border Buffer Flag"
+    source: "GDELT"
+    raw: "gdelt_border_buffer_flag"
+    transformation: "none"
+    output_col: "gdelt_border_buffer_flag"
+
+  - name: "GDELT Shock Signal"
+    source: "Fusion"
+    raw: "gdelt_shock_signal"
+    transformation: "none"
+    output_col: "gdelt_shock_signal"

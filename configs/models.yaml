@@ -84,6 +84,10 @@ submodels:
     - riot_count_lag1          # Added: Violent demonstration signal
     - gdelt_event_count        # Event volume (news)
     - regional_risk_score_lag1
+    - mech_gold_pivot_lag1
+    - mech_predatory_tax_lag1
+    - mech_factional_infighting_lag1
+    - mech_collective_punishment_lag1
 
   economics:
     enabled: true
@@ -183,6 +187,12 @@ submodels:
     - cw_foreign_influence
     - cw_state_vacuum
     - cw_sectarian_cleansing
+    - regime_parallel_governance
+    - regime_transnational_predation
+    - regime_guerrilla_fragmentation
+    - regime_ethno_pastoral_rupture
+    - narrative_velocity_lag1
+    - gdelt_shock_signal
     - driver_resource_cattle          # ACLED hybrid NLP drivers
     - driver_resource_mining
     - driver_econ_taxation

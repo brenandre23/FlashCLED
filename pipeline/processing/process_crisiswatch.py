@@ -33,6 +33,7 @@ import spacy
 import torch
 from rapidfuzz import fuzz
 from rapidfuzz import process as fuzz_process
+from scipy.spatial.distance import cosine
 from sklearn.metrics.pairwise import cosine_similarity
 from sqlalchemy import text
 from tqdm import tqdm
@@ -54,54 +55,28 @@ OUTPUT_TABLE = "features_crisiswatch"
 
 # Concept anchors for sentence scoring - mapped to topic IDs
 CONCEPTS = {
-    0: {  # risk_rebel_coalition
-        "name": "rebel_coalition",
-        "anchors": [
-            "The Coalition of Patriots for Change CPC launched a new offensive against FACA positions.",
-            "UPC and 3R rebel elements coordinated attacks on the main supply corridor.",
-            "An alliance of armed groups announced a new offensive against the central government.",
-        ],
-    },
-    1: {  # risk_transhumance_militia
-        "name": "transhumance_militia",
-        "anchors": [
-            "Clashes erupted between Azande Ani Kpi Gbe militia and UPC rebels over territory.",
-            "Communal violence escalated between armed pastoralists and farming communities.",
-            "Transhumance-related violence between herders and farmers intensified.",
-        ],
-    },
-    2: {  # risk_resource_predation
-        "name": "resource_predation",
-        "anchors": [
-            "Rebels took control of the Ndassima gold mine and levied taxes on miners.",
-            "Illicit taxation and looting of natural resources increased in the mining zone.",
-            "Armed groups extracted resources and imposed illegal checkpoints on traders.",
-        ],
-    },
-    3: {  # risk_foreign_influence
-        "name": "foreign_influence",
-        "anchors": [
-            "Russian mercenaries Wagner Group Africa Corps launched a joint operation with FACA.",
-            "Foreign military contractors were deployed to support government counter-insurgency operations.",
-            "External actors increased their military and political presence in the region.",
-        ],
-    },
-    4: {  # risk_state_vacuum
-        "name": "state_vacuum",
-        "anchors": [
-            "Government forces lost control of the prefecture to the CPC coalition.",
-            "Criminal gangs operate with impunity due to the complete lack of judicial presence.",
-            "State authority collapsed in the region leaving a security vacuum.",
-        ],
-    },
-    5: {  # risk_sectarian_cleansing
-        "name": "sectarian_cleansing",
-        "anchors": [
-            "Anti-balaka militia targeted Muslim civilians in revenge killings.",
-            "Civilians were targeted and displaced based on their ethnic or religious identity.",
-            "Sectarian violence escalated with attacks on religious communities.",
-        ],
-    },
+    # Pillar 10: Predatory Parallel Governance (State Substitution)
+    10: { "name": "parallel_governance", "anchors": [
+        "parallel administration", "illicit licensing", "taxing production", 
+        "revenue generation blockade", "control of mining hub", "customs extortion",
+        "issuance of mining permits", "rebel taxation system"
+    ]},
+    # Pillar 11: Transnational Resource Predation (The Sovereign Nexus)
+    11: { "name": "transnational_predation", "anchors": [
+        "Wagner Group extraction", "Midas Ressources", "Ndassima gold mine", 
+        "Africa Corps security", "industrial exploitation", "Rwandan bilateral forces", 
+        "Crystal Ventures", "Sudanese gold circuit", "RSF smuggling route"
+    ]},
+    # Pillar 12: Guerrilla Fragmentation (Asymmetric Mobility)
+    12: { "name": "guerrilla_fragmentation", "anchors": [
+        "hit-and-run tactics", "rebel splintering", "fluid alliances", 
+        "CPC coalition", "peripheral border clashes", "guerrilla ambush"
+    ]},
+    # Pillar 13: Ethno-Pastoral Rupture (Resolution Collapse)
+    13: { "name": "ethno_pastoral_rupture", "anchors": [
+        "militarized transhumance", "Mbororo stigmatization", "cattle racketeering", 
+        "pastoralist migration route", "farmer-herder clash", "breakdown of customary mediation"
+    ]}
 }
 
 # Spatial confidence weights by resolution tier
@@ -474,11 +449,12 @@ def run():
     input_file = input_files[0]
     logger.info(f"Processing: {input_file.name}")
 
-    # Parse text
+    # Parse text and sort by date
     df_raw = parse_text_file(input_file)
     if df_raw.empty:
         logger.warning("Parsed CrisisWatch file is empty.")
         return
+    df_raw = df_raw.sort_values(by='date').reset_index(drop=True)
 
     # Load NLP models
     logger.info("Loading NLP models...")
@@ -511,8 +487,10 @@ def run():
     logger.info("Building hierarchical gazetteer...")
     gaz = HierarchicalGazetteer(H3_RES)
 
-    # Accumulator: (date, h3_index, topic_id) -> list of spatial_confidence scores
+    # Accumulator for spatial scores and list for national velocity scores
     accumulator: Dict[Tuple, List[float]] = {}
+    velocity_rows = []
+    prev_centroid = None
 
     def add_score(dt, h3_idx: int, topic_id: int, spatial_conf: float):
         key = (dt, h3_idx, topic_id)
@@ -536,17 +514,29 @@ def run():
         sent_texts = [s.text for s in sents]
         sent_vecs = encode_sentences_batched(sent_texts, tokenizer, model, device)
 
-        # Process each sentence
+        # --- NARRATIVE VELOCITY CALCULATION ---
+        current_centroid = np.mean(sent_vecs, axis=0)
+        if prev_centroid is not None:
+            # Cosine distance = 1 - cosine similarity
+            velocity = cosine(prev_centroid, current_centroid)
+            velocity_rows.append({
+                "date": row["date"],
+                "h3_index": np.int64(0),  # National score
+                "cw_topic_id": 99,
+                "spatial_confidence": float(velocity)
+            })
+        prev_centroid = current_centroid
+        # --- END NARRATIVE VELOCITY ---
+
+        # Process each sentence for spatial scores
         for i, sent in enumerate(sents):
             vec = sent_vecs[i].reshape(1, -1)
             
             # Score against each topic
             topic_scores = compute_topic_scores(vec, concept_vectors)
             
-            # Extract location mentions from sentence
+            # Extract location mentions
             tokens = {t.text.lower() for t in sent if not t.is_stop and len(t.text) >= 3}
-            
-            # Also extract named entities
             for ent in sent.ents:
                 if ent.label_ in ("GPE", "LOC", "FAC"):
                     tokens.add(ent.text.lower())
@@ -559,30 +549,43 @@ def run():
                     
                 # For each topic with positive score, add weighted contribution
                 for topic_id, topic_score in topic_scores.items():
-                    if topic_score <= 0.3:  # Threshold for relevance
+                    if topic_score <= 0.3:  # Threshold
                         continue
                         
-                    # Spatial confidence = topic_score * location_weight
                     spatial_conf = topic_score * weight
-                    
                     for h3_idx in h3_list:
                         add_score(row["date"], int(h3_idx), topic_id, spatial_conf)
 
-    if not accumulator:
-        logger.warning("No CrisisWatch locations resolved; nothing to write.")
+    if not accumulator and not velocity_rows:
+        logger.warning("No CrisisWatch locations resolved or velocity calculated; nothing to write.")
         return
 
-    # Aggregate: sum confidence scores per (date, h3, topic)
+    # Aggregate spatial scores
     rows = []
     for (dt, h3_idx, topic_id), vals in accumulator.items():
         rows.append({
             "date": pd.to_datetime(dt),
             "h3_index": np.int64(h3_idx),
             "cw_topic_id": int(topic_id),
-            "spatial_confidence": float(np.sum(vals)),  # Sum for cumulative signal
+            "spatial_confidence": float(np.sum(vals)),
         })
 
-    out_df = pd.DataFrame(rows)
+    # Combine spatial and national (velocity) scores
+    all_rows = rows + velocity_rows
+    out_df = pd.DataFrame(all_rows)
+
+    # --- VALIDATION ---
+    logger.info("🔬 Running Validation Checks...")
+    REQUIRED = {'h3_index', 'date', 'cw_topic_id', 'spatial_confidence'}
+    if not REQUIRED.issubset(out_df.columns):
+        raise ValueError(f"❌ Missing columns: {REQUIRED - set(out_df.columns)}")
+    valid_topics = set(CONCEPTS.keys()) | {99}
+    found_topics = set(out_df['cw_topic_id'].unique())
+    unknown_topics = found_topics - valid_topics
+    if unknown_topics:
+        logger.warning(f"⚠️ Unknown topic IDs found: {unknown_topics}")
+    logger.info("✅ Validation passed.")
+    # ------------------
     
     # Save parquet backup
     out_path = ROOT_DIR / "data" / "processed" / "features_crisiswatch.parquet"
@@ -601,10 +604,11 @@ def run():
     # Summary stats
     logger.info("=" * 60)
     logger.info("CRISISWATCH PROCESSING COMPLETE")
-    logger.info(f"  Total records: {len(out_df)}")
-    logger.info(f"  Unique H3 cells: {out_df['h3_index'].nunique()}")
-    logger.info(f"  Date range: {out_df['date'].min()} to {out_df['date'].max()}")
-    logger.info(f"  Topics extracted: {sorted(out_df['cw_topic_id'].unique().tolist())}")
+    if not out_df.empty:
+        logger.info(f"  Total records: {len(out_df)}")
+        logger.info(f"  Unique H3 cells: {out_df['h3_index'].nunique()}")
+        logger.info(f"  Date range: {out_df['date'].min()} to {out_df['date'].max()}")
+        logger.info(f"  Topics extracted: {sorted(out_df['cw_topic_id'].unique().tolist())}")
     logger.info("=" * 60)
 
 

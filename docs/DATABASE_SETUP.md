@@ -34,6 +34,16 @@ All pipeline tables are created in a dedicated schema to avoid conflicts with ot
 - **ipc_h3** - Food security classifications
 - **geoepr_polygons** - Ethnic power relations spatial data
 
+#### 5. NLP & Signals Tables (New in v2.0)
+- **features_crisiswatch** - Monthly semantic scores from ICG reports
+  - Primary Key: `(h3_index, date, cw_topic_id)`
+  - New Topics: `10-13` (Predatory Pillars), `99` (Narrative Velocity)
+- **features_acled_hybrid** - Semi-supervised mechanism detection
+  - Primary Key: `(h3_index, event_date)`
+  - New Columns: `mech_gold_pivot`, `mech_predatory_tax`, `mech_factional_infighting`, `mech_collective_punishment`
+- **features_dynamic_daily** (GDELT)
+  - Updated to include `border_buffer_flag` (Events in Chad/Sudan buffer zone)
+
 ## Extension Requirements
 
 ### PostGIS (3.0+)

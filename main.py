@@ -41,8 +41,7 @@ from pipeline.ingestion import (
     create_h3_grid,
     fetch_economy,
     fetch_food_security,
-    fetch_gdelt_events,
-    fetch_gdelt_themes,
+    fetch_gdelt_dual, # Replaces fetch_gdelt_events & fetch_gdelt_themes
     fetch_ioda,
     fetch_population,
     fetch_acled,
@@ -249,11 +248,12 @@ class CEWPPipeline:
 
         # 2. High-Frequency Automated Events (GDELT/IODA)
         fetch_ioda.run(self.configs, self.engine)
-        fetch_gdelt_events.run(engine=self.engine)
-        if self.args.skip_gdelt_themes:
-            logger.info("Skipping GDELT Themes fetch (per flag).")
+        
+        if self.args.skip_gdelt:
+            logger.info("Skipping GDELT fetch (per flag).")
         else:
-            fetch_gdelt_themes.run(engine=self.engine)
+            # Dual-Sensor Ingestion (Events + GKG Themes at R5)
+            fetch_gdelt_dual.run(engine=self.engine)
 
         # 3. Socio-Economic
         fetch_food_security.run(self.configs, self.engine)
@@ -778,6 +778,7 @@ def parse_args():
     parser.add_argument("--reset-schema", action="store_true", help="Hard reset schema before running.")
     parser.add_argument("--skip-static", action="store_true", help="Skip static ingestion.")
     parser.add_argument("--skip-dynamic", action="store_true", help="Skip dynamic ingestion.")
+    parser.add_argument("--skip-gdelt", action="store_true", help="Skip all GDELT fetch (Events & Themes).")
     parser.add_argument("--skip-gdelt-themes", action="store_true", help="Skip GDELT themes fetch (BigQuery).")
     parser.add_argument("--skip-features", action="store_true", help="Skip feature engineering.")
     parser.add_argument("--skip-modeling", action="store_true", help="Skip modeling & predictions.")
