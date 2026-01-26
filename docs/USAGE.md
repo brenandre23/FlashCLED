@@ -85,6 +85,18 @@ python main.py \
   --skip-analysis
 ```
 
+### Incremental Ingestion & Force-Refresh
+
+The pipeline uses an **incremental-by-default** strategy for all dynamic data sources to minimize API load and processing time.
+
+- **Default Behavior:** For each source, the pipeline queries the database for the `MAX(date)` and only fetches new records between that date and the requested `--end-date`.
+- **Force Refresh (`--no-incremental`):** Use this flag to override the incremental logic and refetch the entire window from the configured `start_date`.
+- **Overlap Sources:** To ensure data integrity for sources with late-arriving or reprocessed data, the following sources include a mandatory 14-day safety overlap during incremental fetches:
+  - GEE Environmental features
+  - Dynamic World land cover
+  - IOM DTM displacement
+  - GDELT (7-day buffer)
+
 ---
 
 ## Date Range Specification
@@ -455,7 +467,7 @@ Options:
   --reset-schema                 Drop and recreate database schema
   --skip-static                  Skip static data ingestion
   --skip-dynamic                 Skip dynamic data ingestion
-  --skip-gdelt-themes            Skip GDELT themes fetch (BigQuery)
+  --skip-gdelt-themes            Skip GDELT themes fetch
   --skip-features                Skip feature engineering
   --skip-modeling                Skip model training and predictions
   --skip-analysis                Skip post-run analysis

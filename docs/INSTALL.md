@@ -264,9 +264,6 @@ ACLED_KEY=your_api_key
 # Request access at: https://dtm.iom.int/data/api
 IOM_PRIMARY_KEY=your_key
 
-# --- IPC-CH API (Required for food security) ---
-# Request access at: https://www.ipcinfo.org/ipc-country-analysis/api/
-IPC_API_KEY=your_key
 
 # --- Sentinel Hub (Required for Copernicus DEM) ---
 # Register at: https://www.sentinel-hub.com/
@@ -340,10 +337,10 @@ The pipeline relies on a specific mapping between OCHA/HDX standards and World B
 To resolve this mismatch, perform the following file renaming:
 
 1. Download **OCHA Admin 1 (Prefectures)** boundaries for CAR (GeoJSON)
-   - Save as: `wbgCAFadmin1.geojson`
+   - Save as: `prefectures.json`
 
 2. Download **OCHA Admin 2 (Sub-prefectures)** boundaries for CAR (GeoJSON)
-   - Save as: `wbgCAFadmin3.geojson`
+   - Save as: `subprefectures.json`
 
 > **Why?** The pipeline's `spatial_disaggregation.py` logic looks for an "Admin 3" file to find sub-prefectures. Saving the Admin 2 file with this name bridges the gap.
 
@@ -452,7 +449,7 @@ DB_HOST=172.x.x.x  # Use IP from above, not 'localhost'
 
 ## Quotas & Limits
 
-- **Google BigQuery (GDELT):** The pipeline queries the public GDELT dataset. This falls under the BigQuery free tier (1TB/month), but repeated full-history ingestion may incur costs. The pipeline implements caching to minimize this.
+- **GDELT:** The pipeline downloads data from the GDELT v2 Master File List (CSV/ZIP). The pipeline implements caching to minimize bandwidth.
 
 - **Google Earth Engine:** Requires an enabled GEE account linked to your Google Cloud Project.
 

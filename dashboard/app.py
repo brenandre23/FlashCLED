@@ -62,11 +62,19 @@ TEMPORAL_FEATURES_ALLOWLIST = {
     # Environmental/Remote sensing
     "chirps_precip_anomaly", "era5_temp_anomaly", "era5_soil_moisture_anomaly",
     "ndvi_anomaly", "nightlights_intensity",
+    # VIIRS Advanced
+    "ntl_peak", "ntl_stale_days", "ntl_kinetic_delta",
+    # Land Cover (Dynamic World)
+    "landcover_grass", "landcover_trees", "landcover_crops", "landcover_bare", "landcover_built",
     # Conflict
     "fatalities_14d_sum", "fatalities_1m_lag", "protest_count_lag1",
     "riot_count_lag1", "regional_risk_score_lag1",
     # GDELT
     "gdelt_event_count", "gdelt_avg_tone", "gdelt_goldstein_mean", "gdelt_mentions_total",
+    # Fusion / Interactions
+    "cw_onset_amplifier", "cw_mass_casualty_risk", "cw_extraction_violence",
+    "cw_pastoral_predation", "fusion_gold_signal", "fusion_fragmentation_confirmed",
+    "fusion_escalation_momentum",
     # Market
     "price_maize", "price_rice", "price_oil", "price_sorghum", "price_cassava", "price_groundnuts",
     # Macroeconomics

@@ -31,7 +31,6 @@ All pipeline tables are created in a dedicated schema to avoid conflicts with ot
 #### 4. Processing Tables
 - **population_h3** - WorldPop data aggregated to H3
 - **grip4_roads_h3** - Road network density
-- **ipc_h3** - Food security classifications
 - **geoepr_polygons** - Ethnic power relations spatial data
 
 #### 5. NLP & Signals Tables (New in v2.0)
@@ -43,6 +42,26 @@ All pipeline tables are created in a dedicated schema to avoid conflicts with ot
   - New Columns: `mech_gold_pivot`, `mech_predatory_tax`, `mech_factional_infighting`, `mech_collective_punishment`
 - **features_dynamic_daily** (GDELT)
   - Updated to include `border_buffer_flag` (Events in Chad/Sudan buffer zone)
+
+### Database Keys for Upsert
+
+All ingestion and processing scripts utilize `upload_to_postgis` with specific primary keys to ensure idempotent updates and avoid data duplication.
+
+| Table | Primary Key | Description |
+|-------|-------------|-------------|
+| `features_static` | `h3_index` | Master grid |
+| `temporal_features` | `(h3_index, date)` | Analytical base table |
+| `acled_events` | `event_id_cnty` | Normalized event identifier |
+| `economic_drivers` | `date` | Wide format macro-indicators |
+| `food_security` | `(date, market, commodity, indicator)` | Local price records |
+| `market_locations` | `market_id` | Unique market point geometry |
+| `iom_dtm_raw` | `id` | Raw IOM DTM survey records |
+| `internet_outages` | `(h3_index, date, variable)` | National score broadcast to grid |
+| `features_dynamic_daily` | `(h3_index, date, variable)` | GDELT events and themes |
+| `features_crisiswatch` | `(h3_index, date, cw_topic_id)` | Monthly NLP pillars |
+| `features_acled_hybrid` | `(h3_index, event_date)` | Event-level NLP mechanisms |
+| `environmental_features` | `(h3_index, date)` | GEE satellite aggregations |
+| `landcover_features` | `(h3_index, date)` | Dynamic World fractions |
 
 ## Extension Requirements
 
@@ -216,3 +235,17 @@ listen_addresses = '*'
 # Update pg_hba.conf
 host    car_cewp    cewp_user    0.0.0.0/0    md5
 ```
+
+---
+
+### Spatial Boundaries (v2026)
+
+The database schema supports a three-tier administrative hierarchy for spatial aggregation and disaggregation. These layers are defined in `configs/data.yaml` and processed via `spatial_disaggregation.py`.
+
+| Layer | Type | Unit Count | Source File |
+|-------|------|------------|-------------|
+| **Admin 1** | Regions | 17 | `wbgCAFadmin2.geojson` |
+| **Admin 2** | Prefectures | 20 | `prefectures.json` |
+| **Admin 3** | Subprefectures | 72 | `subprefectures.json` |
+
+**Note:** Admin 3 is the primary level for IOM displacement mapping and is often referred to as "Admin 2" in older OCHA datasets. The pipeline's naming convention standardizes this to **Admin 3**.
