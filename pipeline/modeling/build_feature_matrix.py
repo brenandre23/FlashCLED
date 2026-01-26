@@ -12,6 +12,15 @@ CRITICAL FIXES:
 4. FIX: Robust feature selection from registry (avoids NumPy boolean ambiguity).
 5. Pre-flight column validation: ensures all required columns exist before running the query.
 6. FIX: Target columns (target_1_step, target_2_step, etc.) are now PRESERVED in final output.
+7. FIX: ACLED Hybrid uses new mech_* schema (not legacy driver_* columns).
+8. FIX (2026-01-25): Date normalization for ACLED hybrid merge - fixes 0% coverage bug.
+   - Root cause: hybrid table stores DATE (no time), spine has datetime64 (with time)
+   - Solution: Normalize both to midnight before merge using .dt.normalize()
+
+Updated: 2026-01-25
+- Fixed ACLED hybrid merge returning 0% non-zero coverage
+- Added date alignment diagnostics
+- Both spine and hybrid dates now normalized to midnight for consistent merge
 """
 
 import sys
@@ -42,6 +51,27 @@ TARGET_COL_PATTERNS = [
     'target_binary_',
     'target_1_step',
     'target_2_step',
+]
+
+# ==============================================================================
+# ACLED HYBRID COLUMNS (New mech_* schema - NOT legacy driver_* columns)
+# ==============================================================================
+# These are the columns produced by process_acled_hybrid.py
+EXPECTED_HYBRID_COLS = [
+    # Mechanism scores (0-1 range, quality-weighted)
+    "mech_gold_pivot",
+    "mech_predatory_tax",
+    "mech_factional_infighting",
+    "mech_collective_punishment",
+    # Uncertainty scores (0-1 range, margin-based)
+    "mech_gold_pivot_uncertainty",
+    "mech_predatory_tax_uncertainty",
+    "mech_factional_infighting_uncertainty",
+    "mech_collective_punishment_uncertainty",
+    # Aggregate risk scores
+    "acled_actor_risk_score",
+    "acled_mechanism_intensity",
+    "acled_combined_risk_score",
 ]
 
 
@@ -370,81 +400,118 @@ def run(
     if missing_targets:
         logger.warning(f"Expected target columns missing from query result: {missing_targets}")
 
-    # --- ACLED HYBRID FEATURES WITH VALIDATION ---
-    logger.info("Loading Optimized ACLED Hybrid Features...")
+    # ==================================================================
+    # ACLED HYBRID FEATURES (New mech_* schema)
+    # ==================================================================
+    # CHECK: If columns already exist in master_df (from temporal_features), skip redundant merge
+    existing_hybrid_cols = [c for c in EXPECTED_HYBRID_COLS if c in master_df.columns]
     
-    EXPECTED_HYBRID_COLS = [
-        "driver_resource_cattle",
-        "driver_resource_mining",
-        "driver_econ_taxation",
-        "driver_political_coup",
-        "driver_civilian_abuse",
-    ]
-    
-    query_acled = """
-        SELECT event_date as date, h3_index,
-               driver_resource_cattle, driver_resource_mining,
-               driver_econ_taxation, driver_political_coup,
-               driver_civilian_abuse
-        FROM car_cewp.features_acled_hybrid
-    """
-    
-    try:
-        df_acled = pd.read_sql(query_acled, engine)
-    except Exception as e:
-        logger.error(f"Failed to load ACLED hybrid features: {e}")
-        df_acled = pd.DataFrame()
-    
-    if df_acled.empty:
-        logger.warning(f"ACLED hybrid table empty. Filling {len(EXPECTED_HYBRID_COLS)} columns with 0.")
-        for col in EXPECTED_HYBRID_COLS:
-            master_df[col] = 0
+    if len(existing_hybrid_cols) == len(EXPECTED_HYBRID_COLS):
+        logger.info("✅ ACLED Hybrid features already present in temporal_features. Skipping redundant merge.")
     else:
-        actual_cols = [c for c in EXPECTED_HYBRID_COLS if c in df_acled.columns]
-        missing_cols = [c for c in EXPECTED_HYBRID_COLS if c not in df_acled.columns]
+        logger.info("Loading Optimized ACLED Hybrid Features (mech_* schema)...")
         
-        if missing_cols:
-            logger.warning(f"Missing ACLED hybrid columns (will fill with 0): {missing_cols}")
+        # Build query for new schema columns
+        query_acled = f"""
+            SELECT 
+                event_date as date, 
+                h3_index,
+                mech_gold_pivot,
+                mech_predatory_tax,
+                mech_factional_infighting,
+                mech_collective_punishment,
+                mech_gold_pivot_uncertainty,
+                mech_predatory_tax_uncertainty,
+                mech_factional_infighting_uncertainty,
+                mech_collective_punishment_uncertainty,
+                acled_actor_risk_score,
+                acled_mechanism_intensity,
+                acled_combined_risk_score
+            FROM {SCHEMA}.features_acled_hybrid
+        """
         
-        logger.info(f"ACLED hybrid: {len(df_acled):,} rows, {len(actual_cols)}/{len(EXPECTED_HYBRID_COLS)} columns")
+        try:
+            df_acled = pd.read_sql(query_acled, engine)
+        except Exception as e:
+            logger.error(f"Failed to load ACLED hybrid features: {e}")
+            df_acled = pd.DataFrame()
         
-        df_acled["date"] = pd.to_datetime(df_acled["date"])
-        df_acled["h3_index"] = df_acled["h3_index"].astype("int64")
-        
-        acled_date_range = (df_acled["date"].min(), df_acled["date"].max())
-        master_date_range = (master_df["date"].min(), master_df["date"].max())
-        
-        if acled_date_range[0] > master_date_range[0]:
-            logger.warning(
-                f"ACLED hybrid starts at {acled_date_range[0].date()}, "
-                f"after feature matrix start {master_date_range[0].date()}."
-            )
-        
-        pre_merge_rows = len(master_df)
-        master_df = master_df.merge(df_acled, on=["date", "h3_index"], how="left", validate="1:1")
-        post_merge_rows = len(master_df)
-        
-        if pre_merge_rows != post_merge_rows:
-            raise ValueError(
-                f"ACLED hybrid merge changed row count: {pre_merge_rows} -> {post_merge_rows}."
-            )
-        
-        for col in EXPECTED_HYBRID_COLS:
-            if col not in master_df.columns:
-                master_df[col] = 0
-            else:
-                null_count = master_df[col].isna().sum()
-                if null_count > 0:
-                    logger.debug(f"  {col}: filling {null_count:,} nulls with 0")
-                master_df[col] = master_df[col].fillna(0)
-        
-        coverage_stats = {}
-        for col in EXPECTED_HYBRID_COLS:
-            non_zero = (master_df[col] != 0).sum()
-            coverage_stats[col] = non_zero / len(master_df) * 100
-        
-        avg_coverage = sum(coverage_stats.values()) / len(coverage_stats)
-        logger.info(f"ACLED hybrid merge complete. Average non-zero coverage: {avg_coverage:.1f}%")
+        if df_acled.empty:
+            logger.warning(f"ACLED hybrid table empty. Filling {len(EXPECTED_HYBRID_COLS)} columns with 0.")
+            for col in EXPECTED_HYBRID_COLS:
+                if col not in master_df.columns:
+                    master_df[col] = 0
+        else:
+            actual_cols = [c for c in EXPECTED_HYBRID_COLS if c in df_acled.columns]
+            missing_cols = [c for c in EXPECTED_HYBRID_COLS if c not in df_acled.columns]
+            
+            if missing_cols:
+                logger.warning(f"Missing ACLED hybrid columns (will fill with 0): {missing_cols}")
+            
+            logger.info(f"ACLED hybrid: {len(df_acled):,} rows, {len(actual_cols)}/{len(EXPECTED_HYBRID_COLS)} columns")
+            
+            # CRITICAL FIX: Normalize dates to midnight for consistent merging
+            # The hybrid table stores DATE (no time), spine has datetime64 (with time)
+            df_acled["date"] = pd.to_datetime(df_acled["date"]).dt.normalize()
+            df_acled["h3_index"] = df_acled["h3_index"].astype("int64")
+            
+            # Also normalize master_df dates for consistent comparison
+            master_df["date"] = pd.to_datetime(master_df["date"]).dt.normalize()
+            
+            # Debug: Log date alignment info
+            acled_dates = set(df_acled["date"].unique())
+            master_dates = set(master_df["date"].unique())
+            date_overlap = len(acled_dates.intersection(master_dates))
+            logger.info(f"  Date alignment: {len(acled_dates)} hybrid dates, {len(master_dates)} spine dates, {date_overlap} overlap")
+            
+            if date_overlap == 0:
+                logger.error("CRITICAL: No date overlap between ACLED hybrid and spine!")
+                logger.error(f"  Hybrid date range: {df_acled['date'].min()} to {df_acled['date'].max()}")
+                logger.error(f"  Spine date range: {master_df['date'].min()} to {master_df['date'].max()}")
+                # Sample dates for debugging
+                logger.error(f"  Sample hybrid dates: {sorted(list(acled_dates))[:5]}")
+                logger.error(f"  Sample spine dates: {sorted(list(master_dates))[:5]}")
+            
+            acled_date_range = (df_acled["date"].min(), df_acled["date"].max())
+            master_date_range = (master_df["date"].min(), master_df["date"].max())
+            
+            if acled_date_range[0] > master_date_range[0]:
+                logger.warning(
+                    f"ACLED hybrid starts at {acled_date_range[0].date()}, "
+                    f"after feature matrix start {master_date_range[0].date()}."
+                )
+            
+            # Drop columns from master_df that we are about to merge (to avoid _x/_y)
+            cols_to_drop = [c for c in df_acled.columns if c in master_df.columns and c not in ["date", "h3_index"]]
+            if cols_to_drop:
+                logger.info(f"Dropping {len(cols_to_drop)} partial columns from spine before merge to prevent duplicates.")
+                master_df.drop(columns=cols_to_drop, inplace=True)
+
+            pre_merge_rows = len(master_df)
+            master_df = master_df.merge(df_acled, on=["date", "h3_index"], how="left", validate="1:1")
+            post_merge_rows = len(master_df)
+            
+            if pre_merge_rows != post_merge_rows:
+                raise ValueError(
+                    f"ACLED hybrid merge changed row count: {pre_merge_rows} -> {post_merge_rows}."
+                )
+            
+            for col in EXPECTED_HYBRID_COLS:
+                if col not in master_df.columns:
+                    master_df[col] = 0
+                else:
+                    null_count = master_df[col].isna().sum()
+                    if null_count > 0:
+                        logger.debug(f"  {col}: filling {null_count:,} nulls with 0")
+                    master_df[col] = master_df[col].fillna(0)
+            
+            coverage_stats = {}
+            for col in EXPECTED_HYBRID_COLS:
+                non_zero = (master_df[col] != 0).sum()
+                coverage_stats[col] = non_zero / len(master_df) * 100
+            
+            avg_coverage = sum(coverage_stats.values()) / len(coverage_stats)
+            logger.info(f"ACLED hybrid merge complete. Average non-zero coverage: {avg_coverage:.1f}%")
 
     # Distance columns type safety
     dist_cols = [c for c in master_df.columns if c.startswith("dist_")]

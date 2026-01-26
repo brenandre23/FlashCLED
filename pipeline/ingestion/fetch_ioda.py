@@ -21,6 +21,10 @@ Output Variable: ioda_outage_score
 - Higher values = more/worse outages in the period
 - 0 = no detected outages
 
+INCREMENTAL LOADING (2026-01-24):
+- Uses centralized get_incremental_window helper
+- Supports --full / --no-incremental flags for complete refresh
+
 ALIGNMENT & CONFIG:
 - Dates: Pulled from data.yaml (global_date_window)
 - Spines: Pulled from features.yaml (temporal.alignment_date, step_days)
@@ -28,29 +32,21 @@ ALIGNMENT & CONFIG:
 
 import sys
 import time
+import argparse
 import requests
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from dotenv import load_dotenv
+from typing import Optional
+from sqlalchemy import text
 
 # --- SETUP ---
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT_DIR))
-try:
-    from utils import logger, get_db_engine, upload_to_postgis, SCHEMA, load_configs
-except ImportError:
-    import logging
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    logger.addHandler(handler)
-    SCHEMA = "car_cewp"
 
-    def load_configs():
-        return None
+from utils import logger, get_db_engine, upload_to_postgis, SCHEMA, load_configs, get_incremental_window
 
 load_dotenv()
 
@@ -61,6 +57,7 @@ VARIABLE_NAME = "ioda_outage_score"
 
 # IODA data for CAR starts 2022
 IODA_MIN_YEAR = 2022
+DEFAULT_START_DATE = f"{IODA_MIN_YEAR}-01-01"
 
 # API Configuration
 API_BASE = "https://api.ioda.inetintel.cc.gatech.edu/v2"
@@ -206,8 +203,15 @@ def aggregate_events_to_windows(events, windows):
 # -----------------------------------------------------------------------------
 
 
-def run(configs=None, engine=None):
-    """Main entry point for IODA ingestion."""
+def run(configs=None, engine=None, full_refresh: bool = False):
+    """
+    Main entry point for IODA ingestion.
+    
+    Args:
+        configs: Configuration dict
+        engine: SQLAlchemy engine
+        full_refresh: If True, ignore existing data and refetch all
+    """
     
     # Load Configs
     if configs is None:
@@ -216,6 +220,10 @@ def run(configs=None, engine=None):
     if configs is None:
         logger.error("Could not load configs. Ensure data.yaml and features.yaml exist.")
         return
+
+    # Handle optional engine
+    if engine is None:
+        engine = get_db_engine()
 
     # --- EXTRACT CONFIGURATION ---
     try:
@@ -237,19 +245,35 @@ def run(configs=None, engine=None):
         return
 
     # --- CLAMP DATES FOR IODA ---
-    g_start_dt = pd.to_datetime(global_start_str)
     g_end_dt = pd.to_datetime(global_end_str)
-    
-    # IODA data for CAR starts 2022
-    effective_start = max(g_start_dt, pd.Timestamp(f"{IODA_MIN_YEAR}-01-01"))
-    effective_end = g_end_dt
 
     logger.info("Starting IODA Ingestion.")
-    logger.info(f"   Config window: {g_start_dt.date()} to {g_end_dt.date()}")
-    logger.info(f"   Effective window: {effective_start.date()} to {effective_end.date()} (IODA data starts {IODA_MIN_YEAR})")
+    logger.info(f"   Config window end: {g_end_dt.date()}")
+    logger.info(f"   IODA data starts: {IODA_MIN_YEAR}")
     logger.info(f"   Temporal alignment: {step_days} days from {align_date}")
 
-    engine = engine or get_db_engine()
+    # -------------------------------------------------------------------------
+    # INCREMENTAL LOADING: Use centralized helper
+    # -------------------------------------------------------------------------
+    start, end = get_incremental_window(
+        engine=engine,
+        table=TABLE_NAME,
+        date_col="date",
+        requested_end_date=global_end_str,
+        default_start_date=DEFAULT_START_DATE,
+        force_full=full_refresh,
+        schema=SCHEMA
+    )
+    
+    if start is None:
+        logger.info(f"✅ IODA data already up to date. No new data to fetch.")
+        return
+    
+    # Clamp start to IODA minimum year
+    effective_start = max(pd.to_datetime(start), pd.Timestamp(DEFAULT_START_DATE))
+    effective_end = pd.to_datetime(end)
+    
+    logger.info(f"   Effective fetch window: {effective_start.date()} to {effective_end.date()}")
 
     # A. LOAD GRID
     full_grid = get_full_grid_set(engine)
@@ -267,8 +291,9 @@ def run(configs=None, engine=None):
         logger.warning("No temporal windows to process.")
         return
 
-    # C. FETCH EVENTS
-    s_ts = int(effective_start.timestamp())
+    # C. FETCH EVENTS (with overlap buffer for events that span window boundaries)
+    OVERLAP_BUFFER_DAYS = 7
+    s_ts = int((effective_start - timedelta(days=OVERLAP_BUFFER_DAYS)).timestamp())
     e_ts = int(effective_end.timestamp())
     
     logger.info("   Fetching outage events from IODA API...")
@@ -318,8 +343,27 @@ def run(configs=None, engine=None):
         primary_keys=["h3_index", "date", "variable"]
     )
 
-    logger.info("✓ IODA Ingestion Complete.")
+    logger.info("✅ IODA Ingestion Complete.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Fetch IODA internet outage data")
+    parser.add_argument(
+        "--full", 
+        action="store_true",
+        help="Force full refresh (ignore existing data)"
+    )
+    parser.add_argument(
+        "--no-incremental",
+        action="store_true",
+        help="Alias for --full"
+    )
+    args = parser.parse_args()
+    
+    force_full = args.full or args.no_incremental
+    
+    run(full_refresh=force_full)
 
 
 if __name__ == "__main__":
-    run()
+    main()

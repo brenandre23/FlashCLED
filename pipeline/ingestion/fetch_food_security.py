@@ -7,27 +7,34 @@ UPDATES:
 - FIXED: Parsing logic now handles both (lat,lon) and [lat,lon] centroid formats.
 - PUBLICATION LAG: Config-driven via data.yaml fews_net.publication_lag_steps.
   FEWS NET prices have ~45-60 day publication delay (4 steps × 14 days = 56 days).
+- INCREMENTAL LOADING (2026-01-24): Uses centralized get_incremental_window helper.
+- Supports --full flag for complete refresh.
 """
 
 import sys
 import os
+import argparse
 import pandas as pd
 import requests
 import geopandas as gpd
+from datetime import date, timedelta
 from io import BytesIO
 from sqlalchemy import text
 from pathlib import Path
+from typing import Optional
 
 # --- Import Utils ---
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from utils import logger, upload_to_postgis, load_configs, get_db_engine
+from utils import logger, upload_to_postgis, load_configs, get_db_engine, get_incremental_window, SCHEMA
 
-SCHEMA = "car_cewp"
 TABLE_PRICES = "food_security"
 TABLE_LOCATIONS = "market_locations"
+
+# FEWS NET data for CAR starts reliably around 2015
+DEFAULT_START_DATE = "2015-01-01"
 
 
 def get_publication_lag_days(data_cfg, features_cfg):
@@ -72,8 +79,7 @@ def ensure_tables_exist(engine):
             CREATE TABLE IF NOT EXISTS {SCHEMA}.{TABLE_LOCATIONS} (
                 market_id INTEGER PRIMARY KEY,
                 market_name TEXT,
-                latitude FLOAT, longitude FLOAT,
-                admin1 TEXT, admin2 TEXT
+                latitude FLOAT, longitude FLOAT
             );
         """))
         
@@ -176,27 +182,30 @@ def fetch_market_locations_remote(engine, data_config):
         market_lookup[row['market_name']] = row['market_name'] # Name -> Name (Self)
 
     # Upload
-    final_df = gdf[['market_id', 'market_name', 'latitude', 'longitude', 'admin1', 'admin2']].drop_duplicates('market_name')
+    final_df = gdf[['market_id', 'market_name', 'latitude', 'longitude']].drop_duplicates('market_name')
     upload_to_postgis(engine, final_df, TABLE_LOCATIONS, SCHEMA, primary_keys=['market_id'])
     
     return market_lookup
 
 
-def fetch_fews_market_prices(data_config, features_config, market_lookup, auth_token):
+def fetch_fews_market_prices(data_config, features_config, market_lookup, auth_token, 
+                             start_date: str, end_date: str, lag_days: int):
     """
     Fetch market prices and apply publication lag.
     
     FEWS NET prices are collected monthly but published with ~45-60 day delay.
     We shift dates forward by the configured lag to ensure operational validity.
+    
+    Args:
+        start_date: API fetch start date (original observation date)
+        end_date: API fetch end date
+        lag_days: Publication lag in days
     """
     if not auth_token: return pd.DataFrame()
     
-    # Get publication lag from config
-    lag_days = get_publication_lag_days(data_config, features_config)
-    
     url = "https://fdw.fews.net/api/marketpricefacts/"
-    start_date = data_config.get("global_date_window", {}).get("start_date", "2015-01-01")
-    end_date = data_config.get("global_date_window", {}).get("end_date", None)
+    
+    logger.info(f"Fetching prices from {start_date} to {end_date}")
     
     params = {"country_code": "CF", "start_date": start_date, "end_date": end_date, "format": "json"}
     headers = {"Authorization": f"JWT {auth_token}", "Content-Type": "application/json"}
@@ -208,7 +217,7 @@ def fetch_fews_market_prices(data_config, features_config, market_lookup, auth_t
         m_id = p.get("market")
         m_name = market_lookup.get(m_id) or market_lookup.get(str(m_id)) or str(m_id)
         
-        date = p.get("period_date") or p.get("start_date")
+        date_val = p.get("period_date") or p.get("start_date")
         val = p.get("value")
         
         # --- ROBUST PARSING LOGIC ---
@@ -231,10 +240,10 @@ def fetch_fews_market_prices(data_config, features_config, market_lookup, auth_t
 
         if not commodity: commodity = "Unknown"
         
-        if date and val is not None:
+        if date_val and val is not None:
             # PUBLICATION LAG: Shift date forward by lag_days
             # Prices observed on 'date' become "available" at (date + lag_days)
-            original_date = pd.to_datetime(date)
+            original_date = pd.to_datetime(date_val)
             lagged_date = original_date + pd.Timedelta(days=lag_days)
             
             records.append({
@@ -260,28 +269,128 @@ def fetch_fews_market_prices(data_config, features_config, market_lookup, auth_t
     return df_fused
 
 
-def run(configs, engine):
+def run(configs=None, engine=None, full_refresh: bool = False):
+    """
+    Main food security ingestion function.
+    
+    Args:
+        configs: Configuration dict containing data and features configs
+        engine: SQLAlchemy engine
+        full_refresh: If True, ignore existing data and fetch all records
+    """
     logger.info("FOOD SECURITY INGESTION (With Publication Lag)")
+    
+    # Handle optional configs/engine
+    if configs is None:
+        configs = load_configs()
+    if engine is None:
+        engine = get_db_engine()
+    
     token = get_fews_token()
     ensure_tables_exist(engine)
     
     # Extract both data and features configs
-    data_cfg = configs.get("data", configs)
-    features_cfg = configs.get("features", {})
+    if isinstance(configs, dict):
+        data_cfg = configs.get("data", configs)
+        features_cfg = configs.get("features", {})
+    else:
+        data_cfg = configs[0] if len(configs) > 0 else {}
+        features_cfg = configs[1] if len(configs) > 1 else {}
     
     market_lookup = fetch_market_locations_remote(engine, data_cfg)
     
-    # Prices - now with publication lag
-    df_prices = fetch_fews_market_prices(data_cfg, features_cfg, market_lookup, token)
-    if not df_prices.empty:
-        df_prices = df_prices.drop_duplicates(subset=["date", "market", "commodity"])
-        upload_to_postgis(engine, df_prices, TABLE_PRICES, SCHEMA, ["date", "market", "commodity", "indicator"])
-        logger.info(f"✓ Prices: {len(df_prices)} rows.")
+    # Get publication lag
+    lag_days = get_publication_lag_days(data_cfg, features_cfg)
+    
+    # Get config end date
+    requested_end_date = data_cfg.get("global_date_window", {}).get("end_date")
+    if not requested_end_date:
+        from datetime import datetime
+        requested_end_date = datetime.now().strftime("%Y-%m-%d")
+    
+    # -------------------------------------------------------------------------
+    # INCREMENTAL LOADING: Use centralized helper
+    # -------------------------------------------------------------------------
+    # Note: The stored dates have publication lag applied, so we need to account for that
+    # when determining what to fetch from the API
+    
+    start, end = get_incremental_window(
+        engine=engine,
+        table=TABLE_PRICES,
+        date_col="date",
+        requested_end_date=requested_end_date,
+        default_start_date=DEFAULT_START_DATE,
+        force_full=full_refresh,
+        schema=SCHEMA
+    )
+    
+    if start is None:
+        logger.info("✅ Food security data already up to date. No new data to fetch.")
+        return
+    
+    # Convert to observation dates for API call
+    # stored_date = observation_date + lag_days
+    # So observation_date = stored_date - lag_days
+    # Add overlap buffer of 14 days for late-arriving data
+    OVERLAP_BUFFER_DAYS = 14
+    
+    if not full_refresh:
+        # start is the first date we need in the DB (with lag applied)
+        # We need to fetch observation data from (start - lag_days - buffer)
+        api_start = (pd.to_datetime(start) - timedelta(days=lag_days + OVERLAP_BUFFER_DAYS)).strftime("%Y-%m-%d")
     else:
-        logger.warning("No Market Price data loaded.")
+        api_start = DEFAULT_START_DATE
+    
+    # For end date, we need observations that will result in lagged dates up to 'end'
+    # observation_date + lag_days = end, so observation_date = end - lag_days
+    api_end = (pd.to_datetime(end) - timedelta(days=lag_days)).strftime("%Y-%m-%d")
+    
+    logger.info(f"DB window needed: {start} to {end}")
+    logger.info(f"API fetch window (observation dates): {api_start} to {api_end}")
+    
+    # Fetch prices
+    df_prices = fetch_fews_market_prices(
+        data_cfg, features_cfg, market_lookup, token,
+        start_date=api_start,
+        end_date=api_end,
+        lag_days=lag_days
+    )
+    
+    if df_prices.empty:
+        logger.warning("No Market Price data loaded from API.")
+        return
+    
+    # Filter to only the dates we need (avoid re-uploading old data)
+    if not full_refresh:
+        original_count = len(df_prices)
+        df_prices = df_prices[df_prices['date'] >= pd.to_datetime(start).date()]
+        logger.info(f"Filtered to {len(df_prices)} new records (from {original_count} fetched)")
+    
+    if df_prices.empty:
+        logger.info("✅ Food security data already up to date after filtering.")
+        return
+    
+    df_prices = df_prices.drop_duplicates(subset=["date", "market", "commodity"])
+    upload_to_postgis(engine, df_prices, TABLE_PRICES, SCHEMA, ["date", "market", "commodity", "indicator"])
+    logger.info(f"✅ Prices: {len(df_prices)} rows uploaded.")
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Fetch FEWS NET food security data")
+    parser.add_argument(
+        "--full", 
+        action="store_true",
+        help="Force full refresh (ignore existing data)"
+    )
+    parser.add_argument(
+        "--no-incremental",
+        action="store_true",
+        help="Alias for --full"
+    )
+    args = parser.parse_args()
+    
+    force_full = args.full or args.no_incremental
+    
     try:
         cfgs = load_configs()
         if isinstance(cfgs, tuple):
@@ -289,7 +398,7 @@ def main():
         else:
             configs = cfgs
         engine = get_db_engine()
-        run(configs, engine)
+        run(configs, engine, full_refresh=force_full)
     finally:
         if 'engine' in locals(): engine.dispose()
 

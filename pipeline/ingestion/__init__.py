@@ -2,7 +2,6 @@
 
 from . import (
     create_h3_grid,
-    discover_gdelt_themes,
     fetch_economy,
     fetch_food_security,
     fetch_ioda,
@@ -18,13 +17,11 @@ from . import (
     fetch_epr_core,
     fetch_iom,
     fetch_settlements,
-    fetch_gdelt_themes,
-    fetch_gdelt_events
+    fetch_gdelt_dual
 )
 
 __all__ = [
     'create_h3_grid',
-    'discover_gdelt_themes',
     'fetch_population',
     'fetch_acled',
     'fetch_ioda',
@@ -39,7 +36,6 @@ __all__ = [
     'fetch_epr_core',
     'fetch_iom',
     'fetch_economy',
-    'fetch_gdelt_themes',
-    'fetch_gdelt_events',
+    'fetch_gdelt_dual',
     'fetch_food_security',
 ]

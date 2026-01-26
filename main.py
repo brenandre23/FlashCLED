@@ -62,10 +62,11 @@ from pipeline.processing import (
     process_terrain,
     calculate_static_distances,
     spatial_disaggregation,
-    feature_engineering as master_fe,
     calculate_epr_features,
     process_crisiswatch,
     process_acled_hybrid,
+    process_spine_and_infrastructure,
+    process_conflict_features,
 )
 
 # --- Modeling ---
@@ -153,6 +154,9 @@ class CEWPPipeline:
         
         # Resolve Dates
         self.start_date, self.end_date = get_date_window(args, data_cfg)
+        
+        # Unified force_full flag for all dynamic ingests
+        self.force_full = getattr(args, 'no_incremental', False)
 
     def setup(self):
         """Initialize DB connection and schema."""
@@ -242,34 +246,45 @@ class CEWPPipeline:
         """
         Phase 2: Dynamic Ingestion (Time-Series)
         Fetches data that changes over time (Events, Climate, Prices).
+        
+        All dynamic ingests respect self.force_full for uniform --no-incremental behavior.
         """
+        logger.info(f"Dynamic Ingestion Mode: {'FULL REFRESH' if self.force_full else 'INCREMENTAL'}")
+        
         # 1. Conflict Events (The "Target")
-        fetch_acled.run(self.configs, self.engine)
+        # Pass args with no_incremental attribute set
+        fetch_acled.run(self.configs, self.engine, args=self.args)
 
         # 2. High-Frequency Automated Events (GDELT/IODA)
-        fetch_ioda.run(self.configs, self.engine)
+        # IODA: Pass full_refresh flag
+        fetch_ioda.run(self.configs, self.engine, full_refresh=self.force_full)
         
         if self.args.skip_gdelt:
             logger.info("Skipping GDELT fetch (per flag).")
         else:
-            # Dual-Sensor Ingestion (Events + GKG Themes at R5)
-            fetch_gdelt_dual.run(engine=self.engine)
+            # GDELT: Pass force_full flag
+            fetch_gdelt_dual.run(engine=self.engine, force_full=self.force_full)
 
         # 3. Socio-Economic
-        fetch_food_security.run(self.configs, self.engine)
-        fetch_economy.main()
-        fetch_iom.main()
+        # Food Security: Pass full_refresh flag
+        fetch_food_security.run(self.configs, self.engine, full_refresh=self.force_full)
+        
+        # Economy: Pass full_refresh flag
+        fetch_economy.run(self.configs, self.engine, full_refresh=self.force_full)
+        
+        # IOM: Pass full_refresh flag
+        fetch_iom.main(full_refresh=self.force_full)
 
         # 4. Spatial Disaggregation
         logger.info(">> Spatial Disaggregation (Admin -> H3)")
         spatial_disaggregation.run(self.configs, self.engine)
 
         # 5. Environmental Variables (Google Earth Engine)
-        fetch_gee_server_side.run(self.configs, self.engine)
+        fetch_gee_server_side.run(self.configs, self.engine, args=self.args)
 
         # 6. Land Cover (Dynamic World via GEE)
         logger.info(">> Dynamic World Land Cover")
-        fetch_dynamic_world.run(self.configs, self.engine)
+        fetch_dynamic_world.run(self.configs, self.engine, full_refresh=self.force_full)
 
         logger.info("✓ Dynamic Ingestion Phase Complete.")
 
@@ -303,8 +318,12 @@ class CEWPPipeline:
             )
 
         with pipeline_stage("PHASE 3: FEATURE ENGINEERING"):
-            # 3.1 Master Feature Script
-            master_fe.run()
+            # 3.1 Contextual Features (Spine, Economy, Env, etc.)
+            if not self.args.skip_context:
+                logger.info(">> Processing Contextual Features (Spine, Economy, Environment)...")
+                process_spine_and_infrastructure.run()
+            else:
+                logger.info(">> Skipping Contextual Features (assuming already present)...")
 
             # 3.2 ACLED Hybrid (Regex + Semantic) Features
             logger.info(">> Generating ACLED Hybrid Features (Regex + Semantic)...")
@@ -316,6 +335,10 @@ class CEWPPipeline:
 
             # 3.4 EPR Features (Sidecar)
             calculate_epr_features.main()
+            
+            # 3.5 Conflict Features (ACLED, GDELT, Fusion) - Upserts to temporal_features
+            logger.info(">> Processing Conflict Features (ACLED, GDELT, Fusion)...")
+            process_conflict_features.run()
 
         # Optional pause for manual pruning
         if getattr(self.args, "stop_after_features", False):
@@ -509,6 +532,7 @@ class CEWPPipeline:
             logger.info("=" * 60)
             logger.info("   ORCHESTRATING CEWP PIPELINE")
             logger.info(f"   Window: {self.start_date} -> {self.end_date}")
+            logger.info(f"   Incremental Mode: {'OFF (Full Refresh)' if self.force_full else 'ON'}")
             logger.info("=" * 60)
 
             self.run_static_phase()
@@ -519,6 +543,13 @@ class CEWPPipeline:
 
             self.run_modeling_phase()
             self.run_analysis_phase()
+
+            # Optional: run diagnostics after full pipeline completes
+            if getattr(self.args, "run_diagnostics_after", False):
+                logger.info("\nRunning post-pipeline diagnostics (--run-diagnostics-after)...")
+                rc = self._run_diagnostics_mode()
+                if rc != 0:
+                    return rc
 
             logger.info("\n" + "=" * 60)
             logger.info("✅ PIPELINE EXECUTION SUCCESSFUL")
@@ -773,14 +804,20 @@ def parse_args():
     # Dates
     parser.add_argument("--start-date", type=str, help="YYYY-MM-DD")
     parser.add_argument("--end-date", type=str, help="YYYY-MM-DD")
+    parser.add_argument(
+        "--no-incremental",
+        action="store_true",
+        help="Force full refetch for ALL dynamic ingestion steps (ACLED, GDELT, IODA, Food, Economy, IOM, DynamicWorld)."
+    )
     
     # Flags
     parser.add_argument("--reset-schema", action="store_true", help="Hard reset schema before running.")
     parser.add_argument("--skip-static", action="store_true", help="Skip static ingestion.")
     parser.add_argument("--skip-dynamic", action="store_true", help="Skip dynamic ingestion.")
     parser.add_argument("--skip-gdelt", action="store_true", help="Skip all GDELT fetch (Events & Themes).")
-    parser.add_argument("--skip-gdelt-themes", action="store_true", help="Skip GDELT themes fetch (BigQuery).")
+    parser.add_argument("--skip-gdelt-themes", action="store_true", help="Skip GDELT themes fetch.")
     parser.add_argument("--skip-features", action="store_true", help="Skip feature engineering.")
+    parser.add_argument("--skip-context", action="store_true", help="Skip contextual feature engineering (Spine, Economy, Env, etc) and run only Conflict.")
     parser.add_argument("--skip-modeling", action="store_true", help="Skip modeling & predictions.")
     parser.add_argument("--skip-analysis", action="store_true", help="Skip post-run analysis.")
     parser.add_argument(
@@ -814,6 +851,11 @@ def parse_args():
         "--run-diagnostics-only",
         action="store_true",
         help="Run consolidated diagnostics (correlation/VIF) and exit before modeling."
+    )
+    parser.add_argument(
+        "--run-diagnostics-after",
+        action="store_true",
+        help="After full pipeline (including predictions), automatically run diagnostics."
     )
     
     # =========================================================================

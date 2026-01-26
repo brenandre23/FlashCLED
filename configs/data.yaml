@@ -6,7 +6,7 @@
 # --- GLOBAL DATE CONTROL ---
 global_date_window:
   start_date: "2000-01-01"
-  end_date: "2025-12-04"
+  end_date: "2025-12-31"
 
 # --- MODEL TRAINING SPLITS ---
 split:
@@ -75,9 +75,9 @@ world_bank_boundary:
   filter_property: "ISO_A3"
 
 admin_boundaries:
-  admin1_path: "data/raw/wbgCAFadmin1.geojson" #labeled as admin1 in source from World Bank
-  admin2_path: "data/raw/wbgCAFadmin2.geojson" #labeled as admin2 in source from World Bank
-  admin3_path: "data/raw/wbgCAFadmin3.geojson" #labeled as admin2 in source from OCHA
+  region_boundary: "data/raw/regions.geojson"          # Admin 1 (Regions) - legacy WB (17 units)
+  prefecture_boundary: "data/raw/prefectures.json"          # Admin 2 (Prefectures) - 2021 standard (20 units)
+  subprefecture_boundary: "data/raw/subprefectures.json"    # Admin 3 (Subprefectures) - 2021 standard (72 units)
   url: "https://datacatalog.worldbank.org/search/dataset/0038272/World-Bank-Official-Boundaries"
 
 population:

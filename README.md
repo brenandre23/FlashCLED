@@ -2,7 +2,7 @@
 
 A production-grade geospatial machine learning pipeline for forecasting sub-national conflict in the **Central African Republic (CAR)**.
 
-The system ingests multi-source data (satellite, economic, political, NLP-derived), engineers **111 features** on a hexagonal grid (**H3 resolution 5, ~10km cells**), and predicts conflict probability and fatality magnitude using a **Two-Stage Hurdle Ensemble** with calibrated uncertainty quantification.
+The system ingests multi-source data (satellite, economic, political, NLP-derived), engineers **141 features** (unique columns pre-pruning) on a hexagonal grid (**H3 resolution 5, ~10km cells**), and predicts conflict probability and fatality magnitude using a **Two-Stage Hurdle Ensemble** with calibrated uncertainty quantification.
 
 ---
 
@@ -96,7 +96,7 @@ You should see:
 
 - Builds an **H3 grid** (3,407 cells at resolution 5) + static geography layers (terrain, rivers, roads, settlements, mines)
 - Ingests dynamic time-series data from **21+ data sources** (ACLED, GDELT, IODA, WorldPop, GEE, FEWS NET, Yahoo Finance)
-- Extracts **13 NLP features** from ACLED event narratives using semi-supervised semantic projection
+- Extracts **NLP features** from ACLED event narratives and CrisisWatch monthly reports
 - Runs **master feature engineering** on a **14-day temporal spine** (anomalies, shocks, decays, spatial diffusion)
 - Trains a **Two-Stage Hurdle Ensemble** (9 thematic sub-models + meta-learners)
 - Produces **calibrated probabilities** with **uncertainty quantification** via BCCP
@@ -152,10 +152,10 @@ Orchestrated by `main.py`:
 
 | Category | Sources | Key Features |
 | --- | --- | --- |
-| **Environmental** | CHIRPS, ERA5, MODIS, VIIRS, JRC Water, Dynamic World | Precipitation, temperature, NDVI anomalies, nighttime lights, surface water, landcover |
+| **Environmental** | CHIRPS, ERA5, MODIS, VIIRS, JRC Water, Dynamic World | Precipitation, temperature, NDVI anomalies, Integrated NTL (Stability/Kinetic/Staleness), surface water, landcover |
 | **Conflict & Events** | ACLED, GDELT | Event counts, fatalities, protest/riot indicators, media tone |
 | **ACLED Hybrid NLP** | ACLED notes field | 8 semantic themes + 5 explicit drivers (semi-supervised) |
-| **Socio-Political** | EPR, IOM DTM, FEWS NET IPC, IODA | Ethnic exclusion, displacement, food security phases, internet outages |
+| **Socio-Political** | EPR, IOM DTM, IODA | Ethnic exclusion, displacement, internet outages |
 | **Economic** | Yahoo Finance, WFP Markets | Gold/oil prices, local market prices, price shocks |
 | **Infrastructure** | GRIP4, HydroRIVERS, IPIS, OSM | Distance to roads, rivers, mines, settlements |
 | **Demographics** | WorldPop | Population count and density |
@@ -286,17 +286,18 @@ See [docs/DIAGNOSTIC_FILTERING.md](docs/DIAGNOSTIC_FILTERING.md) for complete do
 
 ## 📈 Feature Summary
 
-**Total Features: 111** (45 raw + 66 transformed)
+**Total Features: 141 (unique columns pre-pruning)**
 
 | Category | Count |
 | --- | --- |
-| Environmental | 26 |
+| Environmental | 29 |
 | Conflict | 20 |
 | ACLED Hybrid NLP | 13 |
+| NLP & Narrative (v2.0) | 27 |
 | Economic | 20 |
-| Socio-Political | 14 |
+| Socio-Political | 13 |
 | Infrastructure | 12 |
-| Demographics | 5 |
+| Demographics | 4 |
 | Temporal Context | 3 |
 
 ---
@@ -313,6 +314,23 @@ Model performance is assessed on operational utility rather than raw accuracy (d
 | **RMSE** | Intensity prediction accuracy (absolute error on counts) |
 | **Mean Poisson Deviance** | Intensity fit on count scale; respects heteroscedasticity of conflict counts (lower is better) |
 | **Coverage** | BCCP interval reliability |
+
+---
+
+## 🔬 Research Validation
+
+The pipeline includes a dedicated diagnostic module to validate three core research questions:
+
+| RQ | Objective | Validation Method |
+|----|-----------|-------------------|
+| **RQ1** | Spatial Granularity | SHAP gradient analysis (<5km) & Within-Admin Variance |
+| **RQ2** | Operational Tempo | Precision-Recall comparison (14d vs 30d) & Time-to-Detection |
+| **RQ3** | Multi-Modal Fusion | SHAP Interaction (Hard × Soft) & Ablation Study (F1 Gain) |
+
+Run the validation suite:
+```bash
+python research_questions_diagnostic.py
+```
 
 ---
 
@@ -353,6 +371,13 @@ The pipeline distinguishes two independent lag mechanisms:
 **Analytical lags** use `LAG()`/`shift()` for features and `LEAD()` for targets downstream in feature engineering.
 
 A feature can have both—e.g., GEE data has a 14-day publication lag at ingestion AND an analytical lag when used as a model feature.
+
+---
+
+## 📧 Contact
+
+For inquiries regarding the CEWP methodology or deployment, please contact:
+**Brenan Andre** - [brenan.andre23@gmail.com](mailto:brenan.andre23@gmail.com)
 
 ---
 

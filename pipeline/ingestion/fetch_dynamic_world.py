@@ -6,6 +6,11 @@ Full Ingestion (Grass, Crops, Trees, Bare, Built).
 
 - START DATE: 2017-03-07 (Sentinel-2B Launch)
 - OPTIMIZED: Uses monkey-patched timeouts and robust error handling.
+
+UPDATES (2026-01-24):
+- Uses centralized get_incremental_window helper
+- Supports --full / --no-incremental flags for complete refresh
+- Adds overlap buffer for late-arriving data
 """
 
 import sys
@@ -43,15 +48,18 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from utils import logger, get_db_engine, load_configs, upload_to_postgis, ensure_h3_int64, init_gee
+from utils import logger, get_db_engine, load_configs, upload_to_postgis, ensure_h3_int64, init_gee, get_incremental_window, SCHEMA
 
 # --- Constants ---
-SCHEMA = "car_cewp"
 GRID_TABLE = "features_static"
 TARGET_TABLE = "landcover_features"
 
 # --- UPDATED CUTOFF: Sentinel-2B Launch ---
 CUTOFF_DATE = pd.Timestamp("2017-03-07")
+DEFAULT_START_DATE = "2017-03-07"
+
+# Overlap buffer for late-arriving/reprocessed data
+OVERLAP_BUFFER_DAYS = 14
 
 MAX_WORKERS = 6
 H3_BATCH_SIZE = 200
@@ -62,7 +70,7 @@ DW_COLLECTION = "GOOGLE/DYNAMICWORLD/V1"
 # DATABASE & HELPERS
 # -------------------------------------------------------------------------
 
-def ensure_landcover_table_exists(engine, schema="car_cewp"):
+def ensure_landcover_table_exists(engine, schema=SCHEMA):
     sql = text(f"""
     CREATE SCHEMA IF NOT EXISTS {schema};
     CREATE TABLE IF NOT EXISTS {schema}.{TARGET_TABLE} (
@@ -194,41 +202,91 @@ def process_year_batch(year, all_cells, windows, engine, lag_days):
             upload_to_postgis(engine, df, TARGET_TABLE, SCHEMA, primary_keys=["h3_index", "date"])
         gc.collect()
 
-def run(configs, engine):
+def run(configs=None, engine=None, full_refresh: bool = False):
+    """
+    Main Dynamic World ingestion function.
+    
+    Args:
+        configs: Configuration dict
+        engine: SQLAlchemy engine
+        full_refresh: If True, ignore existing data and fetch all records
+    """
     logger.info("DYNAMIC WORLD FULL INGESTION (Optimized)")
     
-    data_cfg = configs["data"]
-    features_cfg = configs["features"]
-    project_id = data_cfg["gee"]["project_id"]
-    g_end = int(data_cfg["global_date_window"]["end_date"][:4])
+    # Handle optional configs/engine
+    if configs is None:
+        cfgs = load_configs()
+        configs = cfgs if isinstance(cfgs, dict) else {"data": cfgs[0], "features": cfgs[1]}
+    if engine is None:
+        engine = get_db_engine()
+    
+    data_cfg = configs.get("data", configs[0] if isinstance(configs, tuple) else {})
+    features_cfg = configs.get("features", configs[1] if isinstance(configs, tuple) else {})
+    
+    project_id = data_cfg.get("gee", {}).get("project_id")
+    if not project_id:
+        logger.error("GEE project_id not found in data.yaml")
+        return
+    
+    # Get config end date
+    requested_end_date = data_cfg.get("global_date_window", {}).get("end_date")
+    if not requested_end_date:
+        requested_end_date = datetime.now().strftime("%Y-%m-%d")
     
     ensure_landcover_table_exists(engine)
     
     # Lag
-    lag_steps = features_cfg['temporal']['publication_lags'].get('DynamicWorld', 1)
-    lag_days = lag_steps * 14
+    lag_steps = features_cfg.get('temporal', {}).get('publication_lags', {}).get('DynamicWorld', 1)
+    step_days = features_cfg.get('temporal', {}).get('step_days', 14)
+    lag_days = lag_steps * step_days
     
     init_gee(project_id)
     ee.data.setDeadline(600)
     
-    # START DATE: 2017-03-07
-    effective_start_date = datetime(2017, 3, 7)
+    # -------------------------------------------------------------------------
+    # INCREMENTAL LOADING: Use centralized helper
+    # -------------------------------------------------------------------------
+    start, end = get_incremental_window(
+        engine=engine,
+        table=TARGET_TABLE,
+        date_col="date",
+        requested_end_date=requested_end_date,
+        default_start_date=DEFAULT_START_DATE,
+        force_full=full_refresh,
+        schema=SCHEMA
+    )
+    
+    if start is None:
+        logger.info("✅ Dynamic World data already up to date. No fetch needed.")
+        return
+    
+    # Apply overlap buffer for late-arriving/reprocessed data
+    if not full_refresh:
+        effective_start_date = pd.to_datetime(start) - timedelta(days=OVERLAP_BUFFER_DAYS)
+    else:
+        effective_start_date = pd.to_datetime(DEFAULT_START_DATE)
+    
+    # Ensure we don't go before Sentinel-2B launch
+    effective_start_date = max(effective_start_date, pd.Timestamp(DEFAULT_START_DATE))
+    
+    logger.info(f"Start Date: {effective_start_date.date()} (Sentinel-2B)")
+    logger.info(f"End Date: {end}")
     
     all_cells = get_h3_grid_data(engine)
     logger.info(f"Loaded {len(all_cells)} H3 cells.")
     
-    # Check processed
+    # Check already processed dates (for within-year incremental)
     try:
         existing = pd.read_sql(f"SELECT DISTINCT date FROM {SCHEMA}.{TARGET_TABLE}", engine)
         processed_dates = set(pd.to_datetime(existing['date']).dt.strftime('%Y-%m-%d'))
     except:
         processed_dates = set()
-    
-    logger.info(f"Start Date: {effective_start_date.date()} (Sentinel-2B)")
 
-    for year in range(effective_start_date.year, g_end + 1):
+    end_year = pd.to_datetime(end).year
+
+    for year in range(effective_start_date.year, end_year + 1):
         full_spine = build_14day_spine(year, year)
-        valid_spine = [w for w in full_spine if w[0] >= effective_start_date]
+        valid_spine = [w for w in full_spine if w[0] >= effective_start_date.to_pydatetime() and w[0] <= pd.to_datetime(end)]
         
         windows_to_run = []
         for w in valid_spine:
@@ -247,11 +305,28 @@ def run(configs, engine):
     
     logger.info("✓ Dynamic World full ingestion complete.")
 
+
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Fetch Dynamic World land cover data")
+    parser.add_argument(
+        "--full", 
+        action="store_true",
+        help="Force full refresh (ignore existing data)"
+    )
+    parser.add_argument(
+        "--no-incremental",
+        action="store_true",
+        help="Alias for --full"
+    )
+    args = parser.parse_args()
+    
+    force_full = args.full or args.no_incremental
+    
     try:
         cfgs = load_configs()
         configs = cfgs if isinstance(cfgs, dict) else {"data": cfgs[0], "features": cfgs[1]}
         eng = get_db_engine()
-        run(configs, eng)
+        run(configs, eng, full_refresh=force_full)
     finally:
         if 'eng' in locals(): eng.dispose()

@@ -1,0 +1,131 @@
+# =============================================================================
+# SOURCE FRESHNESS CONFIGURATION
+# =============================================================================
+# Defines expected update frequencies for each data source.
+# Used by health check functions to warn when sources become stale.
+#
+# expected_max_gap_days: Maximum acceptable gap between observations
+# table: Database table containing the source data
+# date_column: Column containing observation dates (default: 'date')
+# =============================================================================
+
+sources:
+  # -------------------------------------------------------------------------
+  # HIGH-FREQUENCY SOURCES (Expected daily/weekly updates)
+  # -------------------------------------------------------------------------
+  gdelt:
+    table: features_dynamic_daily
+    date_column: date
+    expected_max_gap_days: 3
+    description: "GDELT v2 events - near real-time ingestion"
+    alert_level: warning  # Delay may indicate master file issues
+    
+  acled:
+    table: acled_events
+    date_column: event_date
+    expected_max_gap_days: 10
+    description: "ACLED conflict events - weekly release cycle"
+    alert_level: warning
+    
+  acled_hybrid:
+    table: acled_hybrid_features
+    date_column: date
+    expected_max_gap_days: 14
+    description: "ACLED hybrid NLP features - processed after raw ACLED"
+    alert_level: info
+    
+  ioda:
+    table: ioda_outages
+    date_column: date
+    expected_max_gap_days: 7
+    description: "IODA internet outage detection - near real-time"
+    alert_level: warning
+
+  # -------------------------------------------------------------------------
+  # MEDIUM-FREQUENCY SOURCES (Expected monthly updates)
+  # -------------------------------------------------------------------------
+  wfp_prices:
+    table: food_prices
+    date_column: date
+    expected_max_gap_days: 45
+    description: "WFP/FEWS NET food prices - monthly with ~2 week lag"
+    alert_level: warning
+    
+  fews_ipc:
+    table: fews_ipc
+    date_column: date
+    expected_max_gap_days: 120
+    description: "FEWS NET IPC food security phases - quarterly projections"
+    alert_level: info
+    
+  gee_environmental:
+    table: environmental_features
+    date_column: date
+    expected_max_gap_days: 21
+    description: "GEE environmental data - 14-day windows with 14-day lag"
+    alert_level: warning
+
+  dynamic_world:
+    table: landcover_features
+    date_column: date
+    expected_max_gap_days: 21
+    description: "Dynamic World landcover - Sentinel-2 derived"
+    alert_level: warning
+
+  # -------------------------------------------------------------------------
+  # LOW-FREQUENCY SOURCES (Expected quarterly/annual updates)
+  # -------------------------------------------------------------------------
+  iom_dtm:
+    table: iom_displacement_h3
+    date_column: date
+    expected_max_gap_days: 120
+    description: "IOM DTM displacement - quarterly survey rounds"
+    alert_level: info
+    
+  economy:
+    table: economic_drivers
+    date_column: date
+    expected_max_gap_days: 7
+    description: "Yahoo Finance macro indicators - daily (trading days)"
+    alert_level: warning
+    
+  population:
+    table: population_h3
+    date_column: year
+    expected_max_gap_days: 400  # Annual
+    description: "WorldPop population - annual estimates"
+    alert_level: info
+
+  # -------------------------------------------------------------------------
+  # STATIC SOURCES (No expected updates)
+  # -------------------------------------------------------------------------
+  epr:
+    table: epr_features
+    date_column: null
+    expected_max_gap_days: null  # Static
+    description: "ETH Zurich EPR ethnic power relations - historical"
+    alert_level: null
+    
+  static_geography:
+    table: features_static
+    date_column: null
+    expected_max_gap_days: null  # Static
+    description: "H3 grid with terrain, distances, mining proximity"
+    alert_level: null
+
+# =============================================================================
+# ALERT THRESHOLDS
+# =============================================================================
+# Global multipliers for escalating alerts
+alert_thresholds:
+  warning_multiplier: 1.0   # Alert at expected_max_gap_days * 1.0
+  critical_multiplier: 2.0  # Critical at expected_max_gap_days * 2.0
+  
+# =============================================================================
+# HEALTH CHECK CONFIGURATION
+# =============================================================================
+health_check:
+  enabled: true
+  run_at_pipeline_start: true
+  fail_on_critical: false  # Set true to halt pipeline on critical staleness
+  log_format: "Source {source}: Last observation {last_date}, gap={gap_days}d (expected <{expected_days}d)"

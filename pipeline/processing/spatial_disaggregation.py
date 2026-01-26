@@ -31,6 +31,20 @@ POPULATION_TABLE = "population_h3"
 STATIC_TABLE = "features_static"
 IOM_SOURCE_TABLE = "iom_dtm_raw"  # Updated to match fetch_iom.py
 
+# Population-weighted splits for Grand Bangui hybrid zones (Source: ICASEES RGPH-4 2021)
+GRAND_BANGUI_SPLITS = {
+    "Bangui-Fleuve": {"Bangui": 0.35, "Bimbo": 0.65},  # Majority Bimbo Commune
+    "Bangui-Kagas":  {"Bangui": 0.52, "Bimbo": 0.48},  # Split City/Bégoua
+    "Bangui-Rapide": {"Bangui": 0.85, "Bimbo": 0.15}   # Majority City (7th Arr)
+}
+
+# Mapping of admin levels to config keys in data.yaml
+LEVEL_PATH_KEY = {
+    "admin1": "region_boundary",         # Regions (legacy WB admin1)
+    "admin2": "prefecture_boundary",     # Prefectures (new admin2)
+    "admin3": "subprefecture_boundary",  # Subprefectures (new admin3)
+}
+
 
 def ensure_admin_columns(engine) -> None:
     """
@@ -48,10 +62,11 @@ def _infer_pcode_col(gdf: gpd.GeoDataFrame, level: str) -> Optional[str]:
     if level == "admin1":
         candidates = ["ADM1_PCODE", "adm1_pcode", "PCODE", "pcode", "ADM1_CODE"]
     elif level == "admin2":
-        candidates = ["ADM2_PCODE", "adm2_pcode", "PCODE", "pcode", "ADM2_CODE"]
+        # Prefectures file uses ADM1_PCODE (legacy WB naming), include it
+        candidates = ["ADM2_PCODE", "adm2_pcode", "ADM1_PCODE", "PCODE", "pcode", "ADM2_CODE"]
     elif level == "admin3":
         # CRITICAL: Admin3 often uses adm2_pcode in WBG data due to naming inconsistencies
-        candidates = ["adm2_pcode", "ADM3_PCODE", "adm3_pcode", "PCODE", "pcode", "ADM3_CODE"]
+        candidates = ["ADM2_PCODE", "adm2_pcode", "ADM3_PCODE", "adm3_pcode", "PCODE", "pcode", "ADM3_CODE"]
     
     for col in candidates:
         if col in gdf.columns:
@@ -65,18 +80,50 @@ def _infer_name_col(gdf: gpd.GeoDataFrame, level: str) -> Optional[str]:
     candidates = []
     
     if level == "admin1":
-        candidates = ["ADM1_REF", "ADM1_NAME", "adm1_name", "NAME_1", "NAM_1", "name"]
+        # New CAF admin1 (regions) files use ADM1_FR for the name
+        candidates = ["ADM1_FR", "ADM1_REF", "ADM1_NAME", "adm1_name", "NAME_1", "NAM_1", "name"]
     elif level == "admin2":
-        candidates = ["ADM2_REF", "ADM2_NAME", "adm2_name", "NAME_2", "NAM_2", "name"]
+        # CAF prefectures (admin2) file exposes ADM1_FR as the name field
+        candidates = ["ADM2_FR", "ADM1_FR", "ADM2_REF", "ADM2_NAME", "adm2_name", "NAME_2", "NAM_2", "name"]
     elif level == "admin3":
         # CRITICAL: Admin3 often uses adm2_ref_name or adm2_name in WBG data
-        candidates = ["adm2_ref_name", "adm2_name", "ADM3_REF", "ADM3_NAME", "adm3_name", "NAME_3", "NAM_3", "name"]
+        candidates = ["ADM2_FR", "adm2_ref_name", "adm2_name", "ADM3_REF", "ADM3_NAME", "adm3_name", "NAME_3", "NAM_3", "name"]
     
     for col in candidates:
         if col in gdf.columns:
             logger.info(f"  Using name column: {col}")
             return col
     return None
+
+
+def apply_grand_bangui_splits(df: pd.DataFrame, name_col: str, count_col: str) -> pd.DataFrame:
+    """
+    Splits Grand Bangui hybrid regions into 'Bangui' and 'Bimbo' based on population weights.
+    """
+    mask = df[name_col].isin(GRAND_BANGUI_SPLITS.keys())
+    if not mask.any():
+        return df
+
+    logger.info(f"Splitting {mask.sum()} Grand Bangui records...")
+
+    records = []
+    for _, row in df[mask].iterrows():
+        region = row[name_col]
+        weights = GRAND_BANGUI_SPLITS[region]
+
+        r1 = row.copy()
+        r1[name_col] = "Bangui"
+        r1["admin2_pcode"] = "CF711"
+        r1[count_col] = row[count_col] * weights["Bangui"]
+        records.append(r1)
+
+        r2 = row.copy()
+        r2[name_col] = "Bimbo"
+        r2["admin2_pcode"] = "CF111"
+        r2[count_col] = row[count_col] * weights["Bimbo"]
+        records.append(r2)
+
+    return pd.concat([df[~mask], pd.DataFrame(records)], ignore_index=True)
 
 
 def normalize_name(name: str) -> str:
@@ -108,6 +155,21 @@ def normalize_name(name: str) -> str:
     name = ' '.join(name.split())
     
     return name
+
+# Recovery map for IOM subprefecture names -> standard subprefecture names
+NORMALIZATION_MAP = {
+    "bangui centre": "bangui",
+    "bangui fleuve": "bangui",
+    "bangui kagas": "bangui",
+    "bangui rapide": "bangui",
+    "nana outa": "kaga bandoro",
+    "sido": "kabo",
+    "taley": "bocaranga",
+    "ndim": "ngaoundaye",
+    "mboki": "obo",
+    "ouandja": "ouanda djalle",
+    "ouandja kotto": "yalinga",
+}
 
 
 def build_admin_h3_map(engine, data_cfg: Dict, features_cfg: Dict) -> Dict[str, Dict]:
@@ -152,12 +214,11 @@ def build_admin_h3_map(engine, data_cfg: Dict, features_cfg: Dict) -> Dict[str, 
     geodetic_crs = features_cfg["spatial"]["crs"]["geodetic"]
     h3_gdf = h3_gdf.to_crs(geodetic_crs)
     
-    # Process each admin level
     admin_levels = ["admin1", "admin2", "admin3"]
     
     for level in admin_levels:
-        path_key = f"{level}_path"
-        admin_path = Path(data_cfg["admin_boundaries"][path_key])
+        path_key = LEVEL_PATH_KEY.get(level)
+        admin_path = Path(data_cfg["admin_boundaries"].get(path_key, ""))
         
         if not admin_path.exists():
             logger.warning(f"  {level} boundary file not found: {admin_path}")
@@ -185,12 +246,16 @@ def build_admin_h3_map(engine, data_cfg: Dict, features_cfg: Dict) -> Dict[str, 
         if pcode_col:
             for pcode, group in joined.groupby(pcode_col):
                 if pd.notna(pcode):
-                    admin_map[level]["by_pcode"][str(pcode)] = group["h3_index"].tolist()
+                    key = str(pcode).strip().upper()
+                    admin_map[level]["by_pcode"][key] = group["h3_index"].tolist()
         
         if name_col:
             for name, group in joined.groupby(name_col):
                 if pd.notna(name):
                     normalized = normalize_name(name)
+                    # Apply recovery map (admin3 is where IOM subprefecture names need harmonization)
+                    if level == "admin3" and normalized in NORMALIZATION_MAP:
+                        normalized = NORMALIZATION_MAP[normalized]
                     admin_map[level]["by_name"][normalized] = group["h3_index"].tolist()
         
         pcode_count = len(admin_map[level]['by_pcode'])
@@ -224,7 +289,7 @@ def enrich_features_static_admins(engine, data_cfg, features_cfg):
         if not name_col:
             continue
             
-        admin_path = ROOT_DIR / data_cfg["admin_boundaries"].get(f"{level}_path", "")
+        admin_path = ROOT_DIR / data_cfg["admin_boundaries"].get(LEVEL_PATH_KEY.get(level, ""), "")
         if not admin_path.exists():
             continue
             
@@ -331,6 +396,9 @@ def distribute_iom(engine, admin_map: Dict[str, Dict], start_date: str, end_date
     
     iom_df = pd.read_sql(query, engine)
     
+    # Apply spatial splits for Grand Bangui before normalization/remap
+    iom_df = apply_grand_bangui_splits(iom_df, name_col="admin2_name", count_col="count")
+    
     if iom_df.empty:
         logger.warning("No IOM records found in date range.")
         return pd.DataFrame()
@@ -346,10 +414,8 @@ def distribute_iom(engine, admin_map: Dict[str, Dict], start_date: str, end_date
         "CAF533": {"pcode": "CF522", "name": "Ouadda"},             # Ouandja
         "CAF524": {"pcode": "CF52",  "name": "Yalinga"},            # Ouandja-Kotto
         "CAF635": {"pcode": "CF631", "name": "Obo"},                # Mboki
-        "CAF711": {"pcode": "CF003", "name": "Bamingui-Bangoran"},  # Bangui-Centre
-        "CAF712": {"pcode": "CF003", "name": "Bamingui-Bangoran"},  # Bangui-Kagas
-        "CAF713": {"pcode": "CF003", "name": "Bamingui-Bangoran"},  # Bangui-Fleuve
-        "CAF714": {"pcode": "CF003", "name": "Bamingui-Bangoran"},  # Bangui-Rapide
+        # Bangui sectors handled via weighted split; keep only Bangui-centre
+        "CAF711": {"pcode": "CF711", "name": "Bangui"},             # Bangui-Centre
     }
     ADMIN2_REMAP_BY_NAME = {normalize_name(k.split("#")[0] if "#" in k else k): v for k, v in {
         "Nana-Outa": {"pcode": "CF421", "name": "Kaga-Bandoro"},
@@ -359,10 +425,8 @@ def distribute_iom(engine, admin_map: Dict[str, Dict], start_date: str, end_date
         "Ouandja": {"pcode": "CF522", "name": "Ouadda"},
         "Ouandja-Kotto": {"pcode": "CF52", "name": "Yalinga"},
         "Mboki": {"pcode": "CF631", "name": "Obo"},
-        "Bangui-Centre": {"pcode": "CF003", "name": "Bamingui-Bangoran"},
-        "Bangui-Kagas": {"pcode": "CF003", "name": "Bamingui-Bangoran"},
-        "Bangui-Fleuve": {"pcode": "CF003", "name": "Bamingui-Bangoran"},
-        "Bangui-Rapide": {"pcode": "CF003", "name": "Bamingui-Bangoran"},
+        # Bangui-Centre stays as Bangui; other sectors split upstream
+        "Bangui-Centre": {"pcode": "CF711", "name": "Bangui"},
     }.items()}
 
     iom_df["admin2_pcode_orig"] = iom_df["admin2_pcode"]
@@ -400,8 +464,10 @@ def distribute_iom(engine, admin_map: Dict[str, Dict], start_date: str, end_date
     pop_weights = pop_df[pop_df["year"] == latest_year].set_index("h3_index")["pop_count"].to_dict()
     
     def _get_h3_list(level: str, pcode: str, name: str) -> List[int]:
-        if pd.notna(pcode) and str(pcode) in admin_map[level]["by_pcode"]:
-            return admin_map[level]["by_pcode"][str(pcode)]
+        if pd.notna(pcode):
+            key = str(pcode).strip().upper()
+            if key in admin_map[level]["by_pcode"]:
+                return admin_map[level]["by_pcode"][key]
         if pd.notna(name):
             normalized = normalize_name(name)
             if normalized in admin_map[level]["by_name"]:
@@ -450,6 +516,15 @@ def distribute_iom(engine, admin_map: Dict[str, Dict], start_date: str, end_date
                 fallback_admin2 += 1
                 key = (row.get("admin1_pcode"), row.get("admin1_name"))
                 fallback_admin2_units[key] = fallback_admin2_units.get(key, 0) + 1
+
+        # Fallback to legacy Region (Admin1) if still unresolved
+        # Uses admin1_name to match against region_boundary (admin_map['admin1'])
+        if not h3_list and pd.notna(row.get("admin1_name")):
+            h3_list = _get_h3_list("admin1", None, row["admin1_name"])
+            if h3_list:
+                fallback_admin1 += 1
+                key = (None, row.get("admin1_name"))
+                fallback_admin1_units[key] = fallback_admin1_units.get(key, 0) + 1
         
         if not h3_list:
             unmapped_count += 1

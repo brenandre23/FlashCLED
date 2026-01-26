@@ -22,10 +22,12 @@ import argparse
 import os
 from pathlib import Path
 import sys
+import random
 from typing import List, Tuple, Optional, Set, Dict, Any
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from scipy.stats import kendalltau, entropy
 from sklearn.feature_selection import mutual_info_regression
 from sklearn.decomposition import PCA
@@ -273,6 +275,119 @@ def interpretability_checks(df: pd.DataFrame, numeric_cols: List[str]) -> pd.Dat
     return pd.DataFrame(records)
 
 
+def load_optimized_matrix(
+    parquet_path: Path,
+    exclude_structural_breaks: bool = True,
+    extra_exclusions: Optional[List[str]] = None,
+    sample_frac: Optional[float] = None
+) -> Tuple[pd.DataFrame, Set[str]]:
+    """
+    Memory-efficient loading of feature matrix.
+    1. Inspects schema to identify numeric columns and columns to exclude.
+    2. Loads only necessary columns.
+    3. If sample_frac is set, reads a random subset of row groups.
+    """
+    if not parquet_path.exists():
+        logger.error(f"Feature matrix not found: {parquet_path}")
+        sys.exit(1)
+
+    logger.info(f"Inspecting Parquet schema: {parquet_path}")
+    pf = pq.ParquetFile(parquet_path)
+    schema = pf.schema
+    
+    # 1. Identify columns to load
+    # We want numeric columns, plus 'date' and 'h3_index' for stratification/metadata.
+    # We exclude targets from diagnostics, but we might need them for stratified sampling?
+    # stratified_sample uses 'target_binary_*'. Let's keep them for now and filter later if needed,
+    # OR we can implement stratification here.
+    # To be safe and save memory, let's keep potential stratification columns.
+    
+    all_cols = schema.names
+    
+    # Determine exclusions based on name patterns (replicating filter_diagnostic_columns logic mostly)
+    # But we need to check types too.
+    
+    # Helper to check if type is numeric
+    def is_numeric_type(col_name):
+        # PyArrow schema type check
+        field = schema.column(all_cols.index(col_name))
+        # logical_type can be None, check physical
+        pt = field.physical_type
+        return pt in ['INT32', 'INT64', 'FLOAT', 'DOUBLE']
+
+    # Get structural flags if needed
+    structural_flags = set()
+    if exclude_structural_breaks:
+        try:
+            from pipeline.common.diagnostic_utils import get_structural_break_flags
+            configs = load_configs()
+            structural_flags = get_structural_break_flags(configs["features"])
+        except ImportError:
+            # Fallback
+            structural_flags = {
+                "is_worldpop_v1", "iom_data_available", "econ_data_available",
+                "ioda_data_available", "landcover_data_available", "viirs_data_available",
+                "gdelt_data_available", "food_data_available"
+            }
+
+    cols_to_load = []
+    excluded_log = set()
+
+    essential_cols = {'date', 'h3_index', 'year', 'epoch'}
+    
+    for col in all_cols:
+        # Always keep essential cols if they exist
+        if col in essential_cols:
+            cols_to_load.append(col)
+            continue
+            
+        # Exclude structural flags
+        if exclude_structural_breaks and col in structural_flags:
+            excluded_log.add(col)
+            continue
+            
+        # Exclude extra exclusions
+        if extra_exclusions and col in extra_exclusions:
+            excluded_log.add(col)
+            continue
+            
+        # Check if numeric
+        if is_numeric_type(col):
+            cols_to_load.append(col)
+        else:
+            # Non-numeric (and not essential) -> Exclude
+            excluded_log.add(col)
+
+    logger.info(f"  Schema columns: {len(all_cols)}")
+    logger.info(f"  Columns to load: {len(cols_to_load)}")
+    logger.info(f"  Excluded (pre-load): {len(excluded_log)}")
+
+    # 2. Row Group Sampling
+    if sample_frac and 0 < sample_frac < 1.0:
+        num_groups = pf.num_row_groups
+        # We want approx sample_frac of rows.
+        # Assuming row groups are roughly equal size.
+        n_groups_to_read = max(1, int(num_groups * sample_frac))
+        
+        # Randomly select row group indices
+        # Use sorted indices for potentially better sequential read perf
+        group_indices = sorted(random.sample(range(num_groups), n_groups_to_read))
+        
+        logger.info(f"  Sampling: Reading {n_groups_to_read}/{num_groups} row groups ({sample_frac:.1%})")
+        
+        # Read specific row groups and columns
+        df = pf.read_row_groups(group_indices, columns=cols_to_load).to_pandas()
+        
+    else:
+        # Load full file (but only selected columns)
+        logger.info("  Loading full dataset (selected columns)...")
+        df = pf.read(columns=cols_to_load).to_pandas()
+
+    logger.info(f"  Loaded DataFrame shape: {df.shape}")
+    
+    return df, excluded_log
+
+
 def main(diag_opts: Optional[Dict[str, Any]] = None):
     # If called directly, provide default args for standalone execution
     if diag_opts is None:
@@ -334,50 +449,45 @@ def main(diag_opts: Optional[Dict[str, Any]] = None):
     neg_ratio = diag_opts.get("neg_ratio", 3.0)
     spatial_frac = diag_opts.get("spatial_frac", 0.2)
     
-    # Load feature matrix
-    if not parquet_path.exists():
-        logger.error(f"Feature matrix not found: {parquet_path}")
-        logger.info("Run build_feature_matrix.py first or specify --parquet path.")
-        sys.exit(1)
-    
-    logger.info(f"Loading feature matrix from: {parquet_path}")
-    df = pd.read_parquet(parquet_path)
-    logger.info(f"  Loaded: {len(df):,} rows, {len(df.columns)} columns")
-
-    # Optionally sample
-    if sample_frac and 0 < sample_frac < 1:
-        df = df.sample(frac=sample_frac, random_state=42)
-        logger.info(f"  Sampled: {len(df):,} rows ({sample_frac*100:.0f}%)")
+    # Load feature matrix (Optimized)
+    df, excluded_cols_preload = load_optimized_matrix(
+        parquet_path,
+        exclude_structural_breaks=exclude_structural,
+        extra_exclusions=extra_exclusions,
+        sample_frac=sample_frac
+    )
 
     # Ensure date is datetime
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"])
 
-    # Filter columns for diagnostics
-    logger.info(f"\nExclude structural breaks: {exclude_structural}")
-    if extra_exclusions:
-        logger.info(f"Additional exclusions: {extra_exclusions}")
-    
-    df_filtered, excluded_cols = filter_diagnostic_columns(
-        df,
-        exclude_structural_breaks=exclude_structural,
-        extra_exclusions=extra_exclusions,
-        verbose=True
-    )
-
-    # Preserve date for temporal stratification/stability while keeping it out of correlation/VIF
-    if "date" in df.columns and "date" not in df_filtered.columns:
-        df_filtered = df_filtered.join(df["date"])
-    
-    # Stratified sample for efficiency
-    sample = stratified_sample(
-        df_filtered, 
+    # 1. Stratified sample (Needs targets to work!)
+    # We pass the FULL df (with targets) so stratification can find positive/negative examples
+    sample_full = stratified_sample(
+        df, 
         horizon_steps, 
         max_pos=max_pos, 
         neg_ratio=neg_ratio, 
         spatial_frac=spatial_frac
     )
-    logger.info(f"\nDiagnostic sample size: {len(sample):,} rows")
+    logger.info(f"\nDiagnostic sample size: {len(sample_full):,} rows (downsampled from {len(df):,})")
+
+    # 2. Filter columns for diagnostics (Remove targets/metadata from the SAMPLE)
+    logger.info(f"\nFinalizing column selection...")
+    sample, excluded_cols_post = filter_diagnostic_columns(
+        sample_full,
+        exclude_structural_breaks=exclude_structural,
+        extra_exclusions=extra_exclusions,
+        verbose=False
+    )
+    
+    # Merge exclusion logs
+    excluded_cols = excluded_cols_preload | excluded_cols_post
+    logger.info(f"  Total excluded columns: {len(excluded_cols)}")
+
+    # Preserve date for temporal stratification/stability while keeping it out of correlation/VIF
+    if "date" in df.columns and "date" not in sample.columns:
+        sample = sample.join(sample_full["date"])
 
     # Get numeric columns for analysis
     numeric_cols = sample.select_dtypes(include=[int, float]).columns.tolist()

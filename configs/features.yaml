@@ -14,11 +14,9 @@ diagnostics:
     - iom_data_available          # IOM DTM coverage start (2015-01-31)
     - econ_data_available         # Yahoo Finance coverage start (2003-12-01)
     - ioda_data_available         # IODA monitoring start (2022-02-01)
-    - ioda_data_available
     - landcover_data_available    # Dynamic World start (2015-06-27)
     - viirs_data_available        # VIIRS coverage start (2012-01-28)
     - gdelt_data_available        # GDELT v2 coverage start (2015)
-    - gdelt_data_available
     - food_data_available         # FEWS NET food price coverage
   
   # Additional columns to always exclude from diagnostics
@@ -42,9 +40,9 @@ spatial:
   h3_resolution: 5
   buffer_km: 8.5
   admin_columns:
-    admin1: NAM_1
-    admin2: NAM_2
-    admin3: adm2_ref_name
+    admin1: NAM_1          # Regions (legacy WB admin1)
+    admin2: ADM1_FR        # Prefectures (column name in prefectures.json)
+    admin3: ADM2_FR        # Subprefectures (column name in subprefectures.json)
 
 temporal:
   base_unit: step
@@ -68,6 +66,7 @@ temporal:
     JRC_Landsat: 1
     ACLED: 1            # ~6 day weekly release cycle
     ACLED_Hybrid: 1
+    NLP_CrisisWatch: 2
     GDELT: 0            # Near real-time (<1 hour)
     Food_Security: 4    # ~45-60 day delay
     IOM_DTM: 2          # ~2-4 week delay
@@ -78,21 +77,53 @@ temporal:
     Static_Geography: 0
 
 # =============================================================================
-# 3. IMPUTATION RULES
+# 3. IMPUTATION RULES (Stocks vs Flows Strategy)
+# =============================================================================
+# CRITICAL DISTINCTION (2026-01-24 Bug Fix):
+#
+# STOCK variables: State persists but becomes uncertain over time.
+#   - Forward-fill within validity window, then PRESERVE NaN
+#   - XGBoost learns optimal split direction for missing values natively
+#   - Zero-filling creates phantom "resolution" events - a critical bug
+#   - Examples: displacement, prices, nightlights, population
+#
+# FLOW variables: Discrete events that either happen or don't.
+#   - Zero-fill immediately (no event recorded = no event occurred)
+#   - Examples: conflict events, protests, outages
+#
+# Key insight: XGBoost handles NaN natively via learned optimal split direction.
+# Forcing zeros destroys this capability and teaches wrong relationships.
 # =============================================================================
 imputation:
   defaults:
     method: "forward_fill"
     limit: 4  # Global fallback (approx 2 months)
+    type: stock  # Default to stock (preserve NaN) for safety
   domains:
+    # STOCK VARIABLES: Forward-fill with limit, then NaN (no zero-fill)
     environmental:
-      limit: 2  # Short: Weather/NDVI change rapidly (approx 1 month)
+      limit: 2   # Short: Weather/NDVI change rapidly (approx 1 month)
+      type: stock
     economic:
-      limit: 8  # Medium: Market prices (approx 4 months)
-    conflict:
-      limit: 3  # Medium-Short: News/Sentiment decays faster (approx 1.5 months)
+      limit: 8   # Medium: Market prices sticky (approx 4 months)
+      type: stock
     social:
-      limit: 12 # Long: Displacement (IOM) is structural; updated quarterly (approx 6 months)
+      limit: 12  # Long: Displacement (IOM) is structural; updated quarterly
+      type: stock
+    demographic:
+      limit: 52  # Annual data: forward-fill up to 1 year
+      type: stock
+    
+    # FLOW VARIABLES: Zero-fill (no event = 0)
+    conflict:
+      limit: 0   # ACLED events - no forward propagation
+      type: flow
+    news:
+      limit: 0   # GDELT/CrisisWatch - preserve temporal precision
+      type: flow
+    outage:
+      limit: 0   # IODA outages - no outage detected = no outage
+      type: flow
 
 # =============================================================================
 # 4. FEATURE REGISTRY
@@ -147,15 +178,57 @@ registry:
     source: MODIS
     transformation: mean
     output_col: ndvi_max
-  - raw: ntl_mean
+  # --- Nighttime Lights (Integrated Strategy) ---
+  # VIIRS VNP46A2: Reliability-Weighted + Kinetic-Aware approach
+  # imputation_policy: pass_through ensures XGBoost handles NaN natively
+  # (no zero-fill for pre-2012 structural break)
+  
+  - name: "NTL Stability"
+    raw: ntl_mean
     source: VIIRS
     transformation: mean
     output_col: nightlights_intensity
-  - raw: ntl_mean
+    imputation_policy: pass_through  # XGBoost handles NaNs; do not fill
+    description: "Gap-filled mean radiance. Stable infrastructure baseline."
+
+  - name: "VIIRS Availability"
+    raw: ntl_mean
     source: VIIRS
     transformation: availability_flag
     output_col: viirs_data_available
-    description: "1 if date >= 2012-01-28 (VIIRS coverage start), else 0"
+    description: "1 if date >= 2012-01-28 AND ntl_mean.notna(), else 0"
+
+  - name: "NTL Kinetic Peak"
+    raw: ntl_peak
+    source: GEE
+    transformation: none
+    output_col: ntl_peak
+    imputation_policy: pass_through  # XGBoost handles NaNs; do not fill
+    description: "Maximum raw radiance. Proxy for fires/transient events."
+
+  - name: "NTL Staleness"
+    raw: ntl_stale_days
+    source: GEE
+    transformation: none
+    output_col: ntl_stale_days
+    imputation_policy: pass_through  # XGBoost handles NaNs; do not fill
+    description: "Median days since last high-quality retrieval. Uncertainty metric."
+
+  - name: "NTL Trust Fraction"
+    raw: ntl_trust_frac
+    source: GEE
+    transformation: none
+    output_col: ntl_trust_frac
+    imputation_policy: pass_through  # Do not fill; represents observation density/quality
+    description: "Fraction of days in window with high-quality VIIRS retrievals (Mandatory_Quality_Flag==0)."
+
+  - name: "NTL Kinetic Delta"
+    raw: derived
+    source: Derived
+    transformation: delta_calc
+    output_col: ntl_kinetic_delta
+    imputation_policy: pass_through  # NaN propagates from inputs
+    description: "ntl_peak - ntl_mean, clipped >= 0. Fire/explosion proxy."
 
   # Surface Water (JRC)
   - raw: water_local_max
@@ -324,78 +397,90 @@ registry:
     source: NLP_CrisisWatch
     transformation: none
     output_col: cw_score_local
-  
-  # CrisisWatch Topic Pivots
-  - name: "CrisisWatch Topic: Rebel Coalition"
-    source: "NLP_CrisisWatch"
-    raw: "cw_topic_id"
-    transformation: "pivot_topic"
-    output_col: "cw_rebel_coalition"
-    transformation_params:
-      topic_id: 0
-      value_column: "spatial_confidence"
-  - name: "CrisisWatch Topic: Transhumance Militia"
-    source: "NLP_CrisisWatch"
-    raw: "cw_topic_id"
-    transformation: "pivot_topic"
-    output_col: "cw_transhumance_militia"
-    transformation_params:
-      topic_id: 1
-      value_column: "spatial_confidence"
-  - name: "CrisisWatch Topic: Resource Predation"
-    source: "NLP_CrisisWatch"
-    raw: "cw_topic_id"
-    transformation: "pivot_topic"
-    output_col: "cw_resource_predation"
-    transformation_params:
-      topic_id: 2
-      value_column: "spatial_confidence"
-  - name: "CrisisWatch Topic: Foreign Influence"
-    source: "NLP_CrisisWatch"
-    raw: "cw_topic_id"
-    transformation: "pivot_topic"
-    output_col: "cw_foreign_influence"
-    transformation_params:
-      topic_id: 3
-      value_column: "spatial_confidence"
-  - name: "CrisisWatch Topic: State Vacuum"
-    source: "NLP_CrisisWatch"
-    raw: "cw_topic_id"
-    transformation: "pivot_topic"
-    output_col: "cw_state_vacuum"
-    transformation_params:
-      topic_id: 4
-      value_column: "spatial_confidence"
-  - name: "CrisisWatch Topic: Sectarian Cleansing"
-    source: "NLP_CrisisWatch"
-    raw: "cw_topic_id"
-    transformation: "pivot_topic"
-    output_col: "cw_sectarian_cleansing"
-    transformation_params:
-      topic_id: 5
-      value_column: "spatial_confidence"
+  - raw: cw_score_local_delta
+    source: NLP_CrisisWatch
+    transformation: none
+    output_col: cw_score_local_delta
+  - raw: cw_score_local_delta_decay_14d
+    source: NLP_CrisisWatch
+    transformation: none
+    output_col: cw_score_local_delta_decay_14d
+  - raw: narrative_velocity
+    source: NLP_CrisisWatch
+    transformation: none
+    output_col: narrative_velocity
+  - raw: narrative_acceleration
+    source: NLP_CrisisWatch
+    transformation: none
+    output_col: narrative_acceleration
 
-  # ACLED Hybrid Drivers (NLP + Regex)
-  - raw: driver_resource_cattle
+  # ACLED Hybrid Mechanisms (current schema)
+  - raw: mech_gold_pivot
     source: ACLED_Hybrid
     transformation: none
-    output_col: driver_resource_cattle
-  - raw: driver_resource_mining
+    output_col: mech_gold_pivot
+  - raw: mech_predatory_tax
     source: ACLED_Hybrid
     transformation: none
-    output_col: driver_resource_mining
-  - raw: driver_econ_taxation
+    output_col: mech_predatory_tax
+  - raw: mech_factional_infighting
     source: ACLED_Hybrid
     transformation: none
-    output_col: driver_econ_taxation
-  - raw: driver_civilian_abuse
+    output_col: mech_factional_infighting
+  - raw: mech_collective_punishment
     source: ACLED_Hybrid
     transformation: none
-    output_col: driver_civilian_abuse
-  - raw: driver_political_coup
+    output_col: mech_collective_punishment
+
+  # Mechanism uncertainties (if needed downstream)
+  - raw: mech_gold_pivot_uncertainty
     source: ACLED_Hybrid
     transformation: none
-    output_col: driver_political_coup
+    output_col: mech_gold_pivot_uncertainty
+  - raw: mech_predatory_tax_uncertainty
+    source: ACLED_Hybrid
+    transformation: none
+    output_col: mech_predatory_tax_uncertainty
+  - raw: mech_factional_infighting_uncertainty
+    source: ACLED_Hybrid
+    transformation: none
+    output_col: mech_factional_infighting_uncertainty
+  - raw: mech_collective_punishment_uncertainty
+    source: ACLED_Hybrid
+    transformation: none
+    output_col: mech_collective_punishment_uncertainty
+
+  # ACLED hybrid summary scores
+  - raw: acled_actor_risk_score
+    source: ACLED_Hybrid
+    transformation: none
+    output_col: acled_actor_risk_score
+  - raw: acled_mechanism_intensity
+    source: ACLED_Hybrid
+    transformation: none
+    output_col: acled_mechanism_intensity
+  - raw: acled_combined_risk_score
+    source: ACLED_Hybrid
+    transformation: none
+    output_col: acled_combined_risk_score
+
+  # Lagged mechanisms (already produced in processing; register as raw to avoid double-lagging)
+  - raw: mech_gold_pivot_lag1
+    source: ACLED_Hybrid
+    transformation: none
+    output_col: mech_gold_pivot_lag1
+  - raw: mech_predatory_tax_lag1
+    source: ACLED_Hybrid
+    transformation: none
+    output_col: mech_predatory_tax_lag1
+  - raw: mech_factional_infighting_lag1
+    source: ACLED_Hybrid
+    transformation: none
+    output_col: mech_factional_infighting_lag1
+  - raw: mech_collective_punishment_lag1
+    source: ACLED_Hybrid
+    transformation: none
+    output_col: mech_collective_punishment_lag1
 
   # ---------------------------------------------------------------------------
   # D. Economic Drivers
@@ -631,7 +716,7 @@ registry:
     output_col: "regime_parallel_governance"
     transformation_params:
       topic_id: 10
-      value_column: "spatial_confidence"
+      value_column: "spatial_confidence_norm"
   - name: "Regime Transnational Predation"
     source: "NLP_CrisisWatch"
     raw: "cw_topic_id"
@@ -639,7 +724,7 @@ registry:
     output_col: "regime_transnational_predation"
     transformation_params:
       topic_id: 11
-      value_column: "spatial_confidence"
+      value_column: "spatial_confidence_norm"
   - name: "Regime Guerrilla Fragmentation"
     source: "NLP_CrisisWatch"
     raw: "cw_topic_id"
@@ -647,7 +732,7 @@ registry:
     output_col: "regime_guerrilla_fragmentation"
     transformation_params:
       topic_id: 12
-      value_column: "spatial_confidence"
+      value_column: "spatial_confidence_norm"
   - name: "Regime Ethno-Pastoral Rupture"
     source: "NLP_CrisisWatch"
     raw: "cw_topic_id"
@@ -655,7 +740,7 @@ registry:
     output_col: "regime_ethno_pastoral_rupture"
     transformation_params:
       topic_id: 13
-      value_column: "spatial_confidence"
+      value_column: "spatial_confidence_norm"
 
   # CrisisWatch Narrative Velocity
   - name: "Narrative Velocity"
@@ -665,25 +750,13 @@ registry:
     output_col: "narrative_velocity_lag1"
     transformation_params:
       topic_id: 99
-      value_column: "spatial_confidence"
+      value_column: "spatial_confidence_norm"
 
-  # ACLED Hybrid Mechanisms
-  - raw: mech_gold_pivot
-    source: ACLED_Hybrid
-    transformation: lag_1_step
-    output_col: mech_gold_pivot_lag1
-  - raw: mech_predatory_tax
-    source: ACLED_Hybrid
-    transformation: lag_1_step
-    output_col: mech_predatory_tax_lag1
-  - raw: mech_factional_infighting
-    source: ACLED_Hybrid
-    transformation: lag_1_step
-    output_col: mech_factional_infighting_lag1
-  - raw: mech_collective_punishment
-    source: ACLED_Hybrid
-    transformation: lag_1_step
-    output_col: mech_collective_punishment_lag1
+  # NOTE: ACLED Hybrid Mechanisms lag entries REMOVED (2026-01-24)
+  # The mech_*_lag1 columns are already registered in Section C with transformation: none
+  # because process_acled_hybrid.py creates the _lag1 suffix at processing time.
+  # Having them here with transformation: lag_1_step would cause double-lagging.
+  # See Section C for the canonical mech_*_lag1 registrations.
 
   # ---------------------------------------------------------------------------
   # I. Phase 2: Border Shocks & Fusion
@@ -699,3 +772,93 @@ registry:
     raw: "gdelt_shock_signal"
     transformation: "none"
     output_col: "gdelt_shock_signal"
+
+  # ---------------------------------------------------------------------------
+  # K. Missing model-requested columns (align models.yaml)
+  # ---------------------------------------------------------------------------
+  - name: "GDELT Event Count (raw)"
+    source: "GDELT"
+    raw: "gdelt_event_count"
+    transformation: "none"
+    output_col: "gdelt_event_count"
+
+  - name: "Price Maize Recency (days)"
+    source: "Food_Security"
+    raw: "price_maize_recency_days"
+    transformation: "none"
+    output_col: "price_maize_recency_days"
+
+  - name: "Price Rice Recency (days)"
+    source: "Food_Security"
+    raw: "price_rice_recency_days"
+    transformation: "none"
+    output_col: "price_rice_recency_days"
+
+  - name: "Price Oil Recency (days)"
+    source: "Food_Security"
+    raw: "price_oil_recency_days"
+    transformation: "none"
+    output_col: "price_oil_recency_days"
+
+  - name: "Price Sorghum Recency (days)"
+    source: "Food_Security"
+    raw: "price_sorghum_recency_days"
+    transformation: "none"
+    output_col: "price_sorghum_recency_days"
+
+  - name: "Price Cassava Recency (days)"
+    source: "Food_Security"
+    raw: "price_cassava_recency_days"
+    transformation: "none"
+    output_col: "price_cassava_recency_days"
+
+  - name: "Price Groundnuts Recency (days)"
+    source: "Food_Security"
+    raw: "price_groundnuts_recency_days"
+    transformation: "none"
+    output_col: "price_groundnuts_recency_days"
+
+  - name: "Food Price Index Recency (days)"
+    source: "Food_Security"
+    raw: "food_price_index_recency_days"
+    transformation: "none"
+    output_col: "food_price_index_recency_days"
+
+  # ---------------------------------------------------------------------------
+  # J. CrisisWatch × ACLED Interaction Features
+  # ---------------------------------------------------------------------------
+  - name: "CW Onset Amplifier"
+    source: "Fusion"
+    raw: "cw_onset_amplifier"
+    transformation: "none"
+    output_col: "cw_onset_amplifier"
+  - name: "CW Mass Casualty Risk"
+    source: "Fusion"
+    raw: "cw_mass_casualty_risk"
+    transformation: "none"
+    output_col: "cw_mass_casualty_risk"
+  - name: "CW Extraction Violence"
+    source: "Fusion"
+    raw: "cw_extraction_violence"
+    transformation: "none"
+    output_col: "cw_extraction_violence"
+  - name: "CW Pastoral Predation"
+    source: "Fusion"
+    raw: "cw_pastoral_predation"
+    transformation: "none"
+    output_col: "cw_pastoral_predation"
+  - name: "Fusion Gold Signal"
+    source: "Fusion"
+    raw: "fusion_gold_signal"
+    transformation: "none"
+    output_col: "fusion_gold_signal"
+  - name: "Fusion Fragmentation Confirmed"
+    source: "Fusion"
+    raw: "fusion_fragmentation_confirmed"
+    transformation: "none"
+    output_col: "fusion_fragmentation_confirmed"
+  - name: "Fusion Escalation Momentum"
+    source: "Fusion"
+    raw: "fusion_escalation_momentum"
+    transformation: "none"
+    output_col: "fusion_escalation_momentum"

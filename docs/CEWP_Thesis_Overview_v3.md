@@ -5,6 +5,7 @@
 | Field | Value |
 |-------|-------|
 | Author | Brenan |
+| Email | brenan.andre23@gmail.com |
 | Degree | Master's Thesis |
 | Date | January 2026 |
 
@@ -104,7 +105,7 @@ The pipeline integrates 21+ distinct data sources across eight thematic categori
 | Conflict | ACLED, GDELT | Event counts, fatalities, protest/riot indicators, media tone |
 | ACLED NLP | ACLED notes field | 8 semantic themes + 5 explicit drivers |
 | **CrisisWatch NLP** | International Crisis Group monthly reports | **4 regime pillars + narrative velocity** |
-| Socio-Political | EPR, IOM DTM, FEWS NET IPC, IODA | Ethnic exclusion, displacement, food security, internet outage events |
+| Socio-Political | EPR, IOM DTM, IODA | Ethnic exclusion, displacement, internet outage events |
 | Economic | Yahoo Finance, WFP Markets | Commodity prices (gold, oil), local market prices, price shocks |
 | Infrastructure | GRIP4, HydroRIVERS, IPIS, OSM | Distance to roads, rivers, mines, settlements |
 | Demographics | WorldPop | Population count and density |
@@ -187,7 +188,7 @@ A feature can have both—e.g., GEE data has a 14-day publication lag at ingesti
 | Default | Forward-fill | limit=4 steps (56 days) |
 | Conflict events | Zero-fill | No event = 0 |
 | Population | Forward-fill + zero | Forward-fill within hex; pre-coverage gaps = 0 (no backward extrapolation) |
-| IPC Phase | Constant | Value=0 before 2009 |
+
 
 #### 3.5.4 Structural Break Handling
 
@@ -281,7 +282,7 @@ The system architecture now includes:
 | Raster Processing | Rasterio, GDAL |
 | ML Framework | XGBoost, LightGBM, Scikit-learn |
 | **NLP Models** | **ConfliBERT (CrisisWatch), MiniLM (ACLED)** |
-| Cloud APIs | Google Earth Engine, BigQuery |
+| Cloud APIs | Google Earth Engine |
 | Configuration | YAML (data.yaml, features.yaml, models.yaml) |
 
 ### 5.4 Configuration-Driven Design
@@ -308,6 +309,30 @@ All features, data sources, and model parameters are defined in YAML configurati
 Mean Poisson Deviance (D) measures the goodness-of-fit for count data models. Unlike RMSE, which assumes constant variance (homoscedasticity), MPD accounts for the heteroscedastic nature of conflict data, where variance increases with the mean. A lower deviance indicates that the model is better at capturing the relative magnitude of conflict events.
 
 **Operational Focus:** The Top-10% Recall metric is particularly important—if a humanitarian organization can only monitor 10% of the geographic area, this metric indicates what fraction of actual conflicts would fall within their coverage.
+
+### 6.1 Validation of Research Questions
+
+The pipeline includes a dedicated diagnostic module (`research_questions_diagnostic.py`) to empirically validate the three core research hypotheses.
+
+#### RQ1: Spatial Granularity (H3 Resolution 5)
+Validates the assumption that ~10km precision is actionable and stable.
+- **Sensitivity:** SHAP dependence analysis for `dist_to_market_km`, calculating the feature importance gradient for values < 5km to verify local sensitivity.
+- **Specificity:** "Within-Admin Variance" analysis for sample prefectures (e.g., Ouaka), quantifying how much risk variation exists *within* a single administrative unit compared to the unit mean.
+- **Stability:** 5-fold Rolling Window Cross-Validation to measure the variance of AUC-ROC scores across different temporal periods.
+
+#### RQ2: Operational Tempo (14-day vs 30-day)
+Validates the tactical advantage of the 14-day prediction window.
+- **Temporal Dilution:** Direct comparison of Precision-Recall (P-R) curves and AUPRC scores between 14-day and 30-day horizon models to quantify information loss.
+- **Lead-Time (Time-to-Detection):** For a set of known historical conflict events, calculates the first date each model crossed a high-risk threshold (e.g., 0.7). The "TtD Delta" measures the operational lead-time advantage of the 14-day model in days.
+
+#### RQ3: Multi-Modal Integration (Hard vs. Soft)
+Validates the value-add of NLP-derived "soft" signals over structural "hard" data.
+- **Interaction Analysis:** Computes SHAP interaction values between key structural features (e.g., Rainfall Anomaly) and NLP features (e.g., CrisisWatch Score) to detect non-additive amplification effects.
+- **Ablation Study:** Trains and evaluates three model configurations:
+    1.  **Hard-Only:** Structural features (Environmental, Demographic, Conflict History).
+    2.  **Soft-Only:** NLP features (CrisisWatch, GDELT tone, ACLED Hybrid mechanisms).
+    3.  **Fused:** Complete feature set.
+    *Metrics:* F1 Score, AUPRC, and "Fused vs Hard Gain".
 
 ---
 
@@ -373,9 +398,9 @@ The modular pipeline design supports operational deployment with incremental upd
 
 ## Appendix A: Complete Feature Registry
 
-**Total Features: 124 (45 raw + 79 transformed)**
+**Total Features: 141 unique columns (pre-pruning)**
 
-### A.1 Environmental Features (26 total)
+### A.1 Environmental Features (29 total)
 
 | Feature | Source | Transform |
 |---------|--------|-----------|
@@ -383,7 +408,11 @@ The modular pipeline design supports operational deployment with incremental upd
 | `era5_temp_anomaly` | ERA5 | anomaly_6_step |
 | `era5_soil_moisture_anomaly` | ERA5 | anomaly_6_step |
 | `ndvi_anomaly` | MODIS | anomaly_6_step |
-| `nightlights_intensity` | VIIRS | mean |
+| `ntl_mean` | VIIRS | none (pass-through) |
+| `ntl_peak` | VIIRS | none (pass-through) |
+| `ntl_stale_days` | VIIRS | none (pass-through) |
+| `ntl_kinetic_delta` | VIIRS | derived |
+| `viirs_data_available` | VIIRS | flag |
 | `water_coverage_lag1` | JRC/Landsat | lag_1_step |
 | `water_presence_lag1` | JRC/Landsat | lag_1_step |
 | `landcover_grass` | Dynamic World | mean fraction (0-1) |
@@ -397,8 +426,11 @@ The modular pipeline design supports operational deployment with incremental upd
 | Feature | Source | Transform |
 |---------|--------|-----------|
 | `fatalities_14d_sum` | ACLED | sum_1_step |
-| `fatalities_1m_lag` | ACLED | lag |
-| `conflict_density_10km` | ACLED | decay_30d |
+| `acled_count_battles` | ACLED | none |
+| `acled_count_vac` | ACLED | none |
+| `acled_count_explosions` | ACLED | none |
+| `acled_count_protests` | ACLED | none |
+| `acled_count_riots` | ACLED | none |
 | `protest_count_lag1` | ACLED | lag_1_step |
 | `riot_count_lag1` | ACLED | lag_1_step |
 | `regional_risk_score_lag1` | ACLED | lag_1_step |
@@ -410,14 +442,17 @@ The modular pipeline design supports operational deployment with incremental upd
 
 | Feature | Description |
 |---------|-------------|
-| `theme_context_0` - `theme_context_7` | Semantic topic weights from event notes (8 themes) |
+| `mech_gold_pivot_lag1` | Gold pivot mechanism (lagged) |
+| `mech_predatory_tax_lag1` | Predatory tax mechanism (lagged) |
+| `mech_factional_infighting_lag1` | Factional infighting (lagged) |
+| `mech_collective_punishment_lag1` | Collective punishment (lagged) |
 | `driver_resource_cattle` | Cattle-related conflict indicator |
 | `driver_resource_mining` | Mining-related conflict indicator |
 | `driver_econ_taxation` | Taxation/economic conflict indicator |
 | `driver_political_coup` | Coup/political violence indicator |
 | `driver_civilian_abuse` | Human rights violations indicator |
 
-### A.4 NLP & Narrative Features (v2.0) (13 total)
+### A.4 NLP & Narrative Features (v2.0) (27 total)
 
 | Feature | Source | Description |
 |---------|--------|-------------|
@@ -436,6 +471,14 @@ The modular pipeline design supports operational deployment with incremental upd
 | **Fusion Signals** | | |
 | `gdelt_shock_signal` | GDELT + CW | (AvgTone × -1) - (RegimeRisk) |
 | `gdelt_border_buffer_flag` | GDELT | 50km spillover zone flag |
+| **Interaction Features** | | |
+| `cw_onset_amplifier` | CW x ACLED | Fragmentation × Wagner Risk |
+| `cw_mass_casualty_risk` | CW Interaction | Pastoral Rupture × Fragmentation |
+| `cw_extraction_violence` | CW x ACLED | Parallel Gov × Wagner Risk |
+| `cw_pastoral_predation` | CW Interaction | Parallel Gov × Pastoral Rupture |
+| `fusion_gold_signal` | CW x ACLED | Wagner Risk × Gold Pivot (Lag 1) |
+| `fusion_fragmentation_confirmed` | CW x ACLED | Fragmentation × Factional Infighting (Lag 1) |
+| `fusion_escalation_momentum` | CW x ACLED | Max(Delta, 0) × Mechanism Intensity |
 
 ### A.5 Economic Features (20 total)
 
@@ -453,7 +496,7 @@ The modular pipeline design supports operational deployment with incremental upd
 | `food_price_index` | FEWS NET | none |
 | `econ_data_available` | Structural | none |
 
-### A.6 Socio-Political Features (14 total)
+### A.6 Socio-Political Features (13 total)
 
 | Feature | Source | Transform |
 |---------|--------|-----------|
@@ -463,11 +506,10 @@ The modular pipeline design supports operational deployment with incremental upd
 | `ethnic_group_count` | EPR | none |
 | `iom_displacement_count_lag1` | IOM DTM | lag_1_step |
 | `iom_data_available` | Structural | none |
-| `ipc_phase_class` | FEWS NET IPC | none |
 | `ioda_outage_score` | IODA | none |
 | `ioda_data_available` | Structural | none |
 
-### A.7 Infrastructure Features (13 total)
+### A.7 Infrastructure Features (12 total)
 
 | Feature | Source |
 |---------|--------|
@@ -485,7 +527,7 @@ The modular pipeline design supports operational deployment with incremental upd
 | `elevation_mean` | Copernicus DEM |
 | `slope_mean` | Copernicus DEM |
 
-### A.8 Demographic Features (5 total)
+### A.8 Demographic Features (4 total)
 
 | Feature | Source | Transform |
 |---------|--------|-----------|
@@ -514,10 +556,10 @@ The modular pipeline design supports operational deployment with incremental upd
 - Columns: `h3_index`, `date` (composite PK), [environmental], [conflict], [economic], [socio-political]
 
 **features_acled_hybrid** (NLP features)
-- Columns: `h3_index`, `date` (composite PK), `theme_context_0-7`, `driver_resource_*`, `driver_econ_*`, `driver_civilian_*`, `driver_political_*`
+- Columns: `h3_index`, `date` (composite PK), `mech_*`, `driver_resource_*`, `driver_econ_*`, `driver_civilian_*`, `driver_political_*`
 
-**features_crisiswatch** (Regime health features - NEW)
-- Columns: `date` (PK), `regime_parallel_governance`, `regime_transnational_predation`, `regime_guerrilla_fragmentation`, `regime_ethno_pastoral_rupture`, `narrative_velocity`
+**features_crisiswatch** (Regime health features)
+- Columns: `date` (PK), `regime_parallel_governance`, `regime_transnational_predation`, `regime_guerrilla_fragmentation`, `regime_ethno_pastoral_rupture`, `narrative_velocity`, [Interactions]
 
 **Raw ingestion tables:**
 - `acled_events` (h3_index, event_date, fatalities, event_type, ...)
@@ -553,7 +595,22 @@ The modular pipeline design supports operational deployment with incremental upd
 
 ---
 
-**Document Version:** 3.0  
-**Last Updated:** January 2026  
-**Total Features:** 124  
+**Document Version:** 4.1  
+**Last Updated:** January 26, 2026  
+**Total Features:** 141 unique columns (pre-pruning)
 **Thematic Sub-models:** 9 + Broad PCA
+
+---
+
+### Appendix D: Spatial Boundaries (v2026)
+
+The pipeline utilizes a three-tier administrative hierarchy for Central African Republic, mapping varied data sources to consistent spatial keys. These layers are critical for IOM disaggregation and regional risk scoring.
+
+| Level | Definition | Standard | Mapping Key | Expected File |
+|-------|------------|----------|-------------|---------------|
+| **Admin 1** | Regions | Legacy World Bank (17 units) | `admin1` | `wbgCAFadmin2.geojson` |
+| **Admin 2** | Prefectures | 2021 OCHA/WB standard (20 units) | `admin2` | `prefectures.json` |
+| **Admin 3** | Subprefectures | 2021 OCHA/WB standard (72 units) | `admin3` | `subprefectures.json` |
+
+**Implementation Note:** The `spatial_disaggregation.py` logic performs area-weighted mapping from these layers to H3 cells. For IOM DTM data, the pipeline performs a "PCODE-first" lookup, falling back to normalized name matching if codes are absent.
+

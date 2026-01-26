@@ -9,7 +9,8 @@
 | Analysis Grid | H3 Resolution 5 (~10km hexagonal cells) |
 | Grid Coverage | ~3,407 cells |
 | Temporal Spine | 14-day intervals aligned to 2000-01-01 |
-| Generated | 2026-01-20 |
+| Total Features | 138 unique columns (pre-pruning) |
+| Generated | 2026-01-25 |
 
 ---
 
@@ -21,7 +22,7 @@ This audit documents all data sources integrated into the Conflict Early Warning
 |----------|---------|-------------------|-------------------|
 | Environmental | 8 | 100m – 11km, hourly/daily | H3-5, 14-day |
 | Conflict & Events | 3 | Point, daily | H3-5, 14-day |
-| Socio-Political | 4 | Admin-1/2, annual/quarterly | H3-5, 14-day |
+| Socio-Political | 3 | Admin-1/2, annual/quarterly | H3-5, 14-day |
 | Economic | 6 | National/Market, daily/monthly | National/H3-5, 14-day |
 | Infrastructure | 5 | Point/polygon, static | H3-5, static |
 | Demographics | 1 | 100m, annual | H3-5, annual |
@@ -44,6 +45,27 @@ Publication lags account for the delay between data collection and public availa
 | ACLED Conflict Counts | 14 days (1 step) | Feature engineering (post-merge) |
 | Food Prices (WFP/FEWS NET) | 56 days (4 steps) | Storage (date shift) |
 | CrisisWatch Reports | 14 days (1 step) | Storage (report_date shift) |
+
+---
+
+## Incremental Ingestion Architecture (Jan 2026 Update)
+
+- **Central helper:** `get_incremental_window` (utils.py) checks `MAX(date)` in Postgres vs. the requested end date (from CLI or `data.global_date_window`). If current data covers the end date, the fetch is skipped; otherwise only the missing window is requested.
+- **Force refresh:** CLI flag `--no-incremental` (main.py) propagates to dynamic ingests to override freshness and refetch the full window.
+- **Safety overlaps:** Sources with latency/reprocessing re-fetch a small buffer:
+  - GEE environmental: 14-day overlap on start window.
+  - Dynamic World: 14-day overlap on start window.
+  - IOM DTM: 14-day overlap on start window.
+- **Per-source adoption:**
+  - ACLED events: incremental window + API/CSV fallback; PK normalization for `event_id_cnty`.
+  - Economy (Yahoo Finance): incremental window; no drop/recreate; upsert on `date`.
+  - Food Security (FEWS NET): incremental window; publication lag handled downstream.
+  - GDELT dual (events + GKG): incremental window.
+  - IODA outages: incremental window.
+  - IOM displacement: incremental window + overlap; filtered to start/end window.
+  - Dynamic World: incremental window + overlap; bounded by helper end date.
+  - GEE environmental: incremental window + 14-day overlap; bounded by helper end date.
+- **Upserts:** All ingests use `upload_to_postgis` with primary keys set per table (e.g., `date`, `h3_index` combos or natural IDs) to avoid duplicates while allowing reruns.
 
 ### Analytical Lags (Leakage Control)
 
@@ -116,21 +138,30 @@ Environmental variables are aggregated from Google Earth Engine collections to H
 **Output Columns:**
 - `ndvi_max` → `ndvi_anomaly`
 
-### 1.4 VIIRS Nighttime Lights
+### 1.4 VIIRS Nighttime Lights (Integrated Strategy)
 
 | Field | Value |
 |-------|-------|
 | Source | NASA/VIIRS/002/VNP46A2 (via GEE) |
 | Native Spatial | 500m |
 | Native Temporal | Daily |
-| Aggregation | H3-5 zonal mean, 14-day mean |
-| Imputation | Forward-fill (limit=4 steps) |
+| Aggregation | H3-5 zonal mean/max/median, 14-day |
+| Imputation | **Pass-through** (NaNs are preserved; not zero-filled) |
 | Coverage | 2012–present |
 | Structural Break | Pre-2012 data = NULL (sensor launch date) |
 | Publication Lag | 14 days (applied at storage) |
 
-**Output Columns:**
-- `ntl_mean` → `nightlights_intensity`
+**Methodology:**
+The pipeline employs a "Reliability-Weighted" and "Kinetic-Aware" strategy to distinguish infrastructure from conflict events.
+
+| Signal Type | Variable | GEE Band | Aggregation | Description |
+|-------------|----------|----------|-------------|-------------|
+| **Stability** | `ntl_mean` | `Gap_Filled_DNB_BRDF_Corrected_NTL` | Mean | Proxy for static infrastructure and electrification. |
+| **Kinetic** | `ntl_peak` | `DNB_BRDF_Corrected_NTL` | Max | Raw peak radiance capturing fires, explosions, or temporary camps. |
+| **Uncertainty** | `ntl_stale_days` | `Latest_High_Quality_Retrieval` | Median | Days since last high-quality observation. Informs model of data age/reliability. |
+| **Derived** | `ntl_kinetic_delta` | (Calculated) | - | `peak - mean`. Isolates transient high-radiance events (fires) from background light. |
+
+**Availability Guard:** `viirs_data_available` = 1 if `date >= 2012-01-28` AND `ntl_mean` is not null.
 
 ### 1.5 JRC Global Surface Water
 
@@ -178,7 +209,7 @@ Event data is aggregated from point locations to H3 cells with 14-day temporal w
 
 | Field | Value |
 |-------|-------|
-| Source | Local CSV (data/raw/ACLED.csv) |
+| Source | Local CSV (data/raw/acled.csv) |
 | Native Spatial | Point (lat/lon, geo_precision 1-3) |
 | Native Temporal | Daily (event_date) |
 | Aggregation | H3-5 point-in-polygon, 14-day sum |
@@ -239,7 +270,7 @@ Semi-supervised semantic projection approach using ensemble scoring and residual
 
 | Field | Value |
 |-------|-------|
-| Source | BigQuery `gdelt-bq.gdeltv2.events` |
+| Source | GDELT v2 Master File List (CSV/ZIP via HTTP) |
 | Native Spatial | Point (Actor1Geo_Lat/Lon) |
 | Native Temporal | Daily (SQLDATE) |
 | Aggregation | H3-5 point-in-polygon, 14-day sum/mean |
@@ -313,6 +344,18 @@ This section documents the "Predatory Ecosystem" NLP framework, which provides t
 | `gdelt_shock_signal` | GDELT + CW | Composite Index | A calculated "Shock" metric: (AvgTone × -1) - (RegimeRisk). High values indicate media panic exceeding structural risk. | Daily |
 | `gdelt_border_buffer_flag` | GDELT | Spatial Buffer | Binary flag (1) indicating if an event originated in the 50km "spillover zone" of Chad or Sudan. | Daily |
 
+#### Interaction Features (New)
+
+| Feature Name | Source | Description |
+|--------------|--------|-------------|
+| `cw_onset_amplifier` | CW x ACLED | Fragmentation × Wagner Risk. |
+| `cw_mass_casualty_risk` | CW Interaction | Pastoral Rupture × Fragmentation. |
+| `cw_extraction_violence` | CW x ACLED | Parallel Gov × Wagner Risk. |
+| `cw_pastoral_predation` | CW Interaction | Parallel Gov × Pastoral Rupture. |
+| `fusion_gold_signal` | CW x ACLED | Wagner Risk × Gold Pivot (Lag 1). |
+| `fusion_fragmentation_confirmed` | CW x ACLED | Fragmentation × Factional Infighting (Lag 1). |
+| `fusion_escalation_momentum` | CW x ACLED | Max(Delta, 0) × Mechanism Intensity. |
+
 ---
 
 ## 4. Socio-Political Data
@@ -351,21 +394,7 @@ This section documents the "Predatory Ecosystem" NLP framework, which provides t
 - `iom_displacement_count_lag1`
 - `iom_data_available` (structural break flag)
 
-### 4.3 FEWS NET IPC (Food Security Phases)
-
-| Field | Value |
-|-------|-------|
-| Source | FEWS NET Data Warehouse API |
-| Native Spatial | Admin-1 (prefecture) |
-| Native Temporal | Quarterly projections |
-| Aggregation | Admin-1 → H3-5 via polygon overlay, 14-day max |
-| Imputation | Constant=0 before 2009-01-01 (pre-IPC era); forward-fill after |
-| Coverage | 2009–present |
-
-**Output Columns:**
-- `ipc_phase_class` (1-5 scale)
-
-### 4.4 IODA Internet Outage Detection
+### 4.3 IODA Internet Outage Detection
 
 | Field | Value |
 |-------|-------|
@@ -430,6 +459,13 @@ This section documents the "Predatory Ecosystem" NLP framework, which provides t
 - `price_oil_shock`
 - `price_sorghum_shock`
 
+### 5.3 Supplemental Data Tables
+
+| Table | Primary Key | Columns | Notes |
+|-------|-------------|---------|-------|
+| `market_locations` | `market_id` | `market_name`, `latitude`, `longitude` | Static market coordinates; contains no admin names. |
+| `environmental_features` (Sync) | `(h3_index, date)` | See Section 1 | `fetch_gee_server_side.py` automatically syncs existing CSVs from `data/raw/` to the DB before starting new queries. |
+
 ---
 
 ## 6. Infrastructure & Geography (Static)
@@ -491,20 +527,20 @@ This section documents the "Predatory Ecosystem" NLP framework, which provides t
 
 ## 10. Feature Count Summary
 
-**Total Features: 124 (45 raw + 79 transformed)**
+**Total Features: 141 unique columns (pre-pruning)**
 
-| Category | Raw | Transformed | Total |
-|----------|-----|-------------|-------|
-| Environmental | 10 | 16 | 26 |
-| Conflict | 5 | 15 | 20 |
-| ACLED Hybrid NLP | 0 | 13 | 13 |
-| NLP & Narrative (v2.0) | 0 | 13 | 13 |
-| Economic | 8 | 12 | 20 |
-| Socio-Political | 8 | 6 | 14 |
-| Infrastructure | 12 | 0 | 12 |
-| Demographics | 2 | 3 | 5 |
-| Temporal Context | 0 | 3 | 3 |
-| **TOTAL** | **45** | **79** | **124** |
+| Category | Count |
+|----------|-------|
+| Environmental | 29 |
+| Conflict | 20 |
+| ACLED Hybrid NLP | 13 |
+| NLP & Narrative (v2.0) | 27 |
+| Economic | 20 |
+| Socio-Political | 13 |
+| Infrastructure | 12 |
+| Demographics | 4 |
+| Temporal Context | 3 |
+| **TOTAL** | **141** |
 
 ---
 
@@ -517,7 +553,10 @@ This section documents the "Predatory Ecosystem" NLP framework, which provides t
 | 3.0 | 2026-01-15 | Corrected ACLED drivers to 5, added IODA initial |
 | 4.0 | 2026-01-17 | IOM date → 2015-01-31, Econ date → 2003-12-01, IODA finalized (2022-02-01), Dynamic World added, variables listed vertically |
 | 5.0 | 2026-01-20 | **"Predatory Ecosystem" NLP Refactor (v2.0):** Added CrisisWatch Regime Pillars (4 features), Narrative Velocity, ACLED Hybrid Mechanisms (4 features), Fusion Signals (2 features). Updated NLP/Semantic source count to 3. Total features increased from 111 to 124. |
+| 5.1 | 2026-01-24 | **CrisisWatch Interactions & Refinement:** Added 7 interaction/fusion features (CW x ACLED). Updated ACLED Contrastive Anchoring logic and CrisisWatch normalization pipeline. Total features increased from 124 to 131. |
+| 5.2 | 2026-01-25 | **Final Feature Registry Update:** Integrated interaction features into main config, removed deprecated ACLED themes and legacy lags. Finalized registry at 138 unique columns before pruning. |
+| 5.3 | 2026-01-26 | **VIIRS Integrated Strategy:** Replaced single NTL intensity with Stability, Kinetic, and Uncertainty signals. Added derived `ntl_kinetic_delta`. Feature count increased to 141. |
 
 ---
 
-**Generated:** 2026-01-20 | **Pipeline Version:** January 2026
+**Generated:** 2026-01-26 | **Pipeline Version:** January 2026

@@ -25,7 +25,15 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from utils import logger, get_db_engine, load_configs, upload_to_postgis, ensure_h3_int64, init_gee
+from utils import (
+    logger,
+    get_db_engine,
+    load_configs,
+    upload_to_postgis,
+    ensure_h3_int64,
+    init_gee,
+    get_incremental_window,
+)
 
 # --- Constants ---
 SCHEMA = "car_cewp"
@@ -70,12 +78,14 @@ def ensure_environmental_table_exists(engine, schema="car_cewp"):
         h3_index BIGINT NOT NULL,
         date DATE NOT NULL,
         precip_mean_depth_mm FLOAT,
-        chirps_precip_anomaly FLOAT,
         temp_mean FLOAT,
         dew_mean FLOAT,
         soil_moisture_mean FLOAT,
         ndvi_max FLOAT,
         ntl_mean FLOAT,
+        ntl_peak FLOAT,
+        ntl_stale_days FLOAT,
+        ntl_trust_frac FLOAT,
         water_local_mean FLOAT,
         water_local_max FLOAT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -84,6 +94,10 @@ def ensure_environmental_table_exists(engine, schema="car_cewp"):
     """)
     with engine.begin() as conn:
         conn.execute(create_sql)
+        # Ensure new VIIRS columns exist on legacy tables
+        conn.execute(text(f'ALTER TABLE {schema}.environmental_features ADD COLUMN IF NOT EXISTS "ntl_peak" FLOAT;'))
+        conn.execute(text(f'ALTER TABLE {schema}.environmental_features ADD COLUMN IF NOT EXISTS "ntl_stale_days" FLOAT;'))
+        conn.execute(text(f'ALTER TABLE {schema}.environmental_features ADD COLUMN IF NOT EXISTS "ntl_trust_frac" FLOAT;'))
     logger.info(f"✓ Table {schema}.environmental_features is ready.")
 
 
@@ -181,6 +195,58 @@ def get_water_image(start_dt, end_dt):
     )
 
 
+def get_viirs_integrated(start_date, end_date):
+    """
+    Fetches VIIRS NTL with Stability, Kinetic, and Staleness signals.
+    
+    Signal Decomposition:
+    - Stability (ntl_mean): Gap-filled mean for infrastructure/development baseline
+    - Kinetic (ntl_peak): Raw max for fires/explosions/transient events
+    - Staleness (ntl_stale_days): Median days since last HQ retrieval (uncertainty)
+    
+    Uses NASA/VIIRS/002/VNP46A2 (VNP46A2 Black Marble product).
+    Returns masked NULLs for pre-2012 (VIIRS launch: 2012-01-28).
+    """
+    # 1. Access Collection (NASA VNP46A2)
+    viirs_col = ee.ImageCollection("NASA/VIIRS/002/VNP46A2").filterDate(start_date, end_date)
+
+    # 2. STABILITY SIGNAL (Infrastructure / Development)
+    # Gap-Filled Mean: Smooth baseline, handles clouds, creates continuity.
+    signal_stable = viirs_col.select("Gap_Filled_DNB_BRDF_Corrected_NTL").mean().rename("ntl_mean")
+
+    # 3. KINETIC SIGNAL (Fires / Explosions)
+    # Raw Band Max: Captures short-term intensity spikes that gap-filling erases.
+    # Essential for catching conflict events like arson.
+    signal_peak = viirs_col.select("DNB_BRDF_Corrected_NTL").max().rename("ntl_peak")
+
+    # 4. UNCERTAINTY SIGNAL (Data Age)
+    # 'Latest_High_Quality_Retrieval' = Days since last good observation.
+    # Use MEDIAN to avoid skew from single bad pixels (outlier-resistant).
+    # High value = Old data (Carry-forward risk).
+    stale_days = viirs_col.select("Latest_High_Quality_Retrieval").median().rename("ntl_stale_days")
+
+    # 5. TRUST FRACTION (Quality Coverage)
+    # Mandatory_Quality_Flag == 0 means high quality.
+    def measure_trust(img):
+        return img.select("Mandatory_Quality_Flag").eq(0).rename("ntl_trust_flag") \
+                 .copyProperties(img, ["system:time_start"])
+    trust_frac = viirs_col.map(measure_trust).mean().rename("ntl_trust_frac")
+
+    # 5. PRE-2012 GUARD (Masking)
+    # If the collection is empty (pre-2012), return NULLs so the binary flag takes over.
+    # Essential for structural breaks - prevents zero-fill leakage.
+    dummy = ee.Image.constant(0).selfMask().rename("ntl_mean") \
+            .addBands(ee.Image.constant(0).selfMask().rename("ntl_peak")) \
+            .addBands(ee.Image.constant(0).selfMask().rename("ntl_stale_days")) \
+            .addBands(ee.Image.constant(0).selfMask().rename("ntl_trust_frac"))
+
+    return ee.Algorithms.If(
+        viirs_col.size().gt(0),
+        signal_stable.addBands(signal_peak).addBands(stale_days).addBands(trust_frac),
+        dummy
+    )
+
+
 def process_single_batch(batch_cells, s_str, e_excl_str, collections_cfg, start_dt, end_dt):
     chirps_id = collections_cfg.get("chirps", "UCSB-CHG/CHIRPS/DAILY")
     era5_id = collections_cfg.get("era5", "ECMWF/ERA5_LAND/HOURLY")
@@ -196,12 +262,8 @@ def process_single_batch(batch_cells, s_str, e_excl_str, collections_cfg, start_
             era5 = ee.ImageCollection(era5_id).filterDate(s_str, e_excl_str).mean().select(["temperature_2m", "dewpoint_temperature_2m", "volumetric_soil_water_layer_1"], ["temp", "dew", "soil"])
             coarse_res = chirps.addBands(era5).reduceRegions(collection=batch_fc, reducer=ee.Reducer.mean(), scale=5000, tileScale=4)
 
-            # 2. Fine
-            if start_dt.year < 2012:
-                viirs_img = ee.Image.constant(0).rename("ntl_mean")
-            else:
-                viirs = ee.ImageCollection(viirs_id).filterDate(s_str, e_excl_str).select("DNB_BRDF_Corrected_NTL")
-                viirs_img = ee.Image(ee.Algorithms.If(viirs.size().gt(0), viirs.mean(), ee.Image.constant(0))).rename("ntl_mean")
+            # 2. Fine (VIIRS at 500m scale, tileScale=8 to prevent timeouts)
+            viirs_img = get_viirs_integrated(s_str, e_excl_str)
 
             def add_ndvi(img):
                 return img.normalizedDifference(["Nadir_Reflectance_Band2", "Nadir_Reflectance_Band1"]).rename("ndvi")
@@ -209,7 +271,9 @@ def process_single_batch(batch_cells, s_str, e_excl_str, collections_cfg, start_
             modis = ee.ImageCollection(modis_id).filterDate(s_str, e_excl_str).map(add_ndvi).select("ndvi")
             modis_img = ee.Image(ee.Algorithms.If(modis.size().gt(0), modis.max(), ee.Image.constant(0))).rename("ndvi_max")
             water_img = get_water_image(start_dt, end_dt).rename("water_local_mean")
-            fine_res = viirs_img.addBands(modis_img).addBands(water_img).reduceRegions(collection=batch_fc, reducer=ee.Reducer.mean(), scale=100, tileScale=4)
+            
+            # VIIRS native resolution is ~500m; use scale=500, tileScale=8 to prevent GEE timeouts
+            fine_res = viirs_img.addBands(modis_img).addBands(water_img).reduceRegions(collection=batch_fc, reducer=ee.Reducer.mean(), scale=500, tileScale=8)
 
             # 3. Water Max
             water_max_res = get_water_image(start_dt, end_dt).rename("water_bin").reduceRegions(collection=batch_fc, reducer=ee.Reducer.max().setOutputs(["water_local_max"]), scale=30, tileScale=4)
@@ -280,6 +344,8 @@ def process_year_batch(year: int, all_cells: list, collections_cfg: dict, window
                             "soil_moisture_mean": get_prop(c_props, ["soil", "soil_mean"]),
                             "ndvi_max": get_prop(props, ["ndvi_max", "ndvi_max_mean", "ndvi"]),
                             "ntl_mean": get_prop(props, ["ntl_mean", "ntl_mean_mean", "ntl"]),
+                            "ntl_peak": get_prop(props, ["ntl_peak", "ntl_peak_mean"]),
+                            "ntl_stale_days": get_prop(props, ["ntl_stale_days", "ntl_stale_days_mean"]),
                             "water_local_mean": get_prop(props, ["water_local_mean", "water_local_mean_mean", "water"]),
                             "water_local_max": w_map.get(h3_idx),
                         })
@@ -302,12 +368,37 @@ def process_year_batch(year: int, all_cells: list, collections_cfg: dict, window
         gc.collect()
 
 
-def run(configs, engine):
+def run(configs, engine, args=None):
+    """
+    Incremental GEE fetch with 14-day safety overlap for late-arriving scenes.
+    """
     data_cfg = configs["data"]
     features_cfg = configs["features"]
     project_id = data_cfg["gee"]["project_id"]
-    g_start = int(data_cfg["global_date_window"]["start_date"][:4])
-    g_end = int(data_cfg["global_date_window"]["end_date"][:4])
+
+    requested_end = data_cfg["global_date_window"].get("end_date", datetime.now().strftime("%Y-%m-%d"))
+    default_start = data_cfg["global_date_window"].get("start_date", "2000-01-01")
+
+    # Determine missing window (no overlap) then apply 14-day buffer
+    force_full = getattr(args, "no_incremental", False) if args is not None else False
+    start, end = get_incremental_window(
+        engine=engine,
+        table=TARGET_TABLE,
+        date_col="date",
+        requested_end_date=requested_end,
+        default_start_date=default_start,
+        force_full=force_full,
+        schema=SCHEMA,
+    )
+
+    if start is None:
+        logger.info("✅ Environmental features up to date; no GEE fetch needed.")
+        return
+
+    buffer_start = pd.to_datetime(start) - timedelta(days=14)
+    buffer_end = pd.to_datetime(end)
+    start_year = buffer_start.year
+    end_year = buffer_end.year
 
     ensure_environmental_table_exists(engine)
     
@@ -323,29 +414,43 @@ def run(configs, engine):
 
     if real_end_date:
         logger.info(f"✓ Latest ERA5 data found: {real_end_date.strftime('%Y-%m-%d')}")
-        cutoff_date = real_end_date - timedelta(days=0)
+        cutoff_date = real_end_date
     else:
-        logger.warning("Could not determine ERA5 end date. Using config dates blindly.")
-        cutoff_date = datetime(g_end, 12, 31)
+        logger.warning("Could not determine ERA5 end date. Using requested end date.")
+        cutoff_date = buffer_end
 
     all_cells = get_h3_grid_data(engine)
 
-    for year in range(g_start, g_end + 1):
+    for year in range(start_year, end_year + 1):
         full_spine = build_14day_spine(year, year)
-        valid_spine = [w for w in full_spine if w[0] <= cutoff_date]
+        valid_spine = [
+            w for w in full_spine
+            if (w[0] >= buffer_start) and (w[0] <= buffer_end) and (w[0] <= cutoff_date)
+        ]
 
         if not valid_spine:
-            logger.info(f"Skipping Year {year} (Beyond available data limit)")
+            logger.info(f"Skipping Year {year} (no windows within buffer/end/cutoff)")
             continue
 
         out_path = DATA_DIR / f"CEWP_Env_Res5_Year_{year}.csv"
         processed = set()
         if out_path.exists():
+            # Sync existing CSV to DB to ensure DB isn't missing prior exports
             try:
-                existing_df = pd.read_csv(out_path, usecols=["date"])
-                processed = set(existing_df["date"].unique())
-            except:
-                pass
+                df_csv = pd.read_csv(out_path)
+                if not df_csv.empty:
+                    df_csv["h3_index"] = df_csv["h3_index"].apply(ensure_h3_int64)
+                    upload_to_postgis(
+                        engine=engine,
+                        df=df_csv,
+                        table_name=TARGET_TABLE,
+                        schema=SCHEMA,
+                        primary_keys=["date", "h3_index"],
+                    )
+                    logger.info(f"✅ Synced existing CSV for year {year} to PostGIS ({len(df_csv)} rows).")
+                processed = set(pd.to_datetime(df_csv["date"]).dt.strftime("%Y-%m-%d")) if not df_csv.empty else set()
+            except Exception:
+                processed = set()
 
         # Check against LAGGED dates (what we would store)
         windows_to_run = []
@@ -357,7 +462,7 @@ def run(configs, engine):
         if windows_to_run:
             process_year_batch(year, all_cells, data_cfg["gee"]["collections"], windows_to_run, engine, lag_days)
         else:
-            logger.info(f"Year {year} complete.")
+            logger.info(f"Year {year} complete (nothing new within buffered window).")
 
 
 if __name__ == "__main__":

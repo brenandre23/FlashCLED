@@ -2,6 +2,11 @@
 # =================================================================
 # MODELING CONFIGURATION
 # =================================================================
+# Updated: 2026-01-23
+# Changes: 
+#   - Mandatory stochastic gradient boosting (subsample + colsample_*)
+#   - Replaced legacy driver_* with new mech_* schema
+#   - Added acled_combined_risk_score for aggregate risk signal
 
 horizons:
 - name: 14d
@@ -12,9 +17,14 @@ horizons:
   steps: 6
 
 # Sigmoid (Platt) calibration for probability reliability (isotonic optional)
+# CENTRALIZED CALIBRATION POLICY - Single source of truth for all calibration splits
 calibration:
-  method: sigmoid     # "sigmoid" | "isotonic" | "none"
-  fraction: 0.2       # Fraction of training data held out for calibration
+  method: sigmoid             # "sigmoid" | "isotonic" | "none"
+  split_method: temporal_tail # "temporal_tail" | "random" | "rolling"
+  fraction: 0.2               # Fraction of data for calibration set
+  min_positive_events: 10     # Minimum positive cases required in calibration set
+  fallback_fraction: 0.3      # Fallback fraction if min_positive_events not met
+  random_seed: 42             # Seed for reproducible random splits
 
 # Bin-Conditional Conformal Prediction for uncertainty intervals
 # Reference: Randahl, Williams & Hegre (2026), Political Analysis
@@ -30,60 +40,93 @@ hurdle_params:
   classifier_scale_pos_weight: 35.0
 
 # =================================================================
-# LEARNERS (Optimized for Speed & Deadlock Prevention)
+# LEARNERS (Stochastic Gradient Boosting - MANDATORY)
+# =================================================================
+# RATIONALE:
+# 1. subsample (Row Randomness): Prevents overfitting to outliers (mass casualty
+#    events). Each tree trains on 80% of data, providing robustness without
+#    external bagging overhead.
+#
+# 2. colsample_bytree (Feature Randomness): CRITICAL for NLP feature discovery.
+#    Without this, dominant autoregressive features (fatalities_lag1) will
+#    monopolize all splits. By hiding 30% of features per tree, we force the
+#    model to learn from weaker NLP signals (cw_score_local, narrative_velocity).
+#
+# 3. colsample_bylevel (Per-Level Dropout): Additional regularization that
+#    prevents any single feature from dominating at every tree level.
+#
+# External bagging is NOT used because:
+# - Bin-Conditional Conformal Prediction (BCCP) provides proper uncertainty
+# - Bagging variance != calibrated prediction intervals
+# - 10x computational overhead for marginal benefit
 # =================================================================
 learners:
   xgboost:
     type: xgboost
     params:
-      # --- CRITICAL FIXES ---
-      tree_method: "hist"   # SPEED: 2x-5x faster than 'auto'
-      n_jobs: 1             # SAFETY: Prevents deadlock in parallel pipeline
-      # ----------------------
+      # --- CORE ARCHITECTURE ---
+      tree_method: "hist"       # 2x-5x faster than 'auto'
+      n_jobs: 1                 # Prevents deadlock in parallel pipeline
       
-      n_estimators: 150
-      learning_rate: 0.05
-      max_depth: 5
-      subsample: 0.7
-      colsample_bytree: 0.7
-      gamma: 1.0
-      reg_alpha: 0.1
-      reg_lambda: 1.0
+      # --- STOCHASTIC GRADIENT BOOSTING (MANDATORY) ---
+      subsample: 0.8            # Row randomness: 80% of data per tree
+      colsample_bytree: 0.7     # Feature randomness: 70% of features per tree
+      colsample_bylevel: 0.9    # Per-level dropout: 90% of features per level
+      
+      # --- TREE STRUCTURE ---
+      n_estimators: 200         # Increased for better convergence with stochasticity
+      learning_rate: 0.05       # Lower rate compensates for added noise
+      max_depth: 6              # Slightly deeper to capture NLP interactions
+      min_child_weight: 10      # Prevents splits on rare events
+      
+      # --- REGULARIZATION ---
+      gamma: 1.0                # Minimum loss reduction for split
+      reg_alpha: 0.1            # L1 regularization
+      reg_lambda: 1.0           # L2 regularization
 
   lightgbm:
     type: lightgbm
     params:
-      # --- CRITICAL FIX ---
-      num_threads: 1        # SAFETY: Prevents deadlock (equivalent to n_jobs)
-      # --------------------
+      # --- CORE ARCHITECTURE ---
+      num_threads: 1            # Prevents deadlock (equivalent to n_jobs)
+      verbose: -1               # Suppress output
       
-      n_estimators: 150
+      # --- STOCHASTIC GRADIENT BOOSTING (MANDATORY) ---
+      subsample: 0.8            # Row randomness (bagging_fraction in native API)
+      subsample_freq: 1         # Apply bagging every iteration
+      colsample_bytree: 0.7     # Feature randomness (feature_fraction in native API)
+      
+      # --- TREE STRUCTURE ---
+      n_estimators: 200
       learning_rate: 0.05
-      num_leaves: 31
-      max_depth: -1
-      subsample: 0.7
-      colsample_bytree: 0.7
-      reg_alpha: 0.1
-      reg_lambda: 1.0
-      verbose: -1
+      num_leaves: 31            # ~2^5 (max_depth=5 equivalent)
+      max_depth: -1             # No limit (controlled by num_leaves)
+      min_child_samples: 20     # Prevents splits on rare events
+      
+      # --- REGULARIZATION ---
+      reg_alpha: 0.1            # L1 regularization
+      reg_lambda: 1.0           # L2 regularization
 
 # =================================================================
-# SUB-MODELS (Synced with your provided list)
+# SUB-MODELS
+# =================================================================
+# Updated: 2026-01-23 - Replaced legacy driver_* with mech_* schema
 # =================================================================
 submodels:
   conflict_history:
     enabled: true
     features:
-    - fatalities_14d_sum       # Added: Immediate intensity signal
+    - fatalities_14d_sum       # Immediate intensity signal
     - acled_count_battles
     - acled_count_vac
     - acled_count_explosions
     - acled_count_protests
     - acled_count_riots
-    - protest_count_lag1       # Added: Civil unrest signal
-    - riot_count_lag1          # Added: Violent demonstration signal
+    - protest_count_lag1       # Civil unrest signal
+    - riot_count_lag1          # Violent demonstration signal
     - gdelt_event_count        # Event volume (news)
     - regional_risk_score_lag1
+    # ACLED Hybrid NLP mechanisms (lagged)
     - mech_gold_pivot_lag1
     - mech_predatory_tax_lag1
     - mech_factional_infighting_lag1
@@ -93,16 +136,28 @@ submodels:
     enabled: true
     features:
     - price_maize
+    - price_maize_recency_days
     - price_maize_shock
     - price_rice
+    - price_rice_recency_days
     - price_rice_shock
     - price_oil                # Local cooking oil
-    - price_oil_shock          # Added: Composite food security signal
+    - price_oil_recency_days
+    - price_oil_shock          # Composite food security signal
+    - price_sorghum
+    - price_sorghum_recency_days
+    - price_sorghum_shock
+    - price_cassava
+    - price_cassava_recency_days
+    - price_cassava_shock
+    - price_groundnuts
+    - price_groundnuts_recency_days
+    - price_groundnuts_shock
     - gold_price_usd_lag1
-    - oil_price_usd_lag1       # Added: Global crude oil price      
-    - eur_usd_rate_lag1        # Added: Purchasing power parity
-    - dist_to_city             # Market access proxy
+    - oil_price_usd_lag1       # Global crude oil price
+    - eur_usd_rate_lag1        # Purchasing power parity
     - food_price_index
+    - food_price_index_recency_days
 
   environmental:
     enabled: true
@@ -117,10 +172,17 @@ submodels:
     - era5_soil_moisture_mean
     - ndvi_anomaly
     - ndvi_max
-    - nightlights_intensity
-    - viirs_data_available
+    # --- VIIRS Nighttime Lights (Integrated Strategy) ---
+    - ntl_mean                 # Stable infrastructure baseline (gap-filled mean)
+    - ntl_peak                 # Raw max: Fire/explosion transients
+    - ntl_stale_days           # Uncertainty: Days since last HQ observation
+    - ntl_trust_frac           # Fraction of HQ retrievals (quality)
+    - ntl_kinetic_delta        # Derived: Peak - Mean (fire proxy, clipped >= 0)
+    - viirs_data_available     # Structural break flag (date + data guard)
+    # --- Surface Water ---
     - water_local_max
     - water_local_mean
+    # --- Land Cover (Dynamic World) ---
     - landcover_grass
     - landcover_crops
     - landcover_trees
@@ -133,10 +195,11 @@ submodels:
     enabled: true
     features:
     - epr_excluded_groups_count
-    - epr_discriminated_groups_count # Added: Active discrimination
-    - ethnic_group_count             # Added: Diversity proxy
+    - epr_discriminated_groups_count # Active discrimination
+    - ethnic_group_count             # Diversity proxy
     - epr_status_mean
-    - iom_displacement_count_lag1    # Added: Displacement dynamics
+    - iom_displacement_count_lag1    # Displacement dynamics
+    - iom_displacement_sum_recency_days    # Freshness of displacement data
 
   demographic:
     enabled: true
@@ -151,12 +214,12 @@ submodels:
     - slope_mean
     - terrain_ruggedness_index
     - dist_to_road
-    - dist_to_city
-    - dist_to_capital          # Added: Core-periphery dynamics
-    - dist_to_border           # Added: Transnational spillover risk
+    - dist_to_capital          # Core-periphery dynamics
+    - dist_to_border           # Transnational spillover risk
     - dist_to_river
     - dist_to_diamond_mine
     - dist_to_gold_mine
+    - dist_to_city             # Market access proxy (moved from economics)
 
   temporal_context:
     enabled: true
@@ -168,37 +231,69 @@ submodels:
   news_ops:
     enabled: true
     features:
-    - gdelt_avg_tone_decay_30d       # Media tone (GDELT)
-    - gdelt_decay_30d                # Short-term media volume (GDELT)
-    - gdelt_goldstein_mean           # Event stability score (GDELT)
-    - gdelt_mentions_total           # Event salience/importance (GDELT)
-    - gdelt_event_count              # Event counts (GDELT)
-    - ioda_outage_score               # IODA outages (current)
-    - cw_score_local                  # CrisisWatch local score
+    # GDELT signals
+    - gdelt_avg_tone_decay_30d       # Media tone
+    - gdelt_decay_30d                # Short-term media volume
+    - gdelt_goldstein_mean           # Event stability score
+    - gdelt_mentions_total           # Event salience/importance
+    - gdelt_event_count              # Event counts
+    - gdelt_shock_signal             # Fusion: negative tone × regime instability
+    # IODA
+    - ioda_outage_score              # Internet outages
+    # CrisisWatch NLP pillars
+    - cw_score_local                 # Composite local score
     - cw_score_local_spatial_lag
     - cw_score_local_lag1
     - cw_score_local_spatial_lag_lag1
     - cw_score_local_lag1_decay_30d
     - cw_score_local_spatial_lag_lag1_decay_30d
-    # CrisisWatch topic pivots (semantic names)
-    - cw_rebel_coalition
-    - cw_transhumance_militia
-    - cw_resource_predation
-    - cw_foreign_influence
-    - cw_state_vacuum
-    - cw_sectarian_cleansing
-    - regime_parallel_governance
-    - regime_transnational_predation
-    - regime_guerrilla_fragmentation
-    - regime_ethno_pastoral_rupture
-    - narrative_velocity_lag1
-    - gdelt_shock_signal
-    - driver_resource_cattle          # ACLED hybrid NLP drivers
-    - driver_resource_mining
-    - driver_econ_taxation
-    - driver_political_coup
-    - driver_civilian_abuse
+    - regime_parallel_governance     # Pillar 10
+    - regime_transnational_predation # Pillar 11 (Wagner)
+    - regime_guerrilla_fragmentation # Pillar 12
+    - regime_ethno_pastoral_rupture  # Pillar 13
+    - narrative_velocity_lag1        # Semantic drift velocity
+    # CrisisWatch × ACLED interaction/fusion features
+    - cw_onset_amplifier
+    - cw_mass_casualty_risk
+    - cw_extraction_violence
+    - cw_pastoral_predation
+    - fusion_gold_signal
+    - fusion_fragmentation_confirmed
+    - fusion_escalation_momentum
+    # ACLED Hybrid NLP (NEW mech_* schema - replaces legacy driver_*)
+    - mech_gold_pivot_lag1
+    - mech_predatory_tax_lag1
+    - mech_factional_infighting_lag1
+    - mech_collective_punishment_lag1
+    - acled_combined_risk_score      # Aggregate: mechanism × actor interaction
 
   broad_pca:
     enabled: true
     variance_retention: 0.9
+
+# =================================================================
+# FEATURE IMPORTANCE MONITORING
+# =================================================================
+# Track whether NLP features are being discovered after enabling stochasticity
+feature_monitoring:
+  enabled: true
+  nlp_features:
+    # CrisisWatch
+    - cw_score_local
+    - cw_score_local_lag1
+    - cw_score_local_spatial_lag
+    - narrative_velocity_lag1
+    - regime_parallel_governance
+    - regime_transnational_predation
+    - regime_guerrilla_fragmentation
+    - regime_ethno_pastoral_rupture
+    # ACLED Hybrid (mech_* schema)
+    - mech_gold_pivot_lag1
+    - mech_predatory_tax_lag1
+    - mech_factional_infighting_lag1
+    - mech_collective_punishment_lag1
+    - acled_combined_risk_score
+    # GDELT fusion
+    - gdelt_shock_signal
+  # Alert if NLP features contribute less than this threshold
+  min_nlp_importance_pct: 5.0

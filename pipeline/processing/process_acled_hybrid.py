@@ -1,21 +1,28 @@
 """
-process_acled_hybrid.py (v2.0 - Actor-Weighted Semantic Pipeline)
-==================================================================
-Methodology: Semi-Supervised Semantic Projection with Empirical Actor Weighting
+process_acled_hybrid.py (v3.0 - Dynamic Actor Scoring)
+======================================================
+Methodology: Semi-Supervised Semantic Projection with Dynamic Lethality-Based Actor Weighting
 
 Pipeline:
-1. CONTRASTIVE MECHANISM DETECTION: Discriminative scoring using positive/negative anchors
-2. UNCERTAINTY QUANTIFICATION: Confidence margins for ambiguous matches
-3. ACTOR RISK WEIGHTING: Empirically-derived IRR weights from Negative Binomial regression
-4. TEXT QUALITY FILTERING: Downweight short/boilerplate notes
+1. ACTOR CALIBRATION: Query fatalities per actor over 1-year lookback, log1p transform, normalize
+2. CONTRASTIVE MECHANISM DETECTION: Discriminative scoring using positive/negative anchors
+3. UNCERTAINTY QUANTIFICATION: Confidence margins for ambiguous matches
+4. ACTOR RISK WEIGHTING: Dynamic weights based on recent fatality data (no hardcoded weights)
+5. TEXT QUALITY FILTERING: Downweight short/boilerplate notes
 
 Output Features:
 - mech_gold_pivot, mech_predatory_tax, mech_factional_infighting, mech_collective_punishment
 - mech_*_uncertainty (confidence signals)
-- acled_actor_risk_score (aggregated actor lethality)
+- acled_actor_risk_score (aggregated actor lethality from dynamic calibration)
 - acled_combined_risk_score (mechanism × actor interaction)
 
 PUBLICATION LAG: Config-driven via data.yaml acled_hybrid.publication_lag_steps.
+
+Changes in v3.0:
+- Removed hardcoded ACTOR_RISK_WEIGHTS (was based on stale IRR analysis)
+- Added calibrate_actor_risk_model() for dynamic weight calculation
+- Actor weights now derived purely from fatality data (log1p normalized)
+- Actors with 0 fatalities in lookback window get weight 0.0 (fail-safe)
 """
 
 import sys
@@ -43,43 +50,21 @@ MODEL_NAME = "all-MiniLM-L6-v2"
 BATCH_SIZE = 64
 
 # -----------------------------------------------------------------------------
-# EMPIRICAL ACTOR RISK WEIGHTS (From Negative Binomial IRR Analysis)
+# DYNAMIC ACTOR RISK CALIBRATION
 # -----------------------------------------------------------------------------
-# IRR = Incidence Rate Ratio: multiplier on expected fatalities when actor present
-# Source: analyze_actor_risk.py regression output (2026-01-21)
-# Only including actors with p < 0.001 and IRR > 1.5
+# Actor risk weights are now calibrated dynamically from recent fatality data.
+# This fallback is ONLY used if the database query returns empty (failsafe).
 
-ACTOR_RISK_WEIGHTS = {
-    # Highest Risk (IRR > 4.0) - Presence multiplies fatalities 4x+
-    "civilians (chad)": 6.91,
-    "unidentified communal militia (central african republic)": 4.66,
-    "military forces of chad (1990-2021)": 4.47,
-    
-    # High Risk (IRR 3.0-4.0)
-    "mlcj: movement of central african liberators for justice": 3.72,
-    "unidentified armed group (chad)": 3.58,
-    "seleka militia": 3.23,
-    "km5 communal militia (central african republic)": 3.22,
-    
-    # Elevated Risk (IRR 2.5-3.0)
-    "christian militia (central african republic)": 2.85,
-    "mutiny of military forces of the central african republic": 2.74,
-    "military forces of the central african republic (2003-2013)": 2.67,
-    
-    # Moderate Risk (IRR 2.0-2.5) - From Lasso/Ridge analysis
-    "anti-balaka": 2.20,
-    "upc: union for peace in the central african republic": 2.10,
-    "fprc: popular front for the renaissance of central africa": 2.05,
-    "wagner group": 2.00,
-    
-    # Baseline Risk (IRR 1.5-2.0)
-    "military forces of the central african republic (1993-2003)": 1.80,
-    "protesters (central african republic)": 1.50,
+CALIBRATION_LOOKBACK_YEARS = 1  # Lookback window for fatality-based calibration
+
+FALLBACK_RISK_WEIGHTS = {
+    # Emergency fallback if DB query fails - based on historical CAR conflict actors
+    "wagner group": 1.0,
+    "upc: union for peace in the central african republic": 0.85,
+    "anti-balaka": 0.80,
+    "fprc: popular front for the renaissance of central africa": 0.75,
+    "seleka militia": 0.70,
 }
-
-# Normalize to [0, 1] scale for combination with mechanism scores
-_max_irr = max(ACTOR_RISK_WEIGHTS.values())
-ACTOR_RISK_WEIGHTS_NORMALIZED = {k: v / _max_irr for k, v in ACTOR_RISK_WEIGHTS.items()}
 
 # -----------------------------------------------------------------------------
 # CONTRASTIVE ANCHOR CONCEPTS (Mechanism Detector)
@@ -99,7 +84,6 @@ ANCHOR_CONCEPTS = {
             "gold miners killed"
         ],
         "negative": [
-            "diamond mining",
             "kimberley process certification",
             "legal mineral export",
             "industrial mining permit",
@@ -115,7 +99,8 @@ ANCHOR_CONCEPTS = {
             "checkpoint fee collection",
             "forced payment at barrier",
             "taxing market vendors",
-            "toll collection by armed group"
+            "toll collection by armed group",
+            "convoy escort"
         ],
         "negative": [
             "customs checkpoint",
@@ -155,6 +140,8 @@ ANCHOR_CONCEPTS = {
             "scorched earth tactics",
             "massacre of villagers",
             "collective retaliation",
+            "cattle raiding reprisal",
+            "targeted killing of fulani",
             "destruction of homes"
         ],
         "negative": [
@@ -237,16 +224,79 @@ def compute_text_quality_weight(text: str) -> float:
     return max(0.1, length_weight)
 
 
-def compute_actor_risk_score(actor1: str, actor2: str) -> float:
+def calibrate_actor_risk_model(engine) -> dict:
     """
-    Compute combined actor risk score from empirical IRR weights.
+    Dynamically calibrate actor risk weights from recent fatality data.
+    
+    Methodology:
+    1. Query total fatalities per actor over the lookback window
+    2. Filter to actors with >0 fatalities (lethal actors only)
+    3. Apply log1p transform to compress scale
+    4. Normalize so top killer = 1.0
+    
+    Returns:
+        dict: Mapping of actor name (lowercase) to normalized risk weight [0, 1]
+    """
+    logger.info(f"Calibrating actor risk model (lookback={CALIBRATION_LOOKBACK_YEARS} year(s))...")
+    
+    query = f"""
+        SELECT 
+            LOWER(TRIM(actor1)) AS actor,
+            SUM(fatalities) AS total_fatalities
+        FROM {SCHEMA}.acled_events
+        WHERE event_date >= CURRENT_DATE - INTERVAL '{CALIBRATION_LOOKBACK_YEARS} year'
+          AND actor1 IS NOT NULL
+          AND actor1 != ''
+        GROUP BY LOWER(TRIM(actor1))
+        HAVING SUM(fatalities) > 0
+        ORDER BY total_fatalities DESC
+    """
+    
+    try:
+        df = pd.read_sql(query, engine)
+        
+        if df.empty:
+            logger.warning("No lethal actors found in calibration window. Using fallback weights.")
+            return FALLBACK_RISK_WEIGHTS.copy()
+        
+        # Log1p transform to compress scale (prevents extreme outliers from dominating)
+        df['weight'] = np.log1p(df['total_fatalities'])
+        
+        # Normalize to [0, 1] where top killer = 1.0
+        max_weight = df['weight'].max()
+        if max_weight > 0:
+            df['weight_normalized'] = df['weight'] / max_weight
+        else:
+            df['weight_normalized'] = 0.0
+        
+        # Build dictionary
+        risk_weights = dict(zip(df['actor'], df['weight_normalized']))
+        
+        # Log top actors for diagnostics
+        top_5 = df.nlargest(5, 'total_fatalities')[['actor', 'total_fatalities', 'weight_normalized']]
+        logger.info(f"Calibrated {len(risk_weights)} lethal actors. Top 5:")
+        for _, row in top_5.iterrows():
+            logger.info(f"  {row['actor'][:50]}: {row['total_fatalities']} fatalities -> weight={row['weight_normalized']:.3f}")
+        
+        return risk_weights
+        
+    except Exception as e:
+        logger.error(f"Actor calibration query failed: {e}. Using fallback weights.")
+        return FALLBACK_RISK_WEIGHTS.copy()
+
+
+def compute_actor_risk_score(actor1: str, actor2: str, risk_weights: dict) -> float:
+    """
+    Compute combined actor risk score from dynamically-calibrated weights.
     
     Args:
         actor1: Primary actor name (may be None)
         actor2: Secondary actor name (may be None)
+        risk_weights: Dictionary mapping actor names (lowercase) to normalized weights [0, 1]
     
     Returns:
-        float: Normalized risk score [0, 1] based on max actor risk
+        float: Normalized risk score [0, 1] based on max actor risk.
+               Returns 0.0 for actors with no fatalities in the calibration window.
     """
     scores = []
     
@@ -256,18 +306,18 @@ def compute_actor_risk_score(actor1: str, actor2: str) -> float:
         actor_lower = str(actor).lower().strip()
         
         # Exact match first
-        if actor_lower in ACTOR_RISK_WEIGHTS_NORMALIZED:
-            scores.append(ACTOR_RISK_WEIGHTS_NORMALIZED[actor_lower])
+        if actor_lower in risk_weights:
+            scores.append(risk_weights[actor_lower])
             continue
         
         # Partial match (e.g., "seleka" in "seleka militia faction")
-        for known_actor, weight in ACTOR_RISK_WEIGHTS_NORMALIZED.items():
+        for known_actor, weight in risk_weights.items():
             if known_actor in actor_lower or actor_lower in known_actor:
                 scores.append(weight)
                 break
     
     if not scores:
-        return 0.0  # Unknown actors get baseline
+        return 0.0  # Unknown actors or actors with 0 fatalities in lookback window
     
     # Return max risk (most dangerous actor present)
     return max(scores)
@@ -318,14 +368,18 @@ def compute_mechanism_scores_with_uncertainty(
 # MAIN PROCESSING PIPELINE
 # =============================================================================
 
-def process_data(df: pd.DataFrame) -> pd.DataFrame:
+def process_data(df: pd.DataFrame, risk_weights: dict) -> pd.DataFrame:
     """
     Process ACLED events through the full NLP pipeline.
+    
+    Args:
+        df: DataFrame with ACLED events (must have notes, actor1, actor2 columns)
+        risk_weights: Dynamically calibrated actor risk weights from calibrate_actor_risk_model()
     
     Steps:
     1. Clean text
     2. Compute text quality weights
-    3. Compute actor risk scores
+    3. Compute actor risk scores (using dynamic weights)
     4. Compute mechanism scores with uncertainty
     5. Combine into final weighted scores
     """
@@ -350,16 +404,16 @@ def process_data(df: pd.DataFrame) -> pd.DataFrame:
                 f"min={quality_stats['min']:.3f}, max={quality_stats['max']:.3f}")
     
     # -------------------------------------------------------------------------
-    # Step 3: Actor Risk Scores
+    # Step 3: Actor Risk Scores (using dynamic calibration)
     # -------------------------------------------------------------------------
     logger.info("Computing actor risk scores...")
     df['acled_actor_risk_score'] = df.apply(
-        lambda x: compute_actor_risk_score(x.get('actor1'), x.get('actor2')), 
+        lambda x: compute_actor_risk_score(x.get('actor1'), x.get('actor2'), risk_weights), 
         axis=1
     )
     
     actor_coverage = (df['acled_actor_risk_score'] > 0).mean()
-    logger.info(f"  Actor coverage: {actor_coverage:.1%} of events matched known actors")
+    logger.info(f"  Actor coverage: {actor_coverage:.1%} of events matched lethal actors")
     
     # -------------------------------------------------------------------------
     # Step 4: Mechanism Scores with Uncertainty
@@ -421,40 +475,56 @@ def process_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def aggregate_and_upload(df: pd.DataFrame, engine, lag_days: int):
+def aggregate_and_upload(df: pd.DataFrame, engine, lag_days: int, configs: dict):
     """
     Aggregate scores by date/location and upload to database.
+    INCLUDES FIX: Snaps dates to temporal spine defined in features.yaml.
     """
-    # Define all feature columns to aggregate
+    # 1. Get Grid Settings from Configs
+    step_days = configs['features']['temporal']['step_days']  # e.g., 14
+    anchor_date_str = configs['data']['global_date_window']['start_date']  # e.g., "2000-01-01"
+    anchor_date = pd.Timestamp(anchor_date_str)
+
+    logger.info(f"Snapping events to {step_days}-day grid starting {anchor_date_str}...")
+
+    # 2. Define Columns
     mechanism_cols = list(ANCHOR_CONCEPTS.keys())
     uncertainty_cols = [f"{c}_uncertainty" for c in mechanism_cols]
     derived_cols = ['acled_actor_risk_score', 'acled_mechanism_intensity', 'acled_combined_risk_score']
-    
+
     feature_cols = mechanism_cols + uncertainty_cols + derived_cols
-    
-    # Ensure all columns exist
+
+    # Ensure columns exist
     for col in feature_cols:
         if col not in df.columns:
             df[col] = 0.0
-    
-    logger.info(f"Aggregating {len(feature_cols)} features by date/location...")
-    
+
+    # 3. SNAP-TO-GRID LOGIC
+    # A. Apply Publication Lag first (Shift time forward)
+    df['future_date'] = pd.to_datetime(df['event_date']) + pd.Timedelta(days=lag_days)
+
+    # B. Calculate "Steps Since Anchor"
+    days_diff = (df['future_date'] - anchor_date).dt.days
+    step_indices = (days_diff // step_days).astype(int)
+
+    # C. Project back to valid spine dates (start of each step window)
+    df['snapped_date'] = anchor_date + pd.to_timedelta(step_indices * step_days, unit='D')
+
+    logger.info(f"Aggregating {len(feature_cols)} features by snapped date/location...")
+
     # Aggregation rules
     agg_rules = {}
     for col in mechanism_cols:
-        agg_rules[col] = 'sum'  # Sum mechanism detections
+        agg_rules[col] = 'sum'  # Accumulate within the 14-day window
     for col in uncertainty_cols:
-        agg_rules[col] = 'mean'  # Average uncertainty
+        agg_rules[col] = 'mean'
     for col in derived_cols:
-        agg_rules[col] = 'max' if 'risk' in col else 'sum'  # Max risk, sum intensity
-    
-    # Group by date/location
-    df_agg = df.groupby(['event_date', 'h3_index']).agg(agg_rules).reset_index()
-    
-    # Apply publication lag
-    df_agg['event_date'] = pd.to_datetime(df_agg['event_date']) + pd.Timedelta(days=lag_days)
-    logger.info(f"Applied {lag_days}-day publication lag")
-    
+        agg_rules[col] = 'max' if 'risk' in col else 'sum'
+
+    # Group by snapped date/location
+    df_agg = df.groupby(['snapped_date', 'h3_index']).agg(agg_rules).reset_index()
+    df_agg.rename(columns={'snapped_date': 'event_date'}, inplace=True)
+
     # Clean column names
     df_agg.columns = [c.replace(" ", "_") for c in df_agg.columns]
     
@@ -547,6 +617,9 @@ def run(configs=None):
     # Get publication lag
     lag_days = get_publication_lag_days(data_cfg, features_cfg)
     
+    # Calibrate actor risk model BEFORE fetching event data
+    risk_weights = calibrate_actor_risk_model(engine)
+    
     # Fetch data with actor columns
     query = """
         SELECT 
@@ -568,15 +641,15 @@ def run(configs=None):
             logger.warning("No ACLED events found with notes")
             return
         
-        # Process
-        df_processed = process_data(df)
+        # Process (with dynamic risk weights)
+        df_processed = process_data(df, risk_weights)
         
         # Validate
         if not validate_output(df_processed):
             raise ValueError("Validation failed")
         
         # Upload
-        aggregate_and_upload(df_processed, engine, lag_days)
+        aggregate_and_upload(df_processed, engine, lag_days, configs)
         
         logger.info("ACLED Hybrid processing complete")
         

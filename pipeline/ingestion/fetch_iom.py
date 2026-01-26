@@ -11,15 +11,22 @@ Key design points:
 - Writes raw records (no premature aggregation) into: car_cewp.iom_dtm_raw
 - Also writes a convenience CSV snapshot to data/processed/
 
+INCREMENTAL LOADING (2026-01-24):
+- Uses centralized get_incremental_window helper
+- Supports --full flag to force complete refresh
+- Adds overlap buffer for late-arriving data
+
 Expected downstream:
 - spatial_disaggregation.py will read iom_dtm_raw and do deterministic selection + disaggregation.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -33,11 +40,16 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from utils import PATHS, logger, load_configs, get_db_engine, upload_to_postgis  # noqa: E402
+from utils import PATHS, logger, load_configs, get_db_engine, upload_to_postgis, get_incremental_window, SCHEMA
 
-SCHEMA = "car_cewp"
 TABLE_NAME = "iom_dtm_raw"
 OUTPUT_FILENAME = "iom_displacement_data_raw.csv"
+
+# IOM data for CAR starts reliably around 2015
+DEFAULT_START_DATE = "2015-01-31"
+
+# Overlap buffer for late-arriving IOM data (IOM updates can be delayed)
+OVERLAP_BUFFER_DAYS = 14
 
 
 @dataclass(frozen=True)
@@ -289,8 +301,20 @@ def _ensure_raw_table(engine) -> None:
         )
 
 
-def main() -> None:
-    data_cfg, _, _ = load_configs()
+def main(full_refresh: bool = False) -> None:
+    """
+    Main IOM ingestion function.
+    
+    Args:
+        full_refresh: If True, ignore existing data and fetch all records.
+                      If False (default), only fetch records newer than MAX(reporting_date).
+    """
+    configs = load_configs()
+    if isinstance(configs, tuple):
+        data_cfg = configs[0]
+    else:
+        data_cfg = configs.get("data", configs)
+    
     iom_cfg = _load_iom_config(data_cfg)
 
     env_path = PATHS["root"] / ".env"
@@ -302,6 +326,38 @@ def main() -> None:
         logger.info("IOM_PRIMARY_KEY not found; calling public endpoint without subscription header.")
 
     engine = get_db_engine()
+    
+    # Get config end date
+    requested_end_date = data_cfg.get("global_date_window", {}).get("end_date")
+    if not requested_end_date:
+        from datetime import datetime
+        requested_end_date = datetime.now().strftime("%Y-%m-%d")
+    
+    # -------------------------------------------------------------------------
+    # INCREMENTAL LOADING: Use centralized helper
+    # -------------------------------------------------------------------------
+    start, end = get_incremental_window(
+        engine=engine,
+        table=TABLE_NAME,
+        date_col="reporting_date",
+        requested_end_date=requested_end_date,
+        default_start_date=DEFAULT_START_DATE,
+        force_full=full_refresh,
+        schema=SCHEMA
+    )
+    
+    if start is None:
+        logger.info("✅ IOM data already up to date. No fetch needed.")
+        return
+    
+    # Apply overlap buffer for late-arriving data
+    if not full_refresh:
+        fetch_start = pd.to_datetime(start) - timedelta(days=OVERLAP_BUFFER_DAYS)
+        logger.info(f"Fetch window: {fetch_start.date()} to {end} (includes {OVERLAP_BUFFER_DAYS}-day overlap buffer)")
+    else:
+        fetch_start = pd.to_datetime(DEFAULT_START_DATE)
+        logger.info(f"Full refresh: fetching all records from {fetch_start.date()}")
+    
     client = IOMClientV3(base_url=iom_cfg.base_url, api_key=api_key)
 
     try:
@@ -325,6 +381,21 @@ def main() -> None:
             logger.warning("No IOM data extracted from API or local file. Nothing to upload.")
             return
 
+        # -------------------------------------------------------------------------
+        # INCREMENTAL FILTER: Only keep records in our target window
+        # -------------------------------------------------------------------------
+        original_count = len(df)
+        df['reporting_date'] = pd.to_datetime(df['reporting_date']).dt.date
+        fetch_start_date = fetch_start.date()
+        
+        df = df[df['reporting_date'] >= fetch_start_date]
+        df = df[df['reporting_date'] <= pd.to_datetime(end).date()]
+        logger.info(f"  Filtered to {len(df)} records (from {original_count} total)")
+        
+        if df.empty:
+            logger.info("✅ IOM data already up to date. No new records after filtering.")
+            return
+
         # Integer coercion and invariant enforcement before upload
         df = _coerce_integer_like_columns(df)
         _assert_no_float_strings(df)
@@ -338,11 +409,26 @@ def main() -> None:
         _ensure_raw_table(engine)
         logger.info(f"Uploading {len(df):,} rows to DB {SCHEMA}.{TABLE_NAME}...")
         upload_to_postgis(engine, df, TABLE_NAME, SCHEMA, primary_keys=["id"])
-        logger.info("IOM ingestion complete.")
+        logger.info("✅ IOM ingestion complete.")
 
     finally:
         client.close()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Fetch IOM DTM displacement data")
+    parser.add_argument(
+        "--full", 
+        action="store_true",
+        help="Force full refresh (ignore existing data)"
+    )
+    parser.add_argument(
+        "--no-incremental",
+        action="store_true",
+        help="Alias for --full"
+    )
+    args = parser.parse_args()
+    
+    force_full = args.full or args.no_incremental
+    
+    main(full_refresh=force_full)

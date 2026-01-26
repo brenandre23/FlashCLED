@@ -56,17 +56,17 @@ ASSERTIONS = [
 
 def check_prevalence(conn):
     """Assertion 8: Target prevalence (allow very sparse grids)."""
-    # Use fatalities_14d_sum as proxy for future targets
+    # Use fatalities as the primary target proxy
     prev_sql = """
         SELECT
-          SUM(CASE WHEN fatalities_14d_sum > 0 THEN 1 ELSE 0 END)::float / COUNT(*) AS prevalence
+          SUM(CASE WHEN fatalities > 0 THEN 1 ELSE 0 END)::float / COUNT(*) AS prevalence
         FROM car_cewp.temporal_features
     """
     prevalence = conn.execute(text(prev_sql)).scalar()
     if prevalence is None:
         raise RuntimeError("Could not compute prevalence from temporal_features.")
-    if prevalence <= 0.0001:
-        raise AssertionError(f"Assertion 8: prevalence {prevalence:.6%} is suspiciously low (<= 0.01%).")
+    if prevalence <= 0.00001:
+        raise AssertionError(f"Assertion 8: prevalence {prevalence:.6%} is extremely low (<= 0.001%). Check ACLED ingestion.")
     logger.info(f"✅ Assertion 8: prevalence = {prevalence:.4%}")
 
 

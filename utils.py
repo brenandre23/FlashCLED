@@ -14,6 +14,7 @@ import yaml
 import time
 import io as sys_io
 import requests
+import numpy as np
 import pandas as pd
 import geopandas as gpd
 import subprocess
@@ -22,7 +23,7 @@ import geoalchemy2
 from sqlalchemy import create_engine, text, inspect
 from dotenv import load_dotenv
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from geoalchemy2 import Geometry
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from typing import Dict, List, Tuple, Optional
@@ -44,6 +45,7 @@ PATHS = {
     "processing": ROOT_DIR / "pipeline" / "processing",
     "modeling": ROOT_DIR / "pipeline" / "modeling",
     "feature_engineering": ROOT_DIR / "pipeline" / "feature_engineering",
+    "analysis": ROOT_DIR / "analysis",  # Added: missing path causing KeyError
     "configs": ROOT_DIR / "configs",
     "data": ROOT_DIR / "data",
     "data_raw": ROOT_DIR / "data" / "raw",
@@ -199,6 +201,56 @@ def get_db_engine():
         logger.critical(f"Missing DB env var: {e}")
         raise
 
+
+# -----------------------------------------------------------------
+# 5b. INCREMENTAL FETCH WINDOW HELPER
+# -----------------------------------------------------------------
+def get_incremental_window(
+    engine,
+    table: str,
+    date_col: str,
+    requested_end_date: str,
+    default_start_date: str,
+    force_full: bool = False,
+    schema: str = SCHEMA
+):
+    """
+    Determine the missing window for incremental ingestion.
+    
+    Returns:
+        (start_date, end_date) if new data is needed.
+        (None, None) if the table already covers requested_end_date.
+    """
+    if date_col is None:
+        return None, None
+
+    if force_full:
+        return default_start_date, requested_end_date
+
+    with engine.connect() as conn:
+        # Check existence
+        exists_query = text("SELECT to_regclass(:regclass)")
+        exists = conn.execute(exists_query, {"regclass": f"{schema}.{table}"}).scalar()
+        if not exists:
+            return default_start_date, requested_end_date
+
+        # Get max date
+        max_query = text(f"SELECT MAX({date_col}) AS max_date FROM {schema}.{table}")
+        current_max = pd.read_sql(max_query, conn).iloc[0, 0]
+
+    if pd.isna(current_max):
+        return default_start_date, requested_end_date
+
+    current_max = pd.to_datetime(current_max)
+    requested_end = pd.to_datetime(requested_end_date)
+
+    if current_max >= requested_end:
+        return None, None
+
+    start_date = current_max + timedelta(days=1)
+    return start_date, requested_end
+
+
 # -----------------------------------------------------------------
 # 6. RESILIENCE
 # -----------------------------------------------------------------
@@ -264,8 +316,99 @@ def _infer_sql_type(dtype_str: str) -> str:
         return "BOOLEAN"
     return "TEXT"
 
+def _sanitize_dataframe_for_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sanitize DataFrame before CSV export to prevent data corruption.
+    
+    CRITICAL FIX: This prevents the '[9.639088E0]' string corruption bug.
+    
+    The bug occurs when:
+    1. A DataFrame cell contains a single-element numpy array like np.array([9.639088])
+    2. df.to_csv() converts this to the string '[9.639088E0]' (array repr)
+    3. PostgreSQL stores this as TEXT, not as a number
+    4. Downstream code fails with "could not convert string to float"
+    
+    Root causes in feature engineering:
+    - Aggregations returning single-element arrays instead of scalars
+    - Improper handling of .values on single-row DataFrames
+    - GroupBy operations with .apply() returning arrays
+    
+    This function defensively converts all such cases to proper scalars.
+    """
+    df = df.copy()
+    
+    for col in df.columns:
+        # Skip non-problematic dtypes
+        if df[col].dtype in ['datetime64[ns]', 'bool', 'int64', 'int32', 'float64', 'float32']:
+            continue
+            
+        # Check for object columns that might contain arrays
+        if df[col].dtype == 'object':
+            # Sample to detect array-valued cells
+            sample = df[col].dropna().head(100)
+            if sample.empty:
+                continue
+                
+            # Check if any values are numpy arrays or lists
+            has_arrays = sample.apply(lambda x: isinstance(x, (np.ndarray, list))).any()
+            
+            if has_arrays:
+                # Convert arrays/lists to scalar values
+                def extract_scalar(x):
+                    if x is None or (isinstance(x, float) and np.isnan(x)):
+                        return np.nan
+                    if isinstance(x, (np.ndarray, list)):
+                        if len(x) == 0:
+                            return np.nan
+                        if len(x) == 1:
+                            return float(x[0])
+                        # Multiple values: take mean (or could raise error)
+                        return float(np.mean(x))
+                    try:
+                        return float(x)
+                    except (ValueError, TypeError):
+                        return x  # Keep as-is if not convertible
+                
+                df[col] = df[col].apply(extract_scalar)
+                
+                # Try to convert to numeric
+                df[col] = pd.to_numeric(df[col], errors='ignore')
+    
+    return df
+
+
+def _coerce_singleton_arrays(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert single-element array/list cells to scalars.
+    Keeps behavior stable for multi-element arrays by taking the mean as before.
+    """
+    def fix_cell(x):
+        if x is None:
+            return np.nan
+        if isinstance(x, (np.ndarray, list)):
+            if len(x) == 0:
+                return np.nan
+            if len(x) == 1:
+                return x[0]
+            return float(np.mean(x))
+        return x
+
+    out = df.copy()
+    # Only touch columns that can plausibly hold arrays (object or array dtype)
+    candidate_cols = [c for c in out.columns if out[c].dtype == 'object' or str(out[c].dtype).startswith('object')]
+    for col in candidate_cols:
+        sample = out[col].dropna().head(50)
+        if sample.apply(lambda v: isinstance(v, (np.ndarray, list))).any():
+            out[col] = out[col].apply(fix_cell)
+    return out
+
+
 def upload_to_postgis(engine, df: pd.DataFrame, table_name: str, schema: str, primary_keys: list):
     if df.empty: return
+    
+    # CRITICAL: Sanitize DataFrame to prevent array-to-string corruption
+    df = _coerce_singleton_arrays(df)
+    df = _sanitize_dataframe_for_csv(df)
         
     temp_table = f"temp_{table_name}_{int(time.time())}"
     
@@ -294,7 +437,7 @@ def upload_to_postgis(engine, df: pd.DataFrame, table_name: str, schema: str, pr
             s_buf.seek(0)
             
             columns = ",".join([f'"{c}"' for c in df.columns])
-            cur.copy_expert(f"COPY {temp_table} ({columns}) FROM STDIN WITH (FORMAT CSV, NULL '')", s_buf)
+            cur.copy_expert(f"COPY {temp_table} ({columns}) FROM STDIN WITH (FORMAT CSV, NULL '', ENCODING 'UTF-8')", s_buf)
 
         cols = ', '.join([f'"{c}"' for c in df.columns])
         pk_cols = ', '.join([f'"{c}"' for c in primary_keys])
@@ -468,4 +611,3 @@ def validate_all_phases(engine, schema: str = SCHEMA) -> Dict[str, ValidationRes
     for phase in PHASE_PREREQUISITES.keys():
         results[phase] = validate_pipeline_prerequisites(engine, phase, schema)
     return results
-

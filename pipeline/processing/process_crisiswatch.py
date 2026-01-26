@@ -7,11 +7,20 @@ Processes ICG CrisisWatch monthly reports for CAR, extracts:
 1. Per-topic semantic similarity scores (ConfliBERT embeddings)
 2. Location-resolved H3 cells via hybrid gazetteer
 3. Spatial confidence weights based on location resolution tier
+4. **NEW: Damped Area Normalization** to prevent large provinces from drowning signals
 
 OUTPUT SCHEMA (aligned with feature_engineering.py):
-    h3_index (int64), date (datetime), cw_topic_id (int), spatial_confidence (float)
+    h3_index (int64), date (datetime), cw_topic_id (int), 
+    spatial_confidence (float),       # RAW score (topic_score × gazetteer_weight)
+    spatial_confidence_norm (float)   # NORMALIZED score (raw / sqrt(cell_count))
 
-FIXES APPLIED:
+FIXES APPLIED (v2):
+1. Damped Area Normalization: sqrt(cell_count) normalization at ingestion
+2. Both raw and normalized scores stored for audit trail
+3. Single-cell matches have norm = raw (factor = 1.0)
+4. 100-cell province matches have norm = raw / 10
+
+PRIOR FIXES (v1):
 1. H3 API FIX: h3.polyfill -> h3.polygon_to_cells (v4.x API)
 2. SCHEMA FIX: Output columns match feature_engineering.py expectations
 3. DB UPLOAD: Upsert to car_cewp.features_crisiswatch table
@@ -54,29 +63,48 @@ SCHEMA = "car_cewp"
 OUTPUT_TABLE = "features_crisiswatch"
 
 # Concept anchors for sentence scoring - mapped to topic IDs
+# Pillar naming matches thesis "Predatory Pillars" framework
 CONCEPTS = {
     # Pillar 10: Predatory Parallel Governance (State Substitution)
-    10: { "name": "parallel_governance", "anchors": [
-        "parallel administration", "illicit licensing", "taxing production", 
-        "revenue generation blockade", "control of mining hub", "customs extortion",
-        "issuance of mining permits", "rebel taxation system"
-    ]},
+    10: {
+        "name": "regime_parallel_governance",
+        "anchors": [
+            "parallel administration", "illicit licensing", "taxing production",
+            "revenue generation blockade", "control of mining hub", "customs extortion",
+            "issuance of mining permits", "rebel taxation system", "illegal checkpoints",
+            "shadow governance", "armed group administration"
+        ]
+    },
     # Pillar 11: Transnational Resource Predation (The Sovereign Nexus)
-    11: { "name": "transnational_predation", "anchors": [
-        "Wagner Group extraction", "Midas Ressources", "Ndassima gold mine", 
-        "Africa Corps security", "industrial exploitation", "Rwandan bilateral forces", 
-        "Crystal Ventures", "Sudanese gold circuit", "RSF smuggling route"
-    ]},
-    # Pillar 12: Guerrilla Fragmentation (Asymmetric Mobility)
-    12: { "name": "guerrilla_fragmentation", "anchors": [
-        "hit-and-run tactics", "rebel splintering", "fluid alliances", 
-        "CPC coalition", "peripheral border clashes", "guerrilla ambush"
-    ]},
-    # Pillar 13: Ethno-Pastoral Rupture (Resolution Collapse)
-    13: { "name": "ethno_pastoral_rupture", "anchors": [
-        "militarized transhumance", "Mbororo stigmatization", "cattle racketeering", 
-        "pastoralist migration route", "farmer-herder clash", "breakdown of customary mediation"
-    ]}
+    11: {
+        "name": "regime_transnational_predation",
+        "anchors": [
+            "Wagner Group extraction", "Midas Ressources", "Ndassima gold mine",
+            "Africa Corps security", "industrial exploitation", "Rwandan bilateral forces",
+            "Crystal Ventures", "Sudanese gold circuit", "RSF smuggling route",
+            "Russian mercenary", "foreign military contractor", "external extraction"
+        ]
+    },
+    # Pillar 12: Guerrilla Fragmentation (Asymmetric Mobility) - ONSET TRIGGER
+    12: {
+        "name": "regime_guerrilla_fragmentation",
+        "anchors": [
+            "hit-and-run tactics", "rebel splintering", "fluid alliances",
+            "CPC coalition", "peripheral border clashes", "guerrilla ambush",
+            "faction split", "group defection", "internal rivalry",
+            "armed group fragmentation", "command breakdown"
+        ]
+    },
+    # Pillar 13: Ethno-Pastoral Rupture (Resolution Collapse) - INTENSITY AMPLIFIER
+    13: {
+        "name": "regime_ethno_pastoral_rupture",
+        "anchors": [
+            "militarized transhumance", "Mbororo stigmatization", "cattle racketeering",
+            "pastoralist migration route", "farmer-herder clash", "breakdown of customary mediation",
+            "ethnic violence", "communal conflict", "identity-based attack",
+            "intercommunal tension", "grazing dispute"
+        ]
+    }
 }
 
 # Spatial confidence weights by resolution tier
@@ -113,6 +141,8 @@ class HierarchicalGazetteer:
       3. Admin3 polygons: exact match -> set of H3 cells (weight: 0.3)
       4. Admin2 polygons: exact match -> set of H3 cells (weight: 0.2)
       5. Admin1 polygons: exact match -> set of H3 cells (weight: 0.1)
+    
+    NEW: Returns cell_count alongside h3_list for damped normalization.
     """
 
     def __init__(self, resolution: int):
@@ -131,18 +161,18 @@ class HierarchicalGazetteer:
         if not zip_path.exists():
             logger.warning(f"Settlements zip not found: {zip_path}")
             return
-        
+
         try:
             gdf = gpd.read_file(f"zip://{zip_path}")
         except Exception as e:
             logger.error(f"Failed to read settlements: {e}")
             return
-            
+
         name_col = "PName1" if "PName1" in gdf.columns else None
         if not name_col:
             logger.warning("PName1 column missing in settlements; skipping.")
             return
-            
+
         for _, row in gdf.iterrows():
             if row.geometry is None:
                 continue
@@ -155,7 +185,7 @@ class HierarchicalGazetteer:
                 self.settlements[name] = int(h3_idx)
             except Exception:
                 continue
-                
+
         self._settlement_names = list(self.settlements.keys())
         logger.info(f"Loaded {len(self.settlements)} settlements into gazetteer.")
 
@@ -176,27 +206,33 @@ class HierarchicalGazetteer:
 
     def _load_admin(self):
         """Load administrative boundary polygons."""
+        try:
+            data_cfg = load_configs()[0] if isinstance(load_configs(), tuple) else load_configs().get("data", {})
+            admin_paths = data_cfg.get("admin_boundaries", {})
+        except Exception:
+            admin_paths = {}
+
         admin_files = [
-            ("admin1", ROOT_DIR / "data" / "raw" / "wbgCAFadmin1.geojson", "NAM_1"),
-            ("admin2", ROOT_DIR / "data" / "raw" / "wbgCAFadmin2.geojson", "NAM_2"),
-            ("admin3", ROOT_DIR / "data" / "raw" / "wbgCAFadmin3.geojson", "adm2_ref_name"),
+            ("admin1", ROOT_DIR / admin_paths.get("region_boundary", "data/raw/regions.geojson"), "NAM_1"),
+            ("admin2", ROOT_DIR / admin_paths.get("prefecture_boundary", "data/raw/prefectures.json"), "ADM1_FR"),
+            ("admin3", ROOT_DIR / admin_paths.get("subprefecture_boundary", "data/raw/subprefectures.json"), "ADM2_FR"),
         ]
-        
+
         for level, path, name_col in admin_files:
             if not path.exists():
                 logger.warning(f"Admin file missing: {path}")
                 continue
-                
+
             try:
                 gdf = gpd.read_file(path)
             except Exception as e:
                 logger.error(f"Failed to read {path}: {e}")
                 continue
-                
+
             if name_col not in gdf.columns:
                 logger.warning(f"{name_col} missing in {path.name}; skipping.")
                 continue
-                
+
             target = getattr(self, level)
             for _, row in gdf.iterrows():
                 name = normalize_name(row[name_col])
@@ -205,34 +241,37 @@ class HierarchicalGazetteer:
                 h3_cells = self._poly_to_h3(row.geometry)
                 if h3_cells:
                     target[name] = h3_cells
-                    
+
             logger.info(f"Loaded {len(target)} {level} polygons into gazetteer.")
 
-    def resolve_location(self, place: str) -> Tuple[Optional[str], float, List[int]]:
+    def resolve_location(self, place: str) -> Tuple[Optional[str], float, List[int], int]:
         """
         Resolve a place name to H3 cells with spatial confidence.
         
         Returns:
-            (tier_name, weight, [h3_indices]) or (None, 0.0, [])
+            (tier_name, weight, [h3_indices], cell_count) or (None, 0.0, [], 0)
+            
+        The cell_count is used for damped area normalization:
+            normalization_factor = 1.0 / sqrt(cell_count)
         """
         clean = normalize_name(place)
         if not clean or len(clean) < 3:  # Skip very short tokens
-            return None, 0.0, []
+            return None, 0.0, [], 0
 
-        # Tier 1: Exact settlement match
+        # Tier 1: Exact settlement match (single cell)
         if clean in self.settlements:
-            return "settlement_exact", SPATIAL_WEIGHTS["settlement_exact"], [self.settlements[clean]]
+            return "settlement_exact", SPATIAL_WEIGHTS["settlement_exact"], [self.settlements[clean]], 1
 
-        # Tier 2: Fuzzy settlement match
+        # Tier 2: Fuzzy settlement match (single cell)
         if self._settlement_names:
             match = fuzz_process.extractOne(
-                clean, 
-                self._settlement_names, 
+                clean,
+                self._settlement_names,
                 scorer=fuzz.WRatio,
                 score_cutoff=90
             )
             if match:
-                return "settlement_fuzzy", SPATIAL_WEIGHTS["settlement_fuzzy"], [self.settlements[match[0]]]
+                return "settlement_fuzzy", SPATIAL_WEIGHTS["settlement_fuzzy"], [self.settlements[match[0]]], 1
 
         # Tier 3-5: Admin boundaries (exact match only for performance)
         for tier, admin_dict in [
@@ -241,9 +280,11 @@ class HierarchicalGazetteer:
             ("admin1", self.admin1),
         ]:
             if clean in admin_dict:
-                return tier, SPATIAL_WEIGHTS[tier], list(admin_dict[clean])
+                h3_list = list(admin_dict[clean])
+                cell_count = len(h3_list)
+                return tier, SPATIAL_WEIGHTS[tier], h3_list, cell_count
 
-        return None, 0.0, []
+        return None, 0.0, [], 0
 
 
 def get_device() -> torch.device:
@@ -268,12 +309,12 @@ def parse_text_file(file_path: Path) -> pd.DataFrame:
     """
     with open(file_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
-        
+
     data = []
     current_date = None
     buffer = []
     header_pattern = re.compile(
-        r"Central African Republic\s+(\w+\s+\d{4})", 
+        r"Central African Republic\s+(\w+\s+\d{4})",
         re.IGNORECASE
     )
 
@@ -281,7 +322,7 @@ def parse_text_file(file_path: Path) -> pd.DataFrame:
         line = clean_text(line)
         if not line:
             continue
-            
+
         match = header_pattern.search(line)
         if match:
             # Save previous entry
@@ -296,11 +337,11 @@ def parse_text_file(file_path: Path) -> pd.DataFrame:
         else:
             if current_date:
                 buffer.append(line)
-                
+
     # Don't forget last entry
     if current_date and buffer:
         data.append({"date": current_date, "text": " ".join(buffer)})
-        
+
     logger.info(f"Parsed {len(data)} monthly entries from CrisisWatch file.")
     return pd.DataFrame(data)
 
@@ -319,7 +360,7 @@ def encode_sentences_batched(
         (N, hidden_dim) array of [CLS] embeddings
     """
     all_embeddings = []
-    
+
     for i in range(0, len(sentences), batch_size):
         batch = sentences[i:i + batch_size]
         inputs = tokenizer(
@@ -329,13 +370,13 @@ def encode_sentences_batched(
             truncation=True,
             max_length=512
         ).to(device)
-        
+
         with torch.no_grad():
             outputs = model(**inputs)
             # [CLS] token embedding
             embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
             all_embeddings.append(embeddings)
-            
+
     return np.vstack(all_embeddings)
 
 
@@ -364,69 +405,87 @@ def upload_to_postgis(engine, df: pd.DataFrame):
     """
     Upsert CrisisWatch features to PostGIS.
     
-    Schema:
-        h3_index BIGINT, date DATE, cw_topic_id INT, spatial_confidence FLOAT
+    Schema (v2 - with normalization):
+        h3_index BIGINT, date DATE, cw_topic_id INT, 
+        spatial_confidence FLOAT,      -- RAW score
+        spatial_confidence_norm FLOAT  -- NORMALIZED score
         PRIMARY KEY (h3_index, date, cw_topic_id)
     """
     if df.empty:
         logger.warning("Empty dataframe; skipping upload.")
         return
-        
+
     with engine.begin() as conn:
-        # Create table if not exists
+        # Create table if not exists (v2 schema with spatial_confidence_norm)
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS {SCHEMA}.{OUTPUT_TABLE} (
                 h3_index BIGINT NOT NULL,
                 date DATE NOT NULL,
                 cw_topic_id INTEGER NOT NULL,
                 spatial_confidence FLOAT NOT NULL,
+                spatial_confidence_norm FLOAT NOT NULL,
                 PRIMARY KEY (h3_index, date, cw_topic_id)
             )
         """))
-        
+
+        # Add spatial_confidence_norm column if it doesn't exist (migration)
+        conn.execute(text(f"""
+            ALTER TABLE {SCHEMA}.{OUTPUT_TABLE} 
+            ADD COLUMN IF NOT EXISTS spatial_confidence_norm FLOAT DEFAULT 0.0
+        """))
+
         # Create index for faster lookups
         conn.execute(text(f"""
             CREATE INDEX IF NOT EXISTS idx_{OUTPUT_TABLE}_date 
             ON {SCHEMA}.{OUTPUT_TABLE} (date)
         """))
         
+        conn.execute(text(f"""
+            CREATE INDEX IF NOT EXISTS idx_{OUTPUT_TABLE}_topic 
+            ON {SCHEMA}.{OUTPUT_TABLE} (cw_topic_id)
+        """))
+
     # Upsert in chunks
     chunk_size = 10000
     total_rows = len(df)
-    
+
     for start in range(0, total_rows, chunk_size):
         chunk = df.iloc[start:start + chunk_size]
-        
+
         # Build VALUES clause
         values = []
         for _, row in chunk.iterrows():
             values.append(
                 f"({int(row['h3_index'])}, '{row['date'].strftime('%Y-%m-%d')}', "
-                f"{int(row['cw_topic_id'])}, {float(row['spatial_confidence'])})"
+                f"{int(row['cw_topic_id'])}, {float(row['spatial_confidence'])}, "
+                f"{float(row['spatial_confidence_norm'])})"
             )
-            
+
         if not values:
             continue
-            
+
         values_str = ",\n".join(values)
-        
+
         upsert_sql = f"""
-            INSERT INTO {SCHEMA}.{OUTPUT_TABLE} (h3_index, date, cw_topic_id, spatial_confidence)
+            INSERT INTO {SCHEMA}.{OUTPUT_TABLE} 
+                (h3_index, date, cw_topic_id, spatial_confidence, spatial_confidence_norm)
             VALUES {values_str}
             ON CONFLICT (h3_index, date, cw_topic_id)
-            DO UPDATE SET spatial_confidence = EXCLUDED.spatial_confidence
+            DO UPDATE SET 
+                spatial_confidence = EXCLUDED.spatial_confidence,
+                spatial_confidence_norm = EXCLUDED.spatial_confidence_norm
         """
-        
+
         with engine.begin() as conn:
             conn.execute(text(upsert_sql))
-            
+
     logger.info(f"Upserted {total_rows} rows to {SCHEMA}.{OUTPUT_TABLE}")
 
 
 def run():
     """Main CrisisWatch processing pipeline."""
     logger.info("=" * 60)
-    logger.info("CRISISWATCH NLP PROCESSING (Schema-Aligned)")
+    logger.info("CRISISWATCH NLP PROCESSING (v2 - Damped Area Normalization)")
     logger.info("=" * 60)
 
     # Find CrisisWatch file (explicit pattern)
@@ -437,15 +496,18 @@ def run():
         + list(raw_dir.glob("*crisiswatchdata*.txt"))  # e.g., crisiswatchdataNOV25.txt
         + list(raw_dir.glob("*CrisesWatchData*.txt"))
     )
-    
+
     if not input_files:
         # Fallback: any txt file with "crisis" in name
-        input_files = [f for f in raw_dir.glob("*.txt") if "crisis" in f.name.lower() or "crisiswatchdata" in f.name.lower()]
-        
+        input_files = [
+            f for f in raw_dir.glob("*.txt")
+            if "crisis" in f.name.lower() or "crisiswatchdata" in f.name.lower()
+        ]
+
     if not input_files:
         logger.error("No CrisisWatch txt file found in data/raw/")
         return
-        
+
     input_file = input_files[0]
     logger.info(f"Processing: {input_file.name}")
 
@@ -461,7 +523,7 @@ def run():
     nlp = spacy.load(NLP_MODEL)
     device = get_device()
     logger.info(f"Using device: {device}")
-    
+
     tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL)
     model = AutoModel.from_pretrained(BERT_MODEL).to(device)
     model.eval()
@@ -472,13 +534,13 @@ def run():
     for topic_id, concept in CONCEPTS.items():
         anchors = concept["anchors"]
         inputs = tokenizer(
-            anchors, 
-            return_tensors="pt", 
-            padding=True, 
+            anchors,
+            return_tensors="pt",
+            padding=True,
             truncation=True,
             max_length=512
         ).to(device)
-        
+
         with torch.no_grad():
             outputs = model(**inputs)
             concept_vectors[topic_id] = outputs.last_hidden_state[:, 0, :].cpu().numpy()
@@ -487,24 +549,38 @@ def run():
     logger.info("Building hierarchical gazetteer...")
     gaz = HierarchicalGazetteer(H3_RES)
 
-    # Accumulator for spatial scores and list for national velocity scores
-    accumulator: Dict[Tuple, List[float]] = {}
+    # Accumulator for spatial scores: key -> (raw_scores, cell_counts)
+    # We need to track cell_count for proper normalization aggregation
+    accumulator: Dict[Tuple, Dict[str, List]] = {}
     velocity_rows = []
     prev_centroid = None
 
-    def add_score(dt, h3_idx: int, topic_id: int, spatial_conf: float):
+    def add_score(dt, h3_idx: int, topic_id: int, raw_conf: float, cell_count: int):
+        """
+        Accumulate scores with cell_count for proper normalization.
+        
+        Damped Area Normalization:
+            normalization_factor = 1.0 / sqrt(cell_count)
+            spatial_confidence_norm = raw × normalization_factor
+        """
         key = (dt, h3_idx, topic_id)
         if key not in accumulator:
-            accumulator[key] = []
-        accumulator[key].append(spatial_conf)
+            accumulator[key] = {"raw": [], "norm": []}
+        
+        # Compute normalized score using damped area normalization
+        normalization_factor = 1.0 / (cell_count ** 0.5)
+        norm_conf = raw_conf * normalization_factor
+        
+        accumulator[key]["raw"].append(raw_conf)
+        accumulator[key]["norm"].append(norm_conf)
 
     # Process each monthly entry
     for _, row in tqdm(df_raw.iterrows(), total=len(df_raw), desc="Processing entries"):
         if not row["text"]:
             continue
-            
+
         doc = nlp(row["text"])
-        
+
         # Filter to meaningful sentences
         sents = [s for s in doc.sents if len(s.text.strip()) > 20]
         if not sents:
@@ -514,16 +590,17 @@ def run():
         sent_texts = [s.text for s in sents]
         sent_vecs = encode_sentences_batched(sent_texts, tokenizer, model, device)
 
-        # --- NARRATIVE VELOCITY CALCULATION ---
+        # --- NARRATIVE VELOCITY CALCULATION (Topic 99) ---
         current_centroid = np.mean(sent_vecs, axis=0)
         if prev_centroid is not None:
             # Cosine distance = 1 - cosine similarity
             velocity = cosine(prev_centroid, current_centroid)
             velocity_rows.append({
                 "date": row["date"],
-                "h3_index": np.int64(0),  # National score
+                "h3_index": np.int64(0),  # National score (h3=0 is sentinel)
                 "cw_topic_id": 99,
-                "spatial_confidence": float(velocity)
+                "spatial_confidence": float(velocity),
+                "spatial_confidence_norm": float(velocity)  # National: no normalization needed
             })
         prev_centroid = current_centroid
         # --- END NARRATIVE VELOCITY ---
@@ -531,30 +608,33 @@ def run():
         # Process each sentence for spatial scores
         for i, sent in enumerate(sents):
             vec = sent_vecs[i].reshape(1, -1)
-            
+
             # Score against each topic
             topic_scores = compute_topic_scores(vec, concept_vectors)
-            
+
             # Extract location mentions
             tokens = {t.text.lower() for t in sent if not t.is_stop and len(t.text) >= 3}
             for ent in sent.ents:
                 if ent.label_ in ("GPE", "LOC", "FAC"):
                     tokens.add(ent.text.lower())
-            
+
             # Resolve each potential location
             for tok in tokens:
-                tier, weight, h3_list = gaz.resolve_location(tok)
+                tier, weight, h3_list, cell_count = gaz.resolve_location(tok)
                 if tier is None or not h3_list:
                     continue
-                    
+
                 # For each topic with positive score, add weighted contribution
                 for topic_id, topic_score in topic_scores.items():
                     if topic_score <= 0.3:  # Threshold
                         continue
-                        
-                    spatial_conf = topic_score * weight
+
+                    # RAW spatial confidence = topic_score × gazetteer_weight
+                    raw_conf = topic_score * weight
+                    
+                    # Add to each resolved H3 cell with cell_count for normalization
                     for h3_idx in h3_list:
-                        add_score(row["date"], int(h3_idx), topic_id, spatial_conf)
+                        add_score(row["date"], int(h3_idx), topic_id, raw_conf, cell_count)
 
     if not accumulator and not velocity_rows:
         logger.warning("No CrisisWatch locations resolved or velocity calculated; nothing to write.")
@@ -567,7 +647,8 @@ def run():
             "date": pd.to_datetime(dt),
             "h3_index": np.int64(h3_idx),
             "cw_topic_id": int(topic_id),
-            "spatial_confidence": float(np.sum(vals)),
+            "spatial_confidence": float(np.sum(vals["raw"])),       # RAW (preserve for audit)
+            "spatial_confidence_norm": float(np.sum(vals["norm"])), # NORMALIZED
         })
 
     # Combine spatial and national (velocity) scores
@@ -575,24 +656,33 @@ def run():
     out_df = pd.DataFrame(all_rows)
 
     # --- VALIDATION ---
-    logger.info("🔬 Running Validation Checks...")
-    REQUIRED = {'h3_index', 'date', 'cw_topic_id', 'spatial_confidence'}
+    logger.info("Running Validation Checks...")
+    REQUIRED = {'h3_index', 'date', 'cw_topic_id', 'spatial_confidence', 'spatial_confidence_norm'}
     if not REQUIRED.issubset(out_df.columns):
-        raise ValueError(f"❌ Missing columns: {REQUIRED - set(out_df.columns)}")
+        raise ValueError(f"Missing columns: {REQUIRED - set(out_df.columns)}")
     valid_topics = set(CONCEPTS.keys()) | {99}
     found_topics = set(out_df['cw_topic_id'].unique())
     unknown_topics = found_topics - valid_topics
     if unknown_topics:
-        logger.warning(f"⚠️ Unknown topic IDs found: {unknown_topics}")
-    logger.info("✅ Validation passed.")
-    # ------------------
+        logger.warning(f"Unknown topic IDs found: {unknown_topics}")
     
+    # Verify normalization correctness
+    single_cell = out_df[(out_df['cw_topic_id'] != 99) & (out_df['h3_index'] != 0)]
+    if not single_cell.empty:
+        # For settlements (single cell), norm should equal raw
+        # For polygons, norm should be < raw
+        logger.info(f"  Sample raw score: {single_cell['spatial_confidence'].iloc[0]:.4f}")
+        logger.info(f"  Sample norm score: {single_cell['spatial_confidence_norm'].iloc[0]:.4f}")
+    
+    logger.info("Validation passed.")
+    # ------------------
+
     # Save parquet backup
     out_path = ROOT_DIR / "data" / "processed" / "features_crisiswatch.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_parquet(out_path, index=False)
     logger.info(f"Saved parquet backup: {out_path} ({len(out_df)} rows)")
-    
+
     # Upload to PostGIS
     logger.info("Uploading to PostGIS...")
     engine = get_db_engine()
@@ -609,6 +699,14 @@ def run():
         logger.info(f"  Unique H3 cells: {out_df['h3_index'].nunique()}")
         logger.info(f"  Date range: {out_df['date'].min()} to {out_df['date'].max()}")
         logger.info(f"  Topics extracted: {sorted(out_df['cw_topic_id'].unique().tolist())}")
+        
+        # Normalization impact summary
+        spatial_only = out_df[out_df['cw_topic_id'] != 99]
+        if not spatial_only.empty:
+            raw_sum = spatial_only['spatial_confidence'].sum()
+            norm_sum = spatial_only['spatial_confidence_norm'].sum()
+            logger.info(f"  Normalization impact: raw_total={raw_sum:.2f}, norm_total={norm_sum:.2f}")
+            logger.info(f"  Average dampening factor: {norm_sum/raw_sum:.3f}" if raw_sum > 0 else "  No spatial data")
     logger.info("=" * 60)
 
 
