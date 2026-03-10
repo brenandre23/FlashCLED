@@ -31,11 +31,19 @@ POPULATION_TABLE = "population_h3"
 STATIC_TABLE = "features_static"
 IOM_SOURCE_TABLE = "iom_dtm_raw"  # Updated to match fetch_iom.py
 
-# Population-weighted splits for Grand Bangui hybrid zones (Source: ICASEES RGPH-4 2021)
+# Population-weighted splits for Grand Bangui hybrid zones
+# Source: IOM DTM Round September 2024 — final round reporting Bangui and Bimbo separately
+#   Bangui (CF711): 765,195 displaced  |  Bimbo (CF111): 484,641 displaced  |  Total: 1,249,836
+#   Bangui share: 765195/1249836 = 0.612  |  Bimbo share: 484641/1249836 = 0.388
+# Rationale: IOM introduced sub-zones (Bangui-Fleuve/Kagas/Rapide) in Jan 2025, replacing the
+#   prior combined Bangui+Bimbo reporting. The 2025 sub-zone totals (~1.25M) match the 2024
+#   combined total, confirming these zones collectively cover the same geography. The 2024
+#   observed ratio is used as the disaggregation weight. An area-weighted approach was rejected:
+#   Bimbo (3,194 km²) is 48x larger than Bangui (66 km²) but holds 2.3x fewer residents.
 GRAND_BANGUI_SPLITS = {
-    "Bangui-Fleuve": {"Bangui": 0.35, "Bimbo": 0.65},  # Majority Bimbo Commune
-    "Bangui-Kagas":  {"Bangui": 0.52, "Bimbo": 0.48},  # Split City/Bégoua
-    "Bangui-Rapide": {"Bangui": 0.85, "Bimbo": 0.15}   # Majority City (7th Arr)
+    "Bangui-Fleuve": {"Bangui": 0.612, "Bimbo": 0.388},
+    "Bangui-Kagas":  {"Bangui": 0.612, "Bimbo": 0.388},
+    "Bangui-Rapide": {"Bangui": 0.612, "Bimbo": 0.388},
 }
 
 # Mapping of admin levels to config keys in data.yaml

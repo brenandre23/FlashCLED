@@ -99,7 +99,7 @@
             <div class="ds-label">Environmental (7)</div>
             <ul class="ds-list">
               <li><a href="https://developers.google.com/earth-engine/datasets/catalog/UCSB-CHG_CHIRPS_DAILY" target="_blank" rel="noreferrer"><strong>CHIRPS</strong></a> — daily rainfall / precipitation anomalies</li>
-              <li><a href="https://cds.climate.copernicus.eu/cdsapp#!/dataset/reanalysis-era5-land" target="_blank" rel="noreferrer"><strong>ERA5-Land</strong></a> — temperature, dewpoint, soil moisture</li>
+              <li><a href="https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land?tab=overview" target="_blank" rel="noreferrer"><strong>ERA5-Land</strong></a> — temperature, dewpoint, soil moisture</li>
               <li><a href="https://developers.google.com/earth-engine/datasets/catalog/MODIS_061_MCD43A4" target="_blank" rel="noreferrer"><strong>MODIS NDVI</strong></a> — vegetation health index</li>
               <li><a href="https://developers.google.com/earth-engine/datasets/catalog/NASA_VIIRS_002_VNP46A2" target="_blank" rel="noreferrer"><strong>VIIRS Nightlights</strong></a> — nighttime light intensity (economic proxy)</li>
               <li><a href="https://global-surface-water.appspot.com/" target="_blank" rel="noreferrer"><strong>JRC Surface Water</strong></a> — water body coverage and presence</li>
@@ -111,14 +111,14 @@
             <ul class="ds-list">
               <li><a href="https://acleddata.com/data/" target="_blank" rel="noreferrer"><strong>ACLED Events</strong></a> — battles, protests, riots, fatalities</li>
               <li><a href="https://acleddata.com/data/" target="_blank" rel="noreferrer"><strong>ACLED NLP</strong></a> — 8 semantic themes + 6 conflict drivers</li>
-              <li><a href="https://console.cloud.google.com/bigquery?p=gdelt-bq&d=gdeltv2&t=events&page=table" target="_blank" rel="noreferrer"><strong>GDELT</strong></a> — global news tone and event counts</li>
+              <li><a href="https://www.gdeltproject.org/" target="_blank" rel="noreferrer"><strong>GDELT</strong></a> — global news tone and event counts</li>
             </ul>
           </article>
           <article class="ds-card socio">
             <div class="ds-label">Socio-Political (3)</div>
             <ul class="ds-list">
               <li><a href="https://icr.ethz.ch/data/epr/geoepr/GeoEPR-2021.geojson" target="_blank" rel="noreferrer"><strong>EPR</strong></a> — ethnic power relations, excluded groups</li>
-              <li><a href="https://dtmapi.iom.int/v3" target="_blank" rel="noreferrer"><strong>IOM DTM</strong></a> — internal displacement counts</li>
+              <li><a href="https://data.humdata.org/organization/international-organization-for-migration" target="_blank" rel="noreferrer"><strong>IOM DTM</strong></a> — internal displacement counts</li>
               <li><a href="https://fdw.fews.net/api/feature/?format=geojson&unit_set_version=3380" target="_blank" rel="noreferrer"><strong>FEWS NET IPC</strong></a> — food security phase (1–5 crisis scale)</li>
             </ul>
           </article>
@@ -130,7 +130,7 @@
               <li><strong>Oil Price (CL=F)</strong> — transport/energy costs</li>
               <li><strong>S&amp;P 500, EUR/USD</strong> — macro stability indicators</li>
               <li><em>Local market prices:</em></li>
-              <li><a href="https://api.vam.wfp.org/" target="_blank" rel="noreferrer"><strong>WFP Food Prices</strong></a> — maize, rice, sorghum, oil + shock flags</li>
+              <li><a href="https://dataviz.vam.wfp.org/" target="_blank" rel="noreferrer"><strong>WFP Food Prices</strong></a> — maize, rice, sorghum, oil + shock flags</li>
             </ul>
           </article>
           <article class="ds-card infra">
@@ -138,7 +138,7 @@
             <ul class="ds-list">
               <li><a href="https://dataportaal.pbl.nl/downloads/GRIP4/GRIP4_Region3_vector_shp.zip" target="_blank" rel="noreferrer"><strong>GRIP4 Roads</strong></a> — distance to nearest road (km)</li>
               <li><a href="https://data.hydrosheds.org/file/HydroRIVERS/HydroRIVERS_v10_af_shp.zip" target="_blank" rel="noreferrer"><strong>HydroRIVERS</strong></a> — distance to river (order 3+)</li>
-              <li><a href="https://geo.ipisresearch.be/geoserver/public/caf_mines_curated_all_opendata_p_ipis/wfs" target="_blank" rel="noreferrer"><strong>IPIS Mining Sites</strong></a> — distance to diamond/gold mines</li>
+              <li><a href="https://geo.ipisresearch.be/geoserver/public/caf_mines_curated_all_opendata_p_ipis/wfs?service=WFS&request=GetCapabilities" target="_blank" rel="noreferrer"><strong>IPIS Mining Sites</strong></a> — distance to diamond/gold mines</li>
               <li><a href="https://data.humdata.org/dataset/27db004a-4f10-4046-a561-c0b0aea98ef0/resource/6d28d003-333c-442c-9d39-6903bb264814/download/caf_settlements_sigcaf.zip" target="_blank" rel="noreferrer"><strong>OSM Settlements</strong></a> — distance to city/capital</li>
               <li><a href="https://datacatalog.worldbank.org/search/dataset/0038272/World-Bank-Official-Boundaries" target="_blank" rel="noreferrer"><strong>Country Boundary</strong></a> — distance to border (km)</li>
             </ul>
@@ -265,6 +265,15 @@
                     <span class="control-title">Options</span>
                   </div>
                   <label class="field">
+                    <span class="field-label">View Level</span>
+                    <select id="pred-level-select" class="feature-select compact">
+                      <option value="h3">H3 Hexagons</option>
+                      <option value="region">Regions</option>
+                      <option value="prefecture">Prefectures</option>
+                      <option value="subprefecture">Subprefectures</option>
+                    </select>
+                  </label>
+                  <label class="field">
                     <span class="field-label">Learner</span>
                     <select id="pred-learner-select" class="feature-select compact">
                       <option value="xgboost">XGBoost</option>
@@ -285,6 +294,27 @@
                     <span class="small muted">Opacity</span>
                     <input type="range" id="pred-opacity" min="0" max="1" step="0.1" value="0.8" />
                   </div>
+                  <label class="field">
+                    <span class="field-label">Show Top</span>
+                    <select id="pred-top-percent" class="feature-select compact">
+                      <option value="1">1%</option>
+                      <option value="5" selected>5%</option>
+                      <option value="10">10%</option>
+                      <option value="15">15%</option>
+                      <option value="25">25%</option>
+                      <option value="30">30%</option>
+                      <option value="50">50%</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span class="field-label">Ranked By</span>
+                    <select id="pred-rank-metric" class="feature-select compact">
+                      <option value="expected_fatalities" selected>Expected Fatalities</option>
+                      <option value="risk">Conflict Probability</option>
+                      <option value="uncertainty_width">Uncertainty Width</option>
+                    </select>
+                  </label>
+                  <p id="pred-top-context" class="small muted">Top 5%: Critical tier deployment focus (48h).</p>
                 </div>
 
                 <div class="legend-card">
@@ -318,9 +348,17 @@
                   <p class="muted">Click a hex to inspect.</p>
                 </div>
                 <div class="inspector-section">
-                  <div class="inspector-subtitle">Top Contributors</div>
-                  <div id="pred-explain" class="chart-container small">
-                    <p class="muted">Click a hex to view explanations.</p>
+                              <div class="inspector-subtitle">
+                                  Top Contributors
+                                  <div class="shap-mode-toggle">
+                                      <label title="Fast: Tree Approximation (Full Coverage) | Standard: Permutation (Sampled)">
+                                          <input type="checkbox" id="shap-mode-checkbox" checked>
+                                          <span class="slider round"></span>
+                                      </label>
+                                      <span id="shap-mode-label" class="mode-label">Fast</span>
+                                  </div>
+                              </div>
+                              <div id="pred-explain" class="chart-container small">                    <p class="muted">Click a hex to view explanations.</p>
                   </div>
                 </div>
               </aside>
@@ -366,7 +404,7 @@
                       <option value="era5_temp_anomaly">Temperature Anomaly</option>
                       <option value="era5_soil_moisture_anomaly">Soil Moisture Anomaly</option>
                       <option value="ndvi_anomaly">NDVI Anomaly</option>
-                      <option value="nightlights_intensity">Nightlights (Stability)</option>
+                      <option value="ntl_mean">Nightlights (Stability)</option>
                     </optgroup>
                     <optgroup label="VIIRS Advanced">
                       <option value="ntl_peak">NTL Kinetic Peak</option>
@@ -451,6 +489,18 @@
                 </div>
 
                 <div class="control-card">
+                  <div class="control-header">
+                    <span class="control-title">Options</span>
+                  </div>
+                  <label class="field">
+                    <span class="field-label">View Level</span>
+                    <select id="temporal-level-select" class="feature-select compact">
+                      <option value="h3">H3 Hexagons</option>
+                      <option value="region">Regions</option>
+                      <option value="prefecture">Prefectures</option>
+                      <option value="subprefecture">Subprefectures</option>
+                    </select>
+                  </label>
                   <label class="toggle">
                     <input type="checkbox" id="temporal-show-layer" checked />
                     <span class="toggle-slider"></span>
@@ -550,11 +600,6 @@
                       <option value="slope_mean">Slope (Mean)</option>
                       <option value="terrain_ruggedness_index">Terrain Ruggedness</option>
                     </optgroup>
-                    <optgroup label="Administrative">
-                      <option value="admin1">Admin 1 Code</option>
-                      <option value="admin2">Admin 2 Code</option>
-                      <option value="admin3">Admin 3 Code</option>
-                    </optgroup>
                   </select>
                 </div>
 
@@ -624,6 +669,7 @@
       </div>
       <div class="footer-right">
         <span class="mono small">Three-Map Architecture v2.0</span>
+        <div class="footer-contact small muted" style="margin-top: 4px;">Contact: brenan.andre23@gmail.com</div>
       </div>
     </div>
   </footer>

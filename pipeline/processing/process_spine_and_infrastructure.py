@@ -55,7 +55,7 @@ STRUCTURAL_BREAKS = {
     'viirs': pd.Timestamp('2012-01-28'),       # VIIRS sensor launch
     'gdelt': pd.Timestamp('2015-02-18'),       # GDELT v2 start
     'dynamic_world': pd.Timestamp('2017-03-07'),  # Sentinel-2B launch (updated)
-    'iom': pd.Timestamp('2015-01-31'),         # IOM DTM CAR coverage start
+    'iom': pd.Timestamp('2018-01-31'),         # IOM DTM CAR coverage start
     'ioda': pd.Timestamp('2022-02-01'),        # IODA monitoring start
     'econ': pd.Timestamp('2003-12-01'),        # Yahoo Finance reliable start
     'food': pd.Timestamp('2015-01-01'),        # FEWS NET price coverage
@@ -359,8 +359,9 @@ def process_economics(engine, spine, econ_specs, feat_cfg):
             continue
         
         if 'lag' in trans:
-            # Shift preserves NaN naturally
+            # Shift then backfill first gap to avoid leading NaN per series (stationary start)
             spine[out_col] = spine.groupby('h3_index')[raw].shift(1)
+            spine[out_col] = spine.groupby('h3_index')[out_col].bfill()
         else:
             spine[out_col] = spine[raw]
     
@@ -466,7 +467,9 @@ def process_social_data(engine, spine, social_specs, feat_cfg):
     # Generate lag (preserves NaN)
     out_col = iom_spec.get('output_col', 'iom_displacement_count_lag1')
     if 'lag' in iom_spec.get('transformation', ''):
+        # Shift then backfill first gap to avoid leading NaN per series (stationary start)
         spine[out_col] = spine.groupby('h3_index')['iom_displacement_sum'].shift(1)
+        spine[out_col] = spine.groupby('h3_index')[out_col].bfill()
     else:
         spine[out_col] = spine['iom_displacement_sum']
     
@@ -572,8 +575,46 @@ def process_environment(engine, spine, env_specs, feat_cfg):
         
         trans = spec.get('transformation', 'none')
         if 'anomaly' in trans:
-            # Simplified anomaly: raw value (full climatology would go here)
-            spine[out] = spine[raw]
+            # Calculate standardized Climatological Anomaly (Z-score)
+            # True anomalies must account for seasonality. We use the calendar month
+            # to compare the current value against historical norms for that same time of year.
+            
+            temp_month = spine['date'].dt.month
+            
+            # Define baseline (2000-2020 as specified in methodology)
+            baseline_mask = spine['date'].dt.year <= 2020
+            
+            # If no data exists in baseline (e.g. newer sources), fallback to all-time
+            if not baseline_mask.any() or spine.loc[baseline_mask, raw].isna().all():
+                baseline_mask = pd.Series(True, index=spine.index)
+                
+            # Calculate historical mean and std per H3 cell per month
+            baseline_data = spine.loc[baseline_mask]
+            # Use a temporary DataFrame to avoid modifying spine index/columns directly during groupby
+            temp_df = pd.DataFrame({'h3_index': baseline_data['h3_index'], 'month': temp_month.loc[baseline_mask], 'val': baseline_data[raw]})
+            stats = temp_df.groupby(['h3_index', 'month'])['val'].agg(['mean', 'std']).reset_index()
+            stats.columns = ['h3_index', 'month', 'base_mean', 'base_std']
+            
+            # Map stats back to spine
+            spine_mapping = pd.DataFrame({'h3_index': spine['h3_index'], 'month': temp_month})
+            spine_mapping = spine_mapping.merge(stats, on=['h3_index', 'month'], how='left')
+            
+            # Compute Seasonal Z-Score
+            # Z = (X - mu_baseline_month) / sigma_baseline_month
+            z_score = (spine[raw] - spine_mapping['base_mean']) / (spine_mapping['base_std'] + 1e-6)
+            
+            # Apply smoothing for cumulative stressors (Precip, Soil Moisture, NDVI) vs acute (Temp, Dew)
+            # A 14-day dry spell is just noise; drought needs time (3 month rolling).
+            # A 14-day heatwave is an acute precursor (no rolling).
+            if raw in ['precip_mean_depth_mm', 'soil_moisture_mean', 'ndvi_max']:
+                # 6-step (~3 month) rolling mean of the Z-score to capture prolonged stress/drought
+                spine[out] = z_score.groupby(spine['h3_index']).transform(
+                    lambda x: x.rolling(window=6, min_periods=1).mean()
+                )
+            else:
+                # Acute 14-day anomaly for temperature etc.
+                spine[out] = z_score
+
         elif 'lag' in trans:
             spine[out] = spine.groupby('h3_index')[raw].shift(1)
         else:

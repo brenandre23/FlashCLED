@@ -53,6 +53,10 @@ PATHS = {
     "cache": ROOT_DIR / "cache",
     "logs": ROOT_DIR / "logs",
     "models": ROOT_DIR / "models",
+    "figures": ROOT_DIR / "Figures",
+    "figures_ch1": ROOT_DIR / "Figures",
+    "figures_ch2": ROOT_DIR / "Figures",
+    "figures_ch5": ROOT_DIR / "Figures" / "Chapter5",
 }
 
 for p in PATHS.values():
@@ -61,13 +65,20 @@ for p in PATHS.values():
 # -----------------------------------------------------------------
 # 2. LOGGING CONFIGURATION
 # -----------------------------------------------------------------
+# Guard against startup crashes if file logging path is unavailable.
+stream_handler = logging.StreamHandler(sys_io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8'))
+handlers = [stream_handler]
+try:
+    PATHS["logs"].mkdir(parents=True, exist_ok=True)
+    handlers.append(logging.FileHandler(PATHS["logs"] / "pipeline.log", mode='a', encoding='utf-8'))
+except OSError:
+    # Continue with console logging only; pipeline must still start.
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys_io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')),
-        logging.FileHandler(PATHS["logs"] / "pipeline.log", mode='a', encoding='utf-8')
-    ]
+    handlers=handlers
 )
 logger = logging.getLogger("CEWP")
 
@@ -427,6 +438,14 @@ def upload_to_postgis(engine, df: pd.DataFrame, table_name: str, schema: str, pr
                 pk_clause = f", PRIMARY KEY ({pk_cols})"
             create_sql = f"CREATE TABLE IF NOT EXISTS {schema}.{table_name} ({', '.join(col_defs)}{pk_clause});"
             conn.execute(text(create_sql))
+        else:
+            # SCHEMA EVOLUTION: Add missing columns if they exist in DF but not DB
+            existing_cols = {col['name'] for col in insp.get_columns(table_name, schema=schema)}
+            for col in df.columns:
+                if col not in existing_cols:
+                    sql_type = _infer_sql_type(df[col].dtype)
+                    logger.info(f"  Schema Evolution: Adding column '{col}' ({sql_type}) to {schema}.{table_name}")
+                    conn.execute(text(f'ALTER TABLE {schema}.{table_name} ADD COLUMN "{col}" {sql_type}'))
         
         conn.execute(text(f"CREATE TEMPORARY TABLE {temp_table} (LIKE {schema}.{table_name} INCLUDING ALL) ON COMMIT DROP;"))
         

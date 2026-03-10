@@ -8,11 +8,36 @@ global_date_window:
   start_date: "2000-01-01"
   end_date: "2025-12-31"
 
+# --- STRUCTURAL BREAK DATES (Centralized Source of Truth) ---
+# NOTE (Audit Fix 2026-01-27): Updated from actual MIN(date) in database
+# Query: scripts/audit_source_dates.sql
+structural_breaks:
+  # Environmental (GEE sources have different starts within same table)
+  era5_chirps: "2000-01-01"    # ERA5/CHIRPS coverage (environmental_features)
+  viirs: "2012-01-28"          # VIIRS sensor launch (subset of environmental_features)
+  
+  # Conflict & News
+  acled: "2000-01-10"          # ACLED events for CAR
+  acled_hybrid: "2000-01-15"   # ACLED Hybrid NLP features (features_acled_hybrid)
+  gdelt: "2015-02-18"          # GDELT v2 start (features_dynamic_daily)
+  crisiswatch: "2003-08-01"    # CrisisWatch NLP (features_crisiswatch)
+  
+  # Land Cover
+  dynamic_world: "2017-04-01"  # Actual start in landcover_features (was 2017-03-07)
+  
+  # Socio-Economic
+  economy: "2003-12-01"        # Yahoo Finance (economic_drivers)
+  food_security: "2018-01-31"  # FEWS NET (food_security) - CORRECTED from 2015-01-01
+  iom: "2018-01-31"            # IOM DTM CAR coverage (iom_dtm_raw, iom_displacement_h3)
+  
+  # Infrastructure
+  ioda: "2022-01-01"           # IODA monitoring (internet_outages) - CORRECTED from 2022-02-01
+
 # --- MODEL TRAINING SPLITS ---
 split:
   test_year: 2023
   validation_years: [2021, 2022, 2024, 2025]
-  train_cutoff: "2020-12-31"
+  train_cutoff: "2024-01-01"  # Matches hardcoded split_date in train_single_model.py:364
 
 # --- VALIDATION ---
 validation:
@@ -56,7 +81,7 @@ epr:
 iom_dtm:
   country_name: "Central African Republic"
   base_url: "https://dtmapi.iom.int/v3"
-  local_file: "data/raw/iom_manual.csv"
+  local_file: "iom_displacement_data_raw.csv"
 
 fews_net:
   iso2: "CF"

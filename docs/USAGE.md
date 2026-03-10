@@ -307,11 +307,11 @@ Structural break flags are binary (0/1) columns indicating data availability per
 | Flag | Purpose |
 |------|--------|
 | `is_worldpop_v1` | WorldPop V1 vs V2 methodology (pre-2015) |
-| `iom_data_available` | IOM DTM coverage start (2015-01-31) |
+| `iom_data_available` | IOM DTM coverage start (2018-01-31) |
 | `econ_data_available` | Yahoo Finance coverage (2003-12-01) |
-| `ioda_data_available` | IODA monitoring start (2022-02-01) |
-| `landcover_avail` | Dynamic World start (2015-06-27) |
-| `is_viirs_available` | VIIRS coverage start (2012-01-28) |
+| `ioda_data_available` | IODA monitoring start (2022-01-01) |
+| `landcover_data_available` | Dynamic World start (2017-04-01) |
+| `viirs_data_available` | VIIRS coverage start (2012-01-28) |
 
 These flags are **essential for XGBoost training** (teaching the model when data becomes available) but:
 
@@ -321,9 +321,34 @@ These flags are **essential for XGBoost training** (teaching the model when data
 
 By default, diagnostic modes exclude them to give you a cleaner picture of actual feature relationships. Use `--include-structural-breaks` to include them when needed.
 
----
-
 ## Advanced Workflows
+
+### Administrative Analysis & Visualization (v3.0)
+
+The dashboard now supports multi-level administrative aggregation, allowing users to move beyond raw H3 hexagons to scientifically defensible regional summaries.
+
+#### 1. Using the "View Level" Toggle
+In both the **Predictions** and **Temporal Features** tabs, use the **View Level** dropdown to switch between:
+- **H3 Hexagons:** Raw 10km grid resolution.
+- **Regions:** Legacy World Bank 17-unit aggregation.
+- **Prefectures:** 2021 OCHA 20-unit aggregation.
+- **Subprefectures:** 2021 OCHA 72-unit aggregation.
+
+#### 2. Scientific Aggregation Logic
+When an administrative level is selected, the system automatically applies the appropriate statistical method:
+- **Mean:** For continuous risk scores and predicted probabilities.
+- **Median:** For environmental anomalies (e.g., NDVI, Rainfall) to mitigate sensor noise.
+- **Sum:** For additive counts (e.g., Fatalities, Population, Displacement).
+
+#### 3. Hierarchical Trend Comparisons
+In the **Temporal Features** tab, selecting a **Subprefecture** will automatically trigger a **Hierarchical Comparison**. The trend chart will overlay the subprefecture's data against its parent **Prefecture**'s trend, allowing you to see if a local area is deviating from its regional norm.
+
+#### 4. Dynamic Normalization
+The "Normalize" toggle uses intelligent scaling based on the data type:
+- **Positive Data (Prices, Counts):** Uses **Min-Max Scaling [0, 1]** to show relative growth.
+- **Anomaly Data (Negative Values):** Uses **Max-Abs Scaling [-1, 1]** to preserve the zero-line, ensuring that droughts or negative shocks correctly appear below zero.
+
+---
 
 ### Scenario 1: Update Data Only
 
@@ -418,16 +443,90 @@ print(f'Features: {len(df.columns) - 2}')  # Minus h3_index and date
 ### Predictions
 
 Locations:
-- `data/processed/predictions_14d.csv` - 14-day forecast
-- `data/processed/predictions_1m.csv` - 1-month forecast
-- `data/processed/predictions_3m.csv` - 3-month forecast
+- `data/processed/predictions_14d.parquet` - 14-day forecast
+- `data/processed/predictions_1m.parquet` - 1-month forecast
+- `data/processed/predictions_3m.parquet` - 3-month forecast
+
+#### Prediction Schema
+
+Each forecast includes:
+
+| Column | Type | Description | Example |
+|--------|------|-------------|---------|
+| `h3_index` | BIGINT | Hexagonal cell identifier | `599686042433355775` |
+| `date` | DATE | Forecast target date | `2024-06-15` |
+| `onset_prob` | FLOAT | Calibrated conflict probability | `0.0342` |
+| `predicted_fatalities` | FLOAT | Expected fatality count (capped at 500) | `2.47` |
+| `fatalities_lower` | FLOAT | BCCP 90% interval lower bound | `0.0` |
+| `fatalities_upper` | FLOAT | BCCP 90% interval upper bound | `12.3` |
+| **`risk_tier`** | TEXT | Operational priority tier | `Critical`, `High`, `Elevated`, `Low` |
+| **`is_priority_target`** | BOOLEAN | Binary flag for Critical tier (Top 5%) | `true` / `false` |
+
+#### Interpreting Risk Tiers
+
+The system uses **adaptive quantile-based tiering** to translate probabilities into actionable priorities:
+
+| Tier | Coverage | Description | Operational Response |
+|------|----------|-------------|----------------------|
+| **Critical** | Top 5% | Highest-risk cells requiring immediate attention | Field verification within 24-48 hours; immediate JMAC escalation |
+| **High** | Top 15% | Elevated risk warranting heightened monitoring | Daily monitoring; preemptive stakeholder engagement; logistics prep |
+| **Elevated** | Top 30% | Emerging risk trends for watchlisting | Weekly situation reports; pattern analysis; open-source monitoring |
+| **Low** | Bottom 70% | Baseline monitoring | Standard surveillance |
+
+**Key Feature:** Tiers adapt to the country's violence trajectory. During escalation, Critical tier cells may have `onset_prob > 0.45`; during calm periods, `onset_prob > 0.28` may qualify. Both represent the **top 5% of relative risk**, preventing alert fatigue while maintaining sensitivity.
+
+#### Viewing Predictions
 
 ```bash
-# View sample predictions
+# View Critical tier cells (highest priority)
 python -c "
 import pandas as pd
-df = pd.read_csv('data/processed/predictions_14d.csv')
-print(df.nlargest(10, 'predicted_fatalities')[['h3_index', 'date', 'predicted_fatalities', 'probability_conflict']])
+df = pd.read_parquet('data/processed/predictions_14d.parquet')
+critical = df[df['risk_tier'] == 'Critical'].sort_values('onset_prob', ascending=False)
+print(critical[['h3_index', 'date', 'onset_prob', 'predicted_fatalities', 'risk_tier']].head(10))
+"
+
+# View tier distribution
+python -c "
+import pandas as pd
+df = pd.read_parquet('data/processed/predictions_14d.parquet')
+print(df['risk_tier'].value_counts(normalize=True).round(3))
+"
+
+# Filter to priority targets only
+python -c "
+import pandas as pd
+df = pd.read_parquet('data/processed/predictions_14d.parquet')
+priority = df[df['is_priority_target'] == True]
+print(f'Priority cells: {len(priority):,} (~{len(priority)/len(df)*100:.1f}%)')
+"
+```
+
+#### Exporting for GIS Visualization
+
+```bash
+# Convert to GeoJSON for QGIS/ArcGIS
+python -c "
+import pandas as pd
+import geopandas as gpd
+import h3.api.basic_int as h3
+from shapely.geometry import Polygon
+
+# Load predictions
+df = pd.read_parquet('data/processed/predictions_14d.parquet')
+
+# Filter to priority tiers
+df = df[df['risk_tier'].isin(['Critical', 'High', 'Elevated'])]
+
+# Convert H3 to polygons
+geometries = []
+for h3_idx in df['h3_index']:
+    boundary = h3.h3_to_geo_boundary(h3_idx, geo_json=True)
+    geometries.append(Polygon(boundary))
+
+gdf = gpd.GeoDataFrame(df, geometry=geometries, crs='EPSG:4326')
+gdf.to_file('predictions_priority_tiers.geojson', driver='GeoJSON')
+print('Exported to predictions_priority_tiers.geojson')
 "
 ```
 
@@ -502,7 +601,7 @@ python pipeline/ingestion/fetch_acled.py
 python pipeline/ingestion/fetch_gee_server_side.py
 
 # Feature engineering
-python pipeline/processing/feature_engineering.py
+python pipeline/processing/process_spine_and_infrastructure.py
 
 # Build feature matrix
 python pipeline/modeling/build_feature_matrix.py

@@ -49,7 +49,7 @@ logs/
 data_audit/
 data/raw/failed_windows_*.txt
 data/raw/processing.log
-analysis/
+/analysis/
 deprecated/
 
 # 2. Cache & Temp
@@ -81,3 +81,29 @@ test/*.csv
 
 # 6. Models (too large for git, use git-lfs if needed)
 models/*.pkl
+
+# --- Local-Only (do not push to GitHub) ---
+# Generated figure outputs (large PNGs/PDFs, regenerated from code)
+Figures/
+# LaTeX thesis (managed in separate Overleaf/git repo)
+Overleaf/
+# Model run archives (large parquet snapshots)
+data/runs/
+# Personal defense prep notes
+Thesis Defense Lessons/
+# Diagnostic text outputs
+conflict_onset.txt
+nlp_changes.txt
+AI_ML_promptdiagnostics.txt
+# Internal cleanup/audit docs (local reference only)
+DEPRECATION_MANIFEST.md
+# Local data quality work (not part of main pipeline)
+ImputationDQ/
+# Original analysis archive (pre-refactor, local reference only)
+OG_Analysis/
+# Generated plot directories (deleted; prevent recurrence)
+agrimatrix_outputs/
+# Gemini settings (deleted; prevent recurrence)
+.gemini/
+# Machine-specific Claude settings
+.claude/settings.local.json

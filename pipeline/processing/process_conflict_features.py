@@ -434,8 +434,13 @@ def process_acled_hybrid(engine, spine: pd.DataFrame, features_config: dict) -> 
     mech_cols = [c for c in spine.columns if c.startswith('mech_') or c.startswith('acled_')]
     spine = zero_fill_conflict_columns(spine, mech_cols)
 
-    # Generate mechanism lags
-    for col in [c for c in spine.columns if c.startswith('mech_') and not c.endswith('_lag1')]:
+    # Generate mechanism lags (and acled_combined_risk_score lag for consistency)
+    cols_to_lag = [
+        c for c in spine.columns
+        if (c.startswith('mech_') or c == 'acled_combined_risk_score')
+        and not c.endswith('_lag1')
+    ]
+    for col in cols_to_lag:
         spine[f"{col}_lag1"] = spine.groupby('h3_index')[col].shift(1).fillna(0)
 
     # NOTE: Legacy driver_* columns REMOVED (2026-01-24)
@@ -605,6 +610,11 @@ def process_crisiswatch(engine, spine: pd.DataFrame, nlp_specs: List[dict],
     score_col = 'spatial_confidence_norm' if 'spatial_confidence_norm' in available_cw_cols else 'spatial_confidence'
     logger.info(f"    Using score column: {score_col}")
     
+    # MEMORY OPTIMIZATION: Convert spine to float32 where possible to save space
+    float64_cols = spine.select_dtypes(include=['float64']).columns
+    if len(float64_cols) > 0:
+        spine[float64_cols] = spine[float64_cols].astype('float32')
+
     cw_raw = pd.read_sql(
         f"""SELECT h3_index, date, cw_topic_id, {score_col} as score 
             FROM {SCHEMA}.features_crisiswatch""",
@@ -618,6 +628,7 @@ def process_crisiswatch(engine, spine: pd.DataFrame, nlp_specs: List[dict],
 
     cw_raw['date'] = pd.to_datetime(cw_raw['date'])
     cw_raw['h3_index'] = cw_raw['h3_index'].astype('int64')
+    cw_raw['score'] = cw_raw['score'].astype('float32') # Use float32
 
     # Apply Publication Lag (e.g., 2 steps = 28 days)
     lag_steps = features_config.get('temporal', {}).get('publication_lags', {}).get('NLP_CrisisWatch', 0)
@@ -633,6 +644,7 @@ def process_crisiswatch(engine, spine: pd.DataFrame, nlp_specs: List[dict],
     # Split national velocity (topic 99) from spatial pillars (10-13)
     velocity_df = cw_raw[cw_raw['cw_topic_id'] == 99].copy()
     pillars_df = cw_raw[cw_raw['cw_topic_id'] != 99].copy()
+    del cw_raw # Free memory
 
     # ------------------------------------------------------------------
     # Broadcast NATIONAL narrative velocity to all H3 cells (join on date only)
@@ -643,9 +655,11 @@ def process_crisiswatch(engine, spine: pd.DataFrame, nlp_specs: List[dict],
         velocity_df = velocity_df.groupby('spine_date', observed=True)['score'].sum().reset_index()
         velocity_df = velocity_df.rename(columns={'spine_date': 'date', 'score': 'narrative_velocity'})
         velocity_df['date'] = pd.to_datetime(velocity_df['date'].astype(str))
+        velocity_df['narrative_velocity'] = velocity_df['narrative_velocity'].astype('float32')
 
         spine = safe_merge(spine, velocity_df, on='date', how='left')
         spine['narrative_velocity'] = spine['narrative_velocity'].fillna(0)
+        del velocity_df
     else:
         spine['narrative_velocity'] = 0.0
 
@@ -660,14 +674,24 @@ def process_crisiswatch(engine, spine: pd.DataFrame, nlp_specs: List[dict],
             aggfunc='sum'
         ).reset_index().rename(columns={'spine_date': 'date'})
         cw_pivot['date'] = pd.to_datetime(cw_pivot['date'].astype(str))
+        cw_pivot['h3_index'] = cw_pivot['h3_index'].astype('int64')
+        
+        # Convert pivoted columns to float32
+        for col in cw_pivot.select_dtypes(include=['float64']).columns:
+            cw_pivot[col] = cw_pivot[col].astype('float32')
 
         rename_map = {tid: name for tid, name in CW_TOPIC_ID_MAP.items() if tid in cw_pivot.columns}
         cw_pivot = cw_pivot.rename(columns=rename_map)
         logger.info(f"    Pivoted CrisisWatch columns: {list(rename_map.values())}")
 
         spine = safe_merge(spine, cw_pivot, on=['h3_index', 'date'], how='left')
+        del cw_pivot
+        del pillars_df
     else:
         logger.warning("    No CrisisWatch pillar rows (10-13) found after split.")
+    
+    import gc
+    gc.collect() # Force cleanup before continuing memory intensive operations
 
     # ==========================================================================
     # STEP 2: Persistence (Strobe Light Fix)
@@ -675,18 +699,22 @@ def process_crisiswatch(engine, spine: pd.DataFrame, nlp_specs: List[dict],
     logger.info("  Step 2: Applying persistence (strobe light fix)...")
     
     # CrisisWatch is monthly, spine is 14-day
-    # Forward-fill for 2 steps to hold state for pillars, then zero-fill true gaps
-    # Note: narrative_velocity is NOT forward-filled (spike only)
+    # Forward-fill for 2 steps to hold state, then zero-fill true gaps.
     cw_pillar_cols = [name for name in CW_TOPIC_ID_MAP.values() if name in spine.columns and name != 'narrative_velocity']
     
     for col in cw_pillar_cols:
         spine[col] = spine.groupby('h3_index')[col].ffill(limit=2).fillna(0)
     
-    # Zero-fill velocity separately
+    # Apply the same bounded persistence to narrative velocity to avoid
+    # biweekly strobing (monthly source on a 14-day spine).
     if 'narrative_velocity' in spine.columns:
-        spine['narrative_velocity'] = spine['narrative_velocity'].fillna(0)
+        spine['narrative_velocity'] = (
+            spine.groupby('h3_index')['narrative_velocity']
+            .ffill(limit=2)
+            .fillna(0)
+        )
     
-    logger.info(f"    Applied persistence to pillars; preserved velocity spikes.")
+    logger.info("    Applied persistence to CrisisWatch pillars and narrative velocity.")
 
     # ==========================================================================
     # STEP 3: Composite Score (Weighted cw_score_local)

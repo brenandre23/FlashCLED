@@ -19,9 +19,9 @@ horizons:
 # Sigmoid (Platt) calibration for probability reliability (isotonic optional)
 # CENTRALIZED CALIBRATION POLICY - Single source of truth for all calibration splits
 calibration:
-  method: sigmoid             # "sigmoid" | "isotonic" | "none"
-  split_method: temporal_tail # "temporal_tail" | "random" | "rolling"
-  fraction: 0.2               # Fraction of data for calibration set
+  method: none                # UPDATED: Trust the XGBoost Meta-Learner (Reduces variance collapse)
+  split_method: temporal_tail # Standardized split
+  fraction: 0.0               # Use 100% of training data for stacking
   min_positive_events: 10     # Minimum positive cases required in calibration set
   fallback_fraction: 0.3      # Fallback fraction if min_positive_events not met
   random_seed: 42             # Seed for reproducible random splits
@@ -37,7 +37,43 @@ conformal_prediction:
   bins: [0, 1, 3, 8, 21, 55, 149, .inf]
 
 hurdle_params:
-  classifier_scale_pos_weight: 35.0
+  classifier_scale_pos_weight: 18  # Reduced from 35 (was ~sqrt(950)); 18 makes base models
+                                    # more conservative, giving meta-learner cleaner signal.
+
+# =================================================================
+# META-LEARNER (LEVEL 2 STACKING)
+# =================================================================
+# Logistic: Interpretable macro-coefficients.
+# XGBoost: Captures non-linear cross-theme interactions (e.g., Conflict x NLP).
+# -----------------------------------------------------------------
+# CALIBRATION NOTES (2026-02-19):
+#   Previous run: C=1.0, class_weight='balanced' → extreme coefficients
+#   (temporal_context=-41.8, broad_pca=+16.5) caused probability floor ~0.09
+#   for ALL cells in OOS period, collapsing PR-AUC to 0.07.
+#
+#   Fix: C=0.1 adds L2 regularization (10x stronger), shrinking extreme coefs.
+#   class_weight removed: sub-models already account for imbalance via
+#   scale_pos_weight=18; double-correcting inflates the floor further.
+# =================================================================
+meta_learner:
+  type: "logistic"  # FINAL SELECTION (2026-02-20): Logistic won head-to-head +12% PR-AUC.
+                    # C=0.1 L2 regularization shrinks weak sub-model coefficients toward zero,
+                    # effectively gating noise inputs. Sub-models handle imbalance via spw=18;
+                    # class_weight=null avoids double-correction that inflates probability floor.
+  params:
+    C: 0.1
+    class_weight: null
+    max_iter: 2000
+    random_state: 42
+  # --- XGBoost meta (archived — lost head-to-head, overfits noise sub-model dims) ---
+  # params:
+  #   n_estimators: 50
+  #   max_depth: 3
+  #   learning_rate: 0.05
+  #   scale_pos_weight: 8
+  #   subsample: 0.8
+  #   colsample_bytree: 0.8
+  #   random_state: 42
 
 # =================================================================
 # LEARNERS (Stochastic Gradient Boosting - MANDATORY)
@@ -65,47 +101,47 @@ learners:
     type: xgboost
     params:
       # --- CORE ARCHITECTURE ---
-      tree_method: "hist"       # 2x-5x faster than 'auto'
-      n_jobs: 1                 # Prevents deadlock in parallel pipeline
+      tree_method: "hist"
+      n_jobs: 1
       
-      # --- STOCHASTIC GRADIENT BOOSTING (MANDATORY) ---
-      subsample: 0.8            # Row randomness: 80% of data per tree
-      colsample_bytree: 0.7     # Feature randomness: 70% of features per tree
-      colsample_bylevel: 0.9    # Per-level dropout: 90% of features per level
+      # --- STOCHASTIC GRADIENT BOOSTING ---
+      subsample: 0.8            # Keep row randomness for general robustness
+      colsample_bytree: 0.85    # INCREASED: Trust the pruned feature set more
+      colsample_bylevel: 0.9    # Keep level dropout to protect NLP signals
       
       # --- TREE STRUCTURE ---
-      n_estimators: 200         # Increased for better convergence with stochasticity
-      learning_rate: 0.05       # Lower rate compensates for added noise
-      max_depth: 6              # Slightly deeper to capture NLP interactions
-      min_child_weight: 10      # Prevents splits on rare events
+      n_estimators: 350         # INCREASED: Slower, more careful learning
+      learning_rate: 0.03       # DECREASED: Balances the deeper trees
+      max_depth: 8              # INCREASED: Capture complex interactions (Conflict x NLP x Env)
+      min_child_weight: 5       # DECREASED: Allow learning from smaller, valid clusters
       
       # --- REGULARIZATION ---
-      gamma: 1.0                # Minimum loss reduction for split
-      reg_alpha: 0.1            # L1 regularization
-      reg_lambda: 1.0           # L2 regularization
+      gamma: 1.0
+      reg_alpha: 0.1
+      reg_lambda: 1.0
 
   lightgbm:
     type: lightgbm
     params:
       # --- CORE ARCHITECTURE ---
-      num_threads: 1            # Prevents deadlock (equivalent to n_jobs)
-      verbose: -1               # Suppress output
+      num_threads: 1
+      verbose: -1
       
-      # --- STOCHASTIC GRADIENT BOOSTING (MANDATORY) ---
-      subsample: 0.8            # Row randomness (bagging_fraction in native API)
-      subsample_freq: 1         # Apply bagging every iteration
-      colsample_bytree: 0.7     # Feature randomness (feature_fraction in native API)
+      # --- STOCHASTIC GRADIENT BOOSTING ---
+      subsample: 0.8
+      subsample_freq: 1
+      colsample_bytree: 0.85    # INCREASED
       
       # --- TREE STRUCTURE ---
-      n_estimators: 200
-      learning_rate: 0.05
-      num_leaves: 31            # ~2^5 (max_depth=5 equivalent)
-      max_depth: -1             # No limit (controlled by num_leaves)
-      min_child_samples: 20     # Prevents splits on rare events
+      n_estimators: 350         # INCREASED
+      learning_rate: 0.03       # DECREASED
+      num_leaves: 50            # INCREASED: Approx depth 7-8 equivalent
+      max_depth: -1
+      min_child_samples: 10     # DECREASED: More sensitive to rare events
       
       # --- REGULARIZATION ---
-      reg_alpha: 0.1            # L1 regularization
-      reg_lambda: 1.0           # L2 regularization
+      reg_alpha: 0.1
+      reg_lambda: 1.0
 
 # =================================================================
 # SUB-MODELS
@@ -116,24 +152,15 @@ submodels:
   conflict_history:
     enabled: true
     features:
-    - fatalities_14d_sum       # Immediate intensity signal
-    - acled_count_battles
-    - acled_count_vac
-    - acled_count_explosions
-    - acled_count_protests
-    - acled_count_riots
+    - fatalities_lag1           # Lagged intensity signal
     - protest_count_lag1       # Civil unrest signal
     - riot_count_lag1          # Violent demonstration signal
     - gdelt_event_count        # Event volume (news)
     - regional_risk_score_lag1
-    # ACLED Hybrid NLP mechanisms (lagged)
-    - mech_gold_pivot_lag1
-    - mech_predatory_tax_lag1
-    - mech_factional_infighting_lag1
-    - mech_collective_punishment_lag1
 
   economics:
-    enabled: true
+    enabled: true   # Full candidate list. pruned_features.yaml is the gate — only features
+                    # present in that file will survive the intersection in build_theme_models().
     features:
     - price_maize
     - price_maize_recency_days
@@ -158,6 +185,7 @@ submodels:
     - eur_usd_rate_lag1        # Purchasing power parity
     - food_price_index
     - food_price_index_recency_days
+    - food_data_available      # Structural break: FEWS NET coverage guard
 
   environmental:
     enabled: true
@@ -222,37 +250,51 @@ submodels:
     - dist_to_city             # Market access proxy (moved from economics)
 
   temporal_context:
-    enabled: true
+    enabled: true   # Full candidate list. pruned_features.yaml controls which survive:
+                    # month_sin/cos removed (in-sample seasonal artifact, OOS ROC-AUC=0.49).
+                    # is_dry_season retained in pruned set: theoretically grounded for CAR.
     features:
     - month_sin
     - month_cos
     - is_dry_season
 
-  news_ops:
+  nlp_acled:
     enabled: true
     features:
-    # GDELT signals
-    - gdelt_avg_tone_decay_30d       # Media tone
-    - gdelt_decay_30d                # Short-term media volume
-    - gdelt_goldstein_mean           # Event stability score
-    - gdelt_mentions_total           # Event salience/importance
-    - gdelt_event_count              # Event counts
-    - gdelt_shock_signal             # Fusion: negative tone × regime instability
-    # IODA
-    - ioda_outage_score              # Internet outages
-    # CrisisWatch NLP pillars
-    - cw_score_local                 # Composite local score
-    - cw_score_local_spatial_lag
+    - mech_gold_pivot_lag1
+    - mech_predatory_tax_lag1
+    - mech_factional_infighting_lag1
+    - mech_collective_punishment_lag1
+    - acled_combined_risk_score_lag1
+
+  nlp_crisiswatch:
+    enabled: false  # DISABLED 2026-02-20: PR-AUC=0.0079 (1.6× random baseline) — noise
+    features:
+    - cw_score_local
     - cw_score_local_lag1
-    - cw_score_local_spatial_lag_lag1
-    - cw_score_local_lag1_decay_30d
-    - cw_score_local_spatial_lag_lag1_decay_30d
-    - regime_parallel_governance     # Pillar 10
-    - regime_transnational_predation # Pillar 11 (Wagner)
-    - regime_guerrilla_fragmentation # Pillar 12
-    - regime_ethno_pastoral_rupture  # Pillar 13
-    - narrative_velocity_lag1        # Semantic drift velocity
-    # CrisisWatch × ACLED interaction/fusion features
+    - cw_score_local_spatial_lag
+    - regime_parallel_governance
+    - regime_transnational_predation
+    - regime_guerrilla_fragmentation
+    - regime_ethno_pastoral_rupture
+    - narrative_velocity_lag1
+
+  nlp_gdelt:
+    enabled: false  # REMOVED 2026-02-19: ROC-AUC=0.487 (below random); meta-learner
+                    # assigned negative coefficient (-1.3) — net noise, not signal.
+                    # gdelt_event_count retained in conflict_history sub-model.
+    features:
+    - gdelt_avg_tone_decay_30d
+    - gdelt_decay_30d
+    - gdelt_goldstein_mean
+    - gdelt_mentions_total
+    - gdelt_event_count
+    - ioda_outage_score
+    - gdelt_shock_signal
+
+  nlp_interactions:
+    enabled: true
+    features:
     - cw_onset_amplifier
     - cw_mass_casualty_risk
     - cw_extraction_violence
@@ -260,16 +302,90 @@ submodels:
     - fusion_gold_signal
     - fusion_fragmentation_confirmed
     - fusion_escalation_momentum
-    # ACLED Hybrid NLP (NEW mech_* schema - replaces legacy driver_*)
-    - mech_gold_pivot_lag1
-    - mech_predatory_tax_lag1
-    - mech_factional_infighting_lag1
-    - mech_collective_punishment_lag1
-    - acled_combined_risk_score      # Aggregate: mechanism × actor interaction
 
   broad_pca:
     enabled: true
-    variance_retention: 0.9
+    variance_retention: 0.95
+    features: []
+
+# =================================================================
+# SHAP EXPLANATIONS FOR CELL INSPECTOR
+# =================================================================
+# Per-cell SHAP values for dashboard interpretability
+# Run: python -m pipeline.analysis.generate_explanations --shap-export
+shap:
+  enabled: true
+  sample_ratio: 0.1          # Subsample rows for performance (0.1 = 10%)
+  top_k: 8                   # Number of top features to return per cell
+  background_size: 200       # Background samples for KernelExplainer
+  horizons: null             # null = all horizons; or list like ["14d", "3m"]
+  learners: null             # null = all learners; or list like ["xgboost"]
+  # Theme mapping for frontend color-coding
+  theme_map:
+    environment:
+      - chirps_
+      - era5_
+      - ndvi
+      - soil_moisture
+      - nightlights
+      - temp
+      - precip
+      - ntl_
+      - water_
+      - landcover_
+    past_conflict:
+      - fatalities
+      - protest
+      - riot
+      - regional_risk_score
+      - mech_
+      - acled_combined
+    gdelt_news:
+      - gdelt_
+      - crisiswatch_
+      - acled_topic_
+      - cw_score
+      - regime_
+      - narrative_velocity
+      - fusion_
+    markets:
+      - price_
+      - maize
+      - rice
+      - cassava
+      - sorghum
+      - groundnuts
+      - oil_price
+      - gold_price
+      - sp500
+      - eur_usd
+      - food_price
+    displacement:
+      - iom_displacement
+    population:
+      - pop_
+      - population
+    distance:
+      - dist_to_
+      - distance_
+      - terrain_ruggedness
+      - elevation
+      - slope
+    admin:
+      - admin1
+      - admin2
+      - admin3
+    temporal:
+      - month_sin
+      - month_cos
+      - is_dry_season
+    pca:
+      - pca_
+    ioda:
+      - ioda_
+    epr:
+      - epr_
+      - ethnic_group
 
 # =================================================================
 # FEATURE IMPORTANCE MONITORING
@@ -292,8 +408,56 @@ feature_monitoring:
     - mech_predatory_tax_lag1
     - mech_factional_infighting_lag1
     - mech_collective_punishment_lag1
-    - acled_combined_risk_score
+    - acled_combined_risk_score_lag1
     # GDELT fusion
     - gdelt_shock_signal
   # Alert if NLP features contribute less than this threshold
   min_nlp_importance_pct: 5.0
+
+# =================================================================
+# STABILITY PRUNING CONFIGURATION
+# =================================================================
+pruning:
+  enabled: true
+  output_path: "configs/pruned_features.yaml"
+  
+  # Scientific Definition of the "Training Era" for Stability
+  training_window:
+    start_date: "2015-02-18"  # Start when GDELT/Modern NLP is available
+    end_date: "2022-12-31"    # Capture more recent conflict dynamics
+  
+  # Multi-Objective Pruning (Union of Stable Sets)
+  objectives:
+    # Objective A: Fatality onset (binary)
+    - target: "target_binary_1_step"
+      type: "binary"
+      threshold: 0.2       # RELAXED: feature must be useful >20% of the time (1/5 folds)
+      
+    # Objective B: Fatality intensity (counts)
+    - target: "fatalities_14d_sum"
+      type: "count"
+      threshold: 0.2       # RELAXED: capture rare intensity signals (approx 1/5 of the time)
+
+# =================================================================
+# SHAP EXPORT CONFIGURATION
+# =================================================================
+shap:
+  enabled: true
+  sample_ratio: 0.1          # Increased to 10% for decent map coverage
+  top_k: 8                   # Number of top features to return per cell
+  background_size: 20        # Aggressively reduced for 10x speedup vs original
+  horizons: null             # Optional filter, e.g., ["14d", "1m"]; null = all
+  learners: null             # Optional filter, e.g., ["xgboost"]; null = all
+  theme_map:                 # Prefix-based theme buckets for grouping features
+    environment: ["chirps_", "era5_", "ndvi", "soil_moisture", "rain", "temp"]
+    conflict_history: ["fatalities", "acled_count_", "protest", "riot", "regional_risk"]
+    nlp: ["cw_", "regime_", "narrative_", "mech_", "fusion_"]
+    market: ["price_", "food_price_index", "oil_price", "gold_price", "econ"]
+    displacement: ["iom_", "displacement"]
+    nightlights: ["ntl_"]
+    landcover: ["landcover_", "water_local"]
+    geography: ["dist_to_", "elevation", "slope", "terrain"]
+    population: ["pop_"]
+    internet: ["ioda_"]
+    seasonality: ["month_", "is_dry_season"]
+    other: []

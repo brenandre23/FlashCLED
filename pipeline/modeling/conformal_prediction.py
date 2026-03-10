@@ -115,7 +115,7 @@ class BinConditionalConformalPredictor:
         bins: Optional[List[float]] = None,
         alpha: float = 0.1,
         nonconformity: str = "absolute",
-        contiguous: bool = True,
+        contiguous: bool = False,  # Changed: False preserves per-bin intervals for honest coverage
         log_scale: bool = True,
     ):
         # Default bins following ViEWS/paper convention

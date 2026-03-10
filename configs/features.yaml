@@ -119,10 +119,12 @@ imputation:
       limit: 0   # ACLED events - no forward propagation
       type: flow
     news:
-      limit: 0   # GDELT/CrisisWatch - preserve temporal precision
-      type: flow
+      # For GDELT/national aggregates, preserve gaps (no forward/zero fill)
+      limit: 0
+      type: stock
     outage:
-      limit: 0   # IODA outages - no outage detected = no outage
+      # Interpret outages as flow: no event detected = 0
+      limit: 0
       type: flow
 
 # =============================================================================
@@ -186,21 +188,24 @@ registry:
   - name: "NTL Stability"
     raw: ntl_mean
     source: VIIRS
+    available_from: "2012-01-28"  # VIIRS satellite launch
     transformation: mean
-    output_col: nightlights_intensity
+    output_col: ntl_mean
     imputation_policy: pass_through  # XGBoost handles NaNs; do not fill
     description: "Gap-filled mean radiance. Stable infrastructure baseline."
 
   - name: "VIIRS Availability"
     raw: ntl_mean
     source: VIIRS
+    available_from: "2012-01-28"  # VIIRS satellite launch
     transformation: availability_flag
     output_col: viirs_data_available
     description: "1 if date >= 2012-01-28 AND ntl_mean.notna(), else 0"
 
   - name: "NTL Kinetic Peak"
     raw: ntl_peak
-    source: GEE
+    source: VIIRS
+    available_from: "2012-01-28"  # VIIRS satellite launch
     transformation: none
     output_col: ntl_peak
     imputation_policy: pass_through  # XGBoost handles NaNs; do not fill
@@ -208,7 +213,8 @@ registry:
 
   - name: "NTL Staleness"
     raw: ntl_stale_days
-    source: GEE
+    source: VIIRS
+    available_from: "2012-01-28"  # VIIRS satellite launch
     transformation: none
     output_col: ntl_stale_days
     imputation_policy: pass_through  # XGBoost handles NaNs; do not fill
@@ -216,7 +222,8 @@ registry:
 
   - name: "NTL Trust Fraction"
     raw: ntl_trust_frac
-    source: GEE
+    source: VIIRS
+    available_from: "2012-01-28"  # VIIRS satellite launch
     transformation: none
     output_col: ntl_trust_frac
     imputation_policy: pass_through  # Do not fill; represents observation density/quality
@@ -225,6 +232,7 @@ registry:
   - name: "NTL Kinetic Delta"
     raw: derived
     source: Derived
+    available_from: "2012-01-28"  # Derived from VIIRS inputs
     transformation: delta_calc
     output_col: ntl_kinetic_delta
     imputation_policy: pass_through  # NaN propagates from inputs
@@ -244,30 +252,35 @@ registry:
   - name: "Grassland Fraction"
     raw: dw_grass_frac
     source: DynamicWorld
+    available_from: "2017-04-01"  # Sentinel-2 / Dynamic World start
     transformation: mean
     output_col: landcover_grass
     description: "Grassland/savanna fraction - pastoralist zones"
   - name: "Forest Fraction"
     raw: dw_trees_frac
     source: DynamicWorld
+    available_from: "2017-04-01"  # Sentinel-2 / Dynamic World start
     transformation: mean
     output_col: landcover_trees
     description: "Forest/woodland fraction - remote areas, rebel hideouts"
   - name: "Cropland Fraction"
     raw: dw_crops_frac
     source: DynamicWorld
+    available_from: "2017-04-01"  # Sentinel-2 / Dynamic World start
     transformation: mean
     output_col: landcover_crops
     description: "Cultivated land fraction - farmer-herder interface"
   - name: "Bare Ground Fraction"
     raw: dw_bare_frac
     source: DynamicWorld
+    available_from: "2017-04-01"  # Sentinel-2 / Dynamic World start
     transformation: mean
     output_col: landcover_bare
     description: "Bare ground fraction - mining activity proxy"
   - name: "Built-up Fraction"
     raw: dw_built_frac
     source: DynamicWorld
+    available_from: "2017-04-01"  # Sentinel-2 / Dynamic World start
     transformation: mean
     output_col: landcover_built
     description: "Built-up area fraction"
@@ -322,70 +335,86 @@ registry:
   # GDELT Global Events
   - raw: gdelt_event_count
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: decay_90d
     output_col: events_3m_lag
   - raw: gdelt_event_count
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: decay_30d
     output_col: gdelt_decay_30d
   - raw: gdelt_predatory_action_count
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: decay_30d
     output_col: gdelt_predatory_action_decay_30d
   - raw: gdelt_theme_resource_predation_count
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: decay_30d
     output_col: gdelt_theme_resource_predation_decay_30d
   - raw: gdelt_theme_displacement_count
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: decay_30d
     output_col: gdelt_theme_displacement_decay_30d
   - raw: gdelt_theme_governance_breakdown_count
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: decay_30d
     output_col: gdelt_theme_governance_breakdown_decay_30d
   - raw: gdelt_avg_tone
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: decay_30d
     output_col: gdelt_avg_tone_decay_30d
   
   # GDELT National Heat (Aggregated)
   - raw: national_predatory_action_sum
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: decay_30d
     output_col: national_predatory_action_sum_decay_30d
   - raw: national_theme_resource_predation_sum
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: decay_30d
     output_col: national_theme_resource_predation_sum_decay_30d
   - raw: national_theme_displacement_sum
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: decay_30d
     output_col: national_theme_displacement_sum_decay_30d
   - raw: national_theme_governance_breakdown_sum
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: decay_30d
     output_col: national_theme_governance_breakdown_sum_decay_30d
   - raw: gdelt_goldstein_mean
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: none
     output_col: gdelt_goldstein_mean
   - raw: gdelt_mentions_total
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: none
     output_col: gdelt_mentions_total
   - raw: gdelt_data_available
     source: GDELT
+    available_from: "2015-02-18"  # GDELT v2 start
     transformation: none
     output_col: gdelt_data_available
 
   # Infrastructure Outages (IODA)
   - raw: ioda_outage_score
     source: IODA
+    available_from: "2022-01-01"  # IODA monitoring start
     transformation: none
     output_col: ioda_outage_score
   - raw: ioda_data_available
     source: IODA
+    available_from: "2022-01-01"  # IODA monitoring start
     transformation: none
     output_col: ioda_data_available
 
@@ -395,90 +424,116 @@ registry:
   # CrisisWatch Aggregate
   - raw: cw_score_local
     source: NLP_CrisisWatch
+    available_from: "2003-08-01"  # CrisisWatch start
     transformation: none
     output_col: cw_score_local
   - raw: cw_score_local_delta
     source: NLP_CrisisWatch
+    available_from: "2003-08-01"  # CrisisWatch start
     transformation: none
     output_col: cw_score_local_delta
   - raw: cw_score_local_delta_decay_14d
     source: NLP_CrisisWatch
+    available_from: "2003-08-01"  # CrisisWatch start
     transformation: none
     output_col: cw_score_local_delta_decay_14d
   - raw: narrative_velocity
     source: NLP_CrisisWatch
+    available_from: "2003-08-01"  # CrisisWatch start
     transformation: none
     output_col: narrative_velocity
   - raw: narrative_acceleration
     source: NLP_CrisisWatch
+    available_from: "2003-08-01"  # CrisisWatch start
     transformation: none
     output_col: narrative_acceleration
 
   # ACLED Hybrid Mechanisms (current schema)
   - raw: mech_gold_pivot
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: mech_gold_pivot
   - raw: mech_predatory_tax
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: mech_predatory_tax
   - raw: mech_factional_infighting
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: mech_factional_infighting
   - raw: mech_collective_punishment
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: mech_collective_punishment
 
   # Mechanism uncertainties (if needed downstream)
   - raw: mech_gold_pivot_uncertainty
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: mech_gold_pivot_uncertainty
   - raw: mech_predatory_tax_uncertainty
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: mech_predatory_tax_uncertainty
   - raw: mech_factional_infighting_uncertainty
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: mech_factional_infighting_uncertainty
   - raw: mech_collective_punishment_uncertainty
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: mech_collective_punishment_uncertainty
 
   # ACLED hybrid summary scores
   - raw: acled_actor_risk_score
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: acled_actor_risk_score
   - raw: acled_mechanism_intensity
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: acled_mechanism_intensity
   - raw: acled_combined_risk_score
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: acled_combined_risk_score
 
-  # Lagged mechanisms (already produced in processing; register as raw to avoid double-lagging)
+  # Lagged mechanisms and aggregates (already produced in processing; register as raw to avoid double-lagging)
+  # acled_combined_risk_score_lag1 is produced by process_conflict_features.py shift(1) on spine
+  - raw: acled_combined_risk_score_lag1
+    source: ACLED_Hybrid
+    available_from: "2000-01-15"
+    transformation: none
+    output_col: acled_combined_risk_score_lag1
   - raw: mech_gold_pivot_lag1
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: mech_gold_pivot_lag1
   - raw: mech_predatory_tax_lag1
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: mech_predatory_tax_lag1
   - raw: mech_factional_infighting_lag1
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: mech_factional_infighting_lag1
   - raw: mech_collective_punishment_lag1
     source: ACLED_Hybrid
+    available_from: "2000-01-15"  # ACLED Hybrid NLP start
     transformation: none
     output_col: mech_collective_punishment_lag1
 
@@ -488,84 +543,101 @@ registry:
   # Macro-Economics (Global)
   - raw: gold_price_usd
     source: Economy
+    available_from: "2003-12-01"  # Yahoo Finance coverage
     transformation: lag_1_step
     output_col: gold_price_usd_lag1
   - raw: oil_price_usd
     source: Economy
+    available_from: "2003-12-01"  # Yahoo Finance coverage
     transformation: lag_1_step
     output_col: oil_price_usd_lag1
   - raw: sp500_index
     source: Economy
+    available_from: "2003-12-01"  # Yahoo Finance coverage
     transformation: lag_1_step
     output_col: sp500_index_lag1
   - raw: eur_usd_rate
     source: Economy
+    available_from: "2003-12-01"  # Yahoo Finance coverage
     transformation: lag_1_step
     output_col: eur_usd_rate_lag1
   - raw: econ_data_available
     source: Economy
+    available_from: "2003-12-01"  # Yahoo Finance coverage
     transformation: none
     output_col: econ_data_available
 
   # Food Security (Local Market Prices)
   - raw: price_maize
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: none
     output_col: price_maize
   - raw: price_rice
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: none
     output_col: price_rice
   - raw: price_oil
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: none
     output_col: price_oil
   - raw: price_sorghum
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: none
     output_col: price_sorghum
   - raw: price_cassava
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: none
     output_col: price_cassava
   - raw: price_groundnuts
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: none
     output_col: price_groundnuts
   
   # Food Price Shocks (Anomalies)
   - raw: price_maize
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: shock_12m
     transformation_params:
       lookback_months: 12
     output_col: price_maize_shock
   - raw: price_rice
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: shock_12m
     transformation_params:
       lookback_months: 12
     output_col: price_rice_shock
   - raw: price_oil
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: shock_12m
     transformation_params:
       lookback_months: 12
     output_col: price_oil_shock
   - raw: price_sorghum
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: shock_12m
     transformation_params:
       lookback_months: 12
     output_col: price_sorghum_shock
   - raw: price_cassava
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: shock_12m
     transformation_params:
       lookback_months: 12
     output_col: price_cassava_shock
   - raw: price_groundnuts
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: shock_12m
     transformation_params:
       lookback_months: 12
@@ -574,10 +646,12 @@ registry:
   # Food Index & Flags
   - raw: food_price_index
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: none
     output_col: food_price_index
   - raw: food_data_available
     source: Food_Security
+    available_from: "2018-01-31"  # FEWS NET coverage start
     transformation: none
     output_col: food_data_available
 
@@ -605,10 +679,12 @@ registry:
   # Displacement (IOM)
   - raw: iom_displacement_sum
     source: IOM_DTM
+    available_from: "2018-01-31"  # IOM DTM CAR coverage
     transformation: lag_1_step
     output_col: iom_displacement_count_lag1
   - raw: iom_data_available
     source: IOM_DTM
+    available_from: "2018-01-31"  # IOM DTM CAR coverage
     transformation: none
     output_col: iom_data_available
     description: "IOM coverage flag (1 on/after 2018-01-31, else 0)"
@@ -711,6 +787,7 @@ registry:
   # CrisisWatch New Pillars (10-13)
   - name: "Regime Parallel Governance"
     source: "NLP_CrisisWatch"
+    available_from: "2003-08-01"  # CrisisWatch start
     raw: "cw_topic_id"
     transformation: "pivot_topic"
     output_col: "regime_parallel_governance"
@@ -719,6 +796,7 @@ registry:
       value_column: "spatial_confidence_norm"
   - name: "Regime Transnational Predation"
     source: "NLP_CrisisWatch"
+    available_from: "2003-08-01"  # CrisisWatch start
     raw: "cw_topic_id"
     transformation: "pivot_topic"
     output_col: "regime_transnational_predation"
@@ -727,6 +805,7 @@ registry:
       value_column: "spatial_confidence_norm"
   - name: "Regime Guerrilla Fragmentation"
     source: "NLP_CrisisWatch"
+    available_from: "2003-08-01"  # CrisisWatch start
     raw: "cw_topic_id"
     transformation: "pivot_topic"
     output_col: "regime_guerrilla_fragmentation"
@@ -735,6 +814,7 @@ registry:
       value_column: "spatial_confidence_norm"
   - name: "Regime Ethno-Pastoral Rupture"
     source: "NLP_CrisisWatch"
+    available_from: "2003-08-01"  # CrisisWatch start
     raw: "cw_topic_id"
     transformation: "pivot_topic"
     output_col: "regime_ethno_pastoral_rupture"
@@ -745,6 +825,7 @@ registry:
   # CrisisWatch Narrative Velocity
   - name: "Narrative Velocity"
     source: "NLP_CrisisWatch"
+    available_from: "2003-08-01"  # CrisisWatch start
     raw: "cw_topic_id"
     transformation: "pivot_topic"
     output_col: "narrative_velocity_lag1"
@@ -784,42 +865,49 @@ registry:
 
   - name: "Price Maize Recency (days)"
     source: "Food_Security"
+    available_from: "2018-01-31"  # FEWS NET coverage start
     raw: "price_maize_recency_days"
     transformation: "none"
     output_col: "price_maize_recency_days"
 
   - name: "Price Rice Recency (days)"
     source: "Food_Security"
+    available_from: "2018-01-31"  # FEWS NET coverage start
     raw: "price_rice_recency_days"
     transformation: "none"
     output_col: "price_rice_recency_days"
 
   - name: "Price Oil Recency (days)"
     source: "Food_Security"
+    available_from: "2018-01-31"  # FEWS NET coverage start
     raw: "price_oil_recency_days"
     transformation: "none"
     output_col: "price_oil_recency_days"
 
   - name: "Price Sorghum Recency (days)"
     source: "Food_Security"
+    available_from: "2018-01-31"  # FEWS NET coverage start
     raw: "price_sorghum_recency_days"
     transformation: "none"
     output_col: "price_sorghum_recency_days"
 
   - name: "Price Cassava Recency (days)"
     source: "Food_Security"
+    available_from: "2018-01-31"  # FEWS NET coverage start
     raw: "price_cassava_recency_days"
     transformation: "none"
     output_col: "price_cassava_recency_days"
 
   - name: "Price Groundnuts Recency (days)"
     source: "Food_Security"
+    available_from: "2018-01-31"  # FEWS NET coverage start
     raw: "price_groundnuts_recency_days"
     transformation: "none"
     output_col: "price_groundnuts_recency_days"
 
   - name: "Food Price Index Recency (days)"
     source: "Food_Security"
+    available_from: "2018-01-31"  # FEWS NET coverage start
     raw: "food_price_index_recency_days"
     transformation: "none"
     output_col: "food_price_index_recency_days"

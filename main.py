@@ -2,6 +2,9 @@ import sys
 import argparse
 import warnings
 import time
+import subprocess
+import resource
+import gc
 from pathlib import Path
 from datetime import datetime
 from contextlib import contextmanager
@@ -12,6 +15,15 @@ import pyarrow.parquet as pq
 
 from sqlalchemy import text, inspect
 from sqlalchemy.engine import Engine
+
+# ---------------------------------------------------------
+# 1) UTILS & MEMORY
+# ---------------------------------------------------------
+def limit_memory():
+    """Sets an 8GB memory limit for the subprocess to ensure traceable MemoryErrors."""
+    # 8.0 GB in bytes
+    limit = 8_000_000_000
+    resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
 
 # Suppress Google Cloud Python version FutureWarning
 warnings.filterwarnings(
@@ -70,11 +82,13 @@ from pipeline.processing import (
 )
 
 # --- Modeling ---
-from pipeline.modeling import (
-    build_feature_matrix,
-    train_models,
-    generate_predictions,
-)
+# Removed to run in subprocess for memory safety
+# from pipeline.modeling import (
+#     build_feature_matrix,
+#     train_models,
+#     generate_predictions,
+# )
+import gc
 
 # --- Validation ---
 from pipeline.validation import run_assertions
@@ -157,6 +171,45 @@ class CEWPPipeline:
         
         # Unified force_full flag for all dynamic ingests
         self.force_full = getattr(args, 'no_incremental', False)
+
+    def _run_build_matrix_subprocess(self):
+        logger.info(">> Building Feature Matrix (Subprocess Mode)...")
+        cmd = [
+            sys.executable,
+            "-m", "pipeline.modeling.build_feature_matrix",
+            "--start-date", str(self.start_date),
+            "--end-date", str(self.end_date)
+        ]
+        result = subprocess.run(cmd, cwd=str(ROOT_DIR), preexec_fn=limit_memory)
+        if result.returncode != 0:
+            raise RuntimeError(f"Build feature matrix failed with code {result.returncode}")
+        gc.collect()
+
+    def _run_train_models_subprocess(self):
+        logger.info(">> Training Models (Subprocess Mode)...")
+        cmd = [sys.executable, "-m", "pipeline.modeling.train_models"]
+        result = subprocess.run(cmd, cwd=str(ROOT_DIR))
+        if result.returncode != 0:
+            raise RuntimeError(f"Training models failed with code {result.returncode}")
+        gc.collect()
+
+    def _run_predictions_subprocess(self):
+        logger.info(">> Generating Predictions (Subprocess Mode)...")
+        cmd = [sys.executable, "-m", "pipeline.modeling.generate_predictions"]
+        result = subprocess.run(cmd, cwd=str(ROOT_DIR))
+        if result.returncode != 0:
+            raise RuntimeError(f"Generating predictions failed with code {result.returncode}")
+        gc.collect()
+
+    def _run_pruning_subprocess(self):
+        logger.info(">> Stability Pruning (Subprocess Mode)...")
+        cmd = [sys.executable, "-m", "pipeline.modeling.pruning"]
+        result = subprocess.run(cmd, cwd=str(ROOT_DIR))
+        if result.returncode != 0:
+            logger.error(f"⚠️ Pruning subsystem failed with code {result.returncode}")
+            logger.warning("Proceeding with full feature registry.")
+        else:
+            gc.collect()
 
     def setup(self):
         """Initialize DB connection and schema."""
@@ -253,11 +306,17 @@ class CEWPPipeline:
         
         # 1. Conflict Events (The "Target")
         # Pass args with no_incremental attribute set
-        fetch_acled.run(self.configs, self.engine, args=self.args)
+        if self.args.skip_acled:
+            logger.info("Skipping ACLED ingest (per flag).")
+        else:
+            fetch_acled.run(self.configs, self.engine, args=self.args)
 
         # 2. High-Frequency Automated Events (GDELT/IODA)
         # IODA: Pass full_refresh flag
-        fetch_ioda.run(self.configs, self.engine, full_refresh=self.force_full)
+        if self.args.skip_ioda:
+            logger.info("Skipping IODA ingest (per flag).")
+        else:
+            fetch_ioda.run(self.configs, self.engine, full_refresh=self.force_full)
         
         if self.args.skip_gdelt:
             logger.info("Skipping GDELT fetch (per flag).")
@@ -267,24 +326,39 @@ class CEWPPipeline:
 
         # 3. Socio-Economic
         # Food Security: Pass full_refresh flag
-        fetch_food_security.run(self.configs, self.engine, full_refresh=self.force_full)
+        if self.args.skip_food:
+            logger.info("Skipping Food Security ingest (per flag).")
+        else:
+            fetch_food_security.run(self.configs, self.engine, full_refresh=self.force_full)
         
         # Economy: Pass full_refresh flag
-        fetch_economy.run(self.configs, self.engine, full_refresh=self.force_full)
+        if self.args.skip_economy:
+            logger.info("Skipping Economy ingest (per flag).")
+        else:
+            fetch_economy.run(self.configs, self.engine, full_refresh=self.force_full)
         
         # IOM: Pass full_refresh flag
-        fetch_iom.main(full_refresh=self.force_full)
+        if self.args.skip_iom:
+            logger.info("Skipping IOM ingest (per flag).")
+        else:
+            fetch_iom.main(full_refresh=self.force_full)
 
         # 4. Spatial Disaggregation
         logger.info(">> Spatial Disaggregation (Admin -> H3)")
         spatial_disaggregation.run(self.configs, self.engine)
 
         # 5. Environmental Variables (Google Earth Engine)
-        fetch_gee_server_side.run(self.configs, self.engine, args=self.args)
+        if self.args.skip_env:
+            logger.info("Skipping Environmental (GEE) ingest (per flag).")
+        else:
+            fetch_gee_server_side.run(self.configs, self.engine, args=self.args)
 
         # 6. Land Cover (Dynamic World via GEE)
         logger.info(">> Dynamic World Land Cover")
-        fetch_dynamic_world.run(self.configs, self.engine, full_refresh=self.force_full)
+        if self.args.skip_dynamic_world:
+            logger.info("Skipping Dynamic World ingest (per flag).")
+        else:
+            fetch_dynamic_world.run(self.configs, self.engine, full_refresh=self.force_full)
 
         logger.info("✓ Dynamic Ingestion Phase Complete.")
 
@@ -352,12 +426,7 @@ class CEWPPipeline:
             if self.configs["data"].get("validation", {}).get("run_assertions", False):
                 logger.info("Running data contract assertions before building feature matrix...")
                 run_assertions.run_checks()
-            build_feature_matrix.run(
-                self.configs,
-                self.engine,
-                str(self.start_date),
-                str(self.end_date)
-            )
+            self._run_build_matrix_subprocess()
             return "STOP_AFTER_FEATURE_MATRIX"
 
         # Optional collinearity diagnostics before modeling
@@ -367,12 +436,7 @@ class CEWPPipeline:
             if self.configs["data"].get("validation", {}).get("run_assertions", False):
                 logger.info("Running data contract assertions before building feature matrix...")
                 run_assertions.run_checks()
-            build_feature_matrix.run(
-                self.configs,
-                self.engine,
-                str(self.start_date),
-                str(self.end_date)
-            )
+            self._run_build_matrix_subprocess()
             try:
                 from pipeline.processing import collinearity_check
                 collinearity_check.run()
@@ -401,23 +465,20 @@ class CEWPPipeline:
                 run_assertions.run_checks()
 
             # 4.1 Build ABT
-            build_feature_matrix.run(
-                self.configs, 
-                self.engine, 
-                str(self.start_date), 
-                str(self.end_date)
-            )
+            self._run_build_matrix_subprocess()
+
+            # =========================================================
+            # STABILITY PRUNING (Configuration Driven)
+            # =========================================================
+            if getattr(self.args, "run_pruning", False):
+                self._run_pruning_subprocess()
 
             # 4.2 Train Models
-            train_models.run()
+            self._run_train_models_subprocess()
 
-            # 4.3 Generate Predictions (Per Horizon)
-            horizons = self.configs["models"].get("horizons", [{"name": "14d"}])
-            for h in horizons:
-                horizon_name = h["name"]
-                logger.info(f"   > Predicting Horizon: {horizon_name}")
-                sys.argv = ["generate_predictions.py", horizon_name]
-                generate_predictions.main()
+            # 4.3 Generate Predictions (Single orchestrator call)
+            logger.info("   > Generating predictions for all horizons/learners (single orchestrator call)")
+            self._run_predictions_subprocess()
 
     def run_analysis_phase(self):
         """Executes the automated analysis & visualization suite."""
@@ -521,12 +582,7 @@ class CEWPPipeline:
                     if self.configs["data"].get("validation", {}).get("run_assertions", False):
                         logger.info("Running data contract assertions before building feature matrix...")
                         run_assertions.run_checks()
-                    build_feature_matrix.run(
-                        self.configs,
-                        self.engine,
-                        str(self.start_date),
-                        str(self.end_date)
-                    )
+                    self._run_build_matrix_subprocess()
                 return 0
             
             logger.info("=" * 60)
@@ -816,6 +872,13 @@ def parse_args():
     parser.add_argument("--skip-dynamic", action="store_true", help="Skip dynamic ingestion.")
     parser.add_argument("--skip-gdelt", action="store_true", help="Skip all GDELT fetch (Events & Themes).")
     parser.add_argument("--skip-gdelt-themes", action="store_true", help="Skip GDELT themes fetch.")
+    parser.add_argument("--skip-acled", action="store_true", help="Skip ACLED ingest.")
+    parser.add_argument("--skip-ioda", action="store_true", help="Skip IODA ingest.")
+    parser.add_argument("--skip-food", action="store_true", help="Skip Food Security ingest.")
+    parser.add_argument("--skip-economy", action="store_true", help="Skip Economy ingest.")
+    parser.add_argument("--skip-iom", action="store_true", help="Skip IOM ingest.")
+    parser.add_argument("--skip-env", action="store_true", help="Skip environmental (GEE) ingest.")
+    parser.add_argument("--skip-dynamic-world", action="store_true", help="Skip Dynamic World land cover ingest.")
     parser.add_argument("--skip-features", action="store_true", help="Skip feature engineering.")
     parser.add_argument("--skip-context", action="store_true", help="Skip contextual feature engineering (Spine, Economy, Env, etc) and run only Conflict.")
     parser.add_argument("--skip-modeling", action="store_true", help="Skip modeling & predictions.")
@@ -856,6 +919,11 @@ def parse_args():
         "--run-diagnostics-after",
         action="store_true",
         help="After full pipeline (including predictions), automatically run diagnostics."
+    )
+    parser.add_argument(
+        "--run-pruning",
+        action="store_true",
+        help="Run stability-based feature pruning before model training."
     )
     
     # =========================================================================

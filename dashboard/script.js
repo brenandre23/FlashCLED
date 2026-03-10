@@ -24,6 +24,20 @@ const CONFIG = {
 
 const PREDICTION_HORIZONS = ['14d', '1m', '3m'];
 const PREDICTION_LEARNERS = ['xgboost', 'lightgbm'];
+const TOP_PERCENT_CONTEXT = {
+    1: { meaning: 'Absolute weekly priorities.', thesis: null },
+    5: { meaning: 'Critical tier: deploy within 48h.', thesis: 'Recall@5% anchor' },
+    10: { meaning: 'Critical + most of High tier.', thesis: 'Recall@10% = 92.4%' },
+    15: { meaning: 'High-tier ceiling.', thesis: 'Recall@15% anchor' },
+    25: { meaning: 'Between High and Elevated tiers.', thesis: null },
+    30: { meaning: 'Elevated-tier ceiling.', thesis: 'Recall@30% anchor' },
+    50: { meaning: 'Broad situational awareness.', thesis: null }
+};
+const RANK_METRIC_LABELS = {
+    expected_fatalities: 'Expected Fatalities',
+    risk: 'Conflict Probability',
+    uncertainty_width: 'Uncertainty Width'
+};
 // legacy stub to avoid ReferenceError from prior zoom code paths
 const zoomPluginRegistered = false;
 
@@ -89,7 +103,7 @@ const TEMPORAL_FEATURE_COLOR_MAP = {
     era5_temp_anomaly: 'temp',
     era5_soil_moisture_anomaly: 'soil',
     ndvi_anomaly: 'ndvi',
-    nightlights_intensity: 'nightlights',
+    ntl_mean: 'nightlights',
     ntl_peak: 'nightlights',
     ntl_kinetic_delta: 'nightlights',
     ntl_stale_days: 'conflict', // Use grayscale for "staleness"
@@ -103,6 +117,19 @@ const TEMPORAL_FEATURE_COLOR_MAP = {
     protest_count_lag1: 'conflict',
     riot_count_lag1: 'conflict',
     regional_risk_score_lag1: 'conflict',
+    // CrisisWatch & Regime Pillars
+    cw_score_local: 'conflict',
+    regime_parallel_governance: 'gdelt',
+    regime_transnational_predation: 'gdelt',
+    regime_guerrilla_fragmentation: 'gdelt',
+    regime_ethno_pastoral_rupture: 'gdelt',
+    narrative_velocity_lag1: 'gdelt',
+    // ACLED Hybrid Mechanisms
+    mech_gold_pivot_lag1: 'conflict',
+    mech_predatory_tax_lag1: 'conflict',
+    mech_factional_infighting_lag1: 'conflict',
+    mech_collective_punishment_lag1: 'conflict',
+    // Fusion
     cw_onset_amplifier: 'gdelt', // Use hot/active colors for fusion
     cw_mass_casualty_risk: 'gdelt',
     cw_extraction_violence: 'gdelt',
@@ -122,6 +149,46 @@ const TEMPORAL_FEATURE_COLOR_MAP = {
     price_groundnuts: 'market'
 };
 
+// Feature descriptions for UI tooltips
+const FEATURE_DESCRIPTIONS = {
+    // VIIRS
+    ntl_mean: "Gap-filled mean radiance (Infrastructure baseline).",
+    ntl_peak: "Maximum raw radiance (Fire/Explosion proxy).",
+    ntl_stale_days: "Days since last high-quality observation (Uncertainty).",
+    ntl_kinetic_delta: "Peak - Mean radiance (Transient event intensity).",
+    // Landcover
+    landcover_grass: "Fraction of area covered by grassland/savanna.",
+    landcover_crops: "Fraction of area covered by agriculture.",
+    landcover_bare: "Fraction of bare ground (mining proxy).",
+    landcover_built: "Fraction of built-up/urban area.",
+    // Fusion
+    cw_onset_amplifier: "Guerrilla Fragmentation × Wagner presence (Onset risk).",
+    cw_mass_casualty_risk: "Ethno-Pastoral Rupture × Fragmentation (Escalation risk).",
+    cw_extraction_violence: "Parallel Gov × Wagner Risk.",
+    cw_pastoral_predation: "Parallel Gov × Pastoral Rupture.",
+    fusion_gold_signal: "Wagner presence × Gold Pivot mechanism.",
+    fusion_fragmentation_confirmed: "Fragmentation × Factional Infighting.",
+    fusion_escalation_momentum: "Max(Delta, 0) × Mechanism Intensity.",
+    // CrisisWatch & Regime
+    cw_score_local: "Composite CrisisWatch risk score (local).",
+    regime_parallel_governance: "Semantic score for state substitution activities.",
+    regime_transnational_predation: "Semantic score for foreign resource extraction.",
+    regime_guerrilla_fragmentation: "Semantic score for rebel splintering.",
+    regime_ethno_pastoral_rupture: "Semantic score for customary breakdown.",
+    narrative_velocity_lag1: "Rate of semantic change in reporting (Narrative Drift).",
+    // Mechanisms
+    mech_gold_pivot_lag1: "Violence shifting to gold mining sites.",
+    mech_predatory_tax_lag1: "Economic violence (checkpoints, extortion).",
+    mech_factional_infighting_lag1: "Intra-rebel clashes.",
+    mech_collective_punishment_lag1: "Punitive expeditions against civilians.",
+    // Conflict
+    fatalities_14d_sum: "Total fatalities in the last 14 days.",
+    regional_risk_score_lag1: "Log-transformed regional fatality aggregate (Spillover).",
+    // Environmental
+    chirps_precip_anomaly: "Deviation from long-term rainfall climatology.",
+    ndvi_anomaly: "Deviation from long-term vegetation health."
+};
+
 // Static feature allowlist (must match backend allowlist)
 const STATIC_FEATURE_OPTIONS = {
     Distance: [
@@ -137,8 +204,7 @@ const STATIC_FEATURE_OPTIONS = {
         "dist_to_controlled_mine",
         "dist_to_large_gold_mine"
     ],
-    Geographic: ["elevation_mean", "slope_mean", "terrain_ruggedness_index"],
-    Administrative: ["admin1", "admin2", "admin3"]
+    Geographic: ["elevation_mean", "slope_mean", "terrain_ruggedness_index"]
 };
 // Non-spatial temporal features (do not render on map)
 const NON_SPATIAL_TEMPORAL = [
@@ -181,7 +247,10 @@ const COMPARE_FEATURES = [
     "era5_temp_anomaly",
     "era5_soil_moisture_anomaly",
     "ndvi_anomaly",
-    "nightlights_intensity",
+    "ntl_mean",
+    // CrisisWatch
+    "cw_score_local",
+    "narrative_velocity_lag1",
     // Macroeconomics
     "gold_price_usd_lag1",
     "oil_price_usd_lag1",
@@ -199,6 +268,7 @@ let activeCompareFeatures = new Set();
 
 const PRED_FORWARD_ONLY = { enabled: false };
 const PRED_HISTORY_WINDOW = { steps: null }; // null = all
+let temporalRequestSeq = 0;
 
 // =============================================================================
 // STATE MANAGEMENT (Isolated per map)
@@ -215,10 +285,14 @@ const state = {
         showLayer: true,
         showEvents: false,
         opacity: 0.8,
+        topPercent: 5,
+        rankMetric: 'expected_fatalities',
         cube: {},
         cubeLoaded: false,
         horizon: '3m',
-        learner: 'xgboost'
+        learner: 'xgboost',
+        level: 'h3',
+        explanationMode: 'fast'
     },
     
     temporal: {
@@ -232,7 +306,8 @@ const state = {
         stats: { min: 0, max: 1 },
         normalize: false,
         showMax: false,
-        showMin: false
+        showMin: false,
+        level: 'h3'
     },
     
     static: {
@@ -278,6 +353,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (horizonDisplay) horizonDisplay.textContent = state.predictions.horizon;
     const learnerSelect = document.getElementById('pred-learner-select');
     if (learnerSelect) learnerSelect.value = state.predictions.learner;
+    const topPercentSelect = document.getElementById('pred-top-percent');
+    if (topPercentSelect) topPercentSelect.value = String(state.predictions.topPercent);
+    const rankMetricSelect = document.getElementById('pred-rank-metric');
+    if (rankMetricSelect) rankMetricSelect.value = state.predictions.rankMetric;
+    const shapModeCheckbox = document.getElementById('shap-mode-checkbox');
+    const shapModeLabel = document.getElementById('shap-mode-label');
+    if (shapModeCheckbox && shapModeLabel) {
+        shapModeCheckbox.checked = state.predictions.explanationMode === 'fast';
+        shapModeLabel.textContent = shapModeCheckbox.checked ? 'Fast' : 'Standard';
+    }
+    updateTopFilterContext();
     
     // Initialize all three maps
     initializeMap('predictions');
@@ -394,9 +480,11 @@ function buildPredictionQuery(basePath, params = {}) {
     const search = new URLSearchParams();
     const horizon = params.horizon || state.predictions.horizon;
     const learner = params.hasOwnProperty('learner') ? params.learner : state.predictions.learner;
+    const level = params.level || state.predictions.level;
 
     if (horizon) search.append('horizon', horizon);
     if (learner) search.append('learner', learner);
+    if (level) search.append('level', level);
     if (params.date) search.append('date', params.date);
 
     return `${CONFIG.API_URL}${basePath}?${search.toString()}`;
@@ -486,6 +574,11 @@ async function loadPredictionsCube() {
                 hex: row.h3_index,
                 risk: row.risk,
                 fatalities: row.fatal,
+                fatalities_lower: row.fatal_lower,
+                fatalities_upper: row.fatal_upper,
+                uncertainty_width: (row.fatal_upper !== null && row.fatal_lower !== null)
+                    ? (row.fatal_upper - row.fatal_lower)
+                    : null,
                 expected_fatalities: row.expected_fatal
             });
         });
@@ -552,8 +645,10 @@ async function loadTemporalDates() {
 }
 
 async function loadTemporalData() {
+    const requestSeq = ++temporalRequestSeq;
     const feature = state.temporal.feature;
     const date = state.temporal.dates[state.temporal.selectedDateIndex];
+    const level = state.temporal.level;
     if (!date) return;
     const isNonSpatial = NON_SPATIAL_TEMPORAL.includes(feature);
     if (!isNonSpatial && !state.selection.temporal) {
@@ -562,8 +657,9 @@ async function loadTemporalData() {
     }
     
     // Check cache
-    const cacheKey = `${feature}_${date}`;
+    const cacheKey = `${feature}_${date}_${level}`;
     if (state.temporal.cache[cacheKey]) {
+        if (requestSeq !== temporalRequestSeq) return;
         state.temporal.data = state.temporal.cache[cacheKey].data;
         state.temporal.stats = state.temporal.cache[cacheKey].stats;
         renderTemporalLayer();
@@ -572,24 +668,33 @@ async function loadTemporalData() {
     }
     
     try {
-        const res = await fetch(`${CONFIG.API_URL}/temporal_feature?feature=${feature}&date=${date}`);
+        const res = await fetch(`${CONFIG.API_URL}/temporal_feature?feature=${feature}&date=${date}&level=${level}`);
         const data = await res.json();
         
         if (data.error) {
             showToast(data.error, 'error');
             return;
         }
+
+        if (requestSeq !== temporalRequestSeq) return;
+        
+        // Keep deterministic instance ordering so Deck.gl transitions map old->new cells correctly.
+        const sortedData = [...data].sort((a, b) => {
+            const ah = (a.hex || '').toString();
+            const bh = (b.hex || '').toString();
+            return ah.localeCompare(bh);
+        });
         
         // Calculate stats for normalization
-        const values = data.filter(d => d.value !== null).map(d => d.value);
+        const values = sortedData.filter(d => d.value !== null).map(d => d.value);
         // For elevation, keep full min/max so extrusion is continuous across full range
         const stats = feature === 'elevation_mean'
             ? { min: Math.min(...values), max: Math.max(...values) }
             : calculatePercentileStats(values);
         
-        state.temporal.data = data;
+        state.temporal.data = sortedData;
         state.temporal.stats = stats;
-        state.temporal.cache[cacheKey] = { data, stats };
+        state.temporal.cache[cacheKey] = { data: sortedData, stats };
         
         if (isNonSpatial && lastNonSpatialNoticeFeature !== feature) {
             showToast(`${formatFeatureName(feature)} is non-spatial. Map layer hidden; use the trend chart.`, 'info');
@@ -616,12 +721,25 @@ function getComparisonHex() {
     return '855a5a1bfffffff';
 }
 
-async function fetchTemporalSeries(feature, hexOverride = null) {
-    const hex = hexOverride || getComparisonHex();
-    const cacheKey = `${feature}|${hex}`;
+function getTemporalSeriesAnchor(level) {
+    if (state.selection.temporal) return state.selection.temporal;
+    if (state.temporal.data && state.temporal.data.length) {
+        if (level !== 'h3') {
+            return state.temporal.data[0].admin_name || null;
+        }
+        return state.temporal.data[0].hex || null;
+    }
+    return level === 'h3' ? getComparisonHex() : null;
+}
+
+async function fetchTemporalSeries(feature, hexOverride = null, levelOverride = null) {
+    const level = levelOverride || state.temporal.level;
+    const anchor = hexOverride || getTemporalSeriesAnchor(level);
+    if (!anchor) return null;
+    const cacheKey = `${feature}|${anchor}|${level}`;
     if (SERIES_CACHE[cacheKey]) return SERIES_CACHE[cacheKey];
     try {
-        const res = await fetch(`${CONFIG.API_URL}/analytics/temporal/hex/${hex}?feature=${feature}`);
+        const res = await fetch(`${CONFIG.API_URL}/analytics/temporal/hex/${encodeURIComponent(anchor)}?feature=${feature}&level=${level}`);
         const data = await res.json();
         if (data.error || !data.history) return null;
         SERIES_CACHE[cacheKey] = data.history;
@@ -634,14 +752,26 @@ async function fetchTemporalSeries(feature, hexOverride = null) {
 
 async function fetchTemporalSummary(feature) {
     if (SUMMARY_CACHE[feature]) return SUMMARY_CACHE[feature];
+    const level = state.temporal.level;
     try {
-        const res = await fetch(`${CONFIG.API_URL}/analytics/temporal/summary?feature=${feature}`);
+        const res = await fetch(`${CONFIG.API_URL}/analytics/temporal/summary?feature=${feature}&level=${level}`);
         const data = await res.json();
         if (data.error) return null;
-        SUMMARY_CACHE[feature] = data;
+        // Don't cache here if we want level-sensitivity, or cache by level
+        // For simplicity, we just won't cache summary if level changes frequently
         return data;
     } catch (e) {
         console.error('Failed to fetch temporal summary', feature, e);
+        return null;
+    }
+}
+
+async function fetchParentAdminName(subName) {
+    try {
+        const res = await fetch(`${CONFIG.API_URL}/admin/parent?subprefecture=${encodeURIComponent(subName)}`);
+        const data = await res.json();
+        return data.prefecture;
+    } catch (e) {
         return null;
     }
 }
@@ -661,21 +791,38 @@ async function fetchStaticSnapshot(hex) {
 function buildChunkSeries(history, labels) {
     if (!history || !history.dates) return { values: [] };
     const map = {};
+    const norm = d => (d === null || d === undefined) ? null : String(d).slice(0, 10);
     for (let i = 0; i < history.dates.length; i++) {
-        map[history.dates[i]] = history.values[i];
+        const key = norm(history.dates[i]);
+        if (key) map[key] = history.values[i];
     }
     return {
-        values: labels.map(d => map[d] ?? null)
+        values: labels.map(d => map[norm(d)] ?? null)
     };
 }
 
 function normalizeSeries(values) {
     const vals = values.slice();
-    const firstIdx = vals.findIndex(v => v !== null && v !== undefined);
-    if (firstIdx === -1) return vals;
-    const base = vals[firstIdx];
-    if (base === 0) return vals;
-    return vals.map(v => (v === null || v === undefined) ? null : (v - base) / Math.abs(base));
+    const valid = vals.filter(v => v !== null && v !== undefined);
+    if (valid.length === 0) return vals;
+    
+    const min = Math.min(...valid);
+    const max = Math.max(...valid);
+    
+    // Logic: If data crosses zero or is negative (anomalies/deltas), preserve 0 using MaxAbs scaling.
+    // If data is strictly positive (prices/counts), use MinMax to stretch trend to 0-1.
+    
+    if (min < 0) {
+        // Zero-centered or negative data -> MaxAbs scaling [-1, 1]
+        const absMax = Math.max(Math.abs(min), Math.abs(max));
+        if (absMax === 0) return vals.map(v => (v !== null && v !== undefined) ? 0 : null);
+        return vals.map(v => (v === null || v === undefined) ? null : v / absMax);
+    } else {
+        // Positive data -> MinMax scaling [0, 1]
+        const range = max - min;
+        if (range === 0) return vals.map(v => (v !== null && v !== undefined) ? 0.5 : null); // flat line centered
+        return vals.map(v => (v === null || v === undefined) ? null : (v - min) / range);
+    }
 }
 
 function buildLineChart(ctx, datasets, labels) {
@@ -736,14 +883,14 @@ async function refreshTrendChart() {
 
     const colors = ['#f39c12', '#27ae60', '#2980b9', '#8e44ad', '#e74c3c', '#16a085'];
     const datasets = [];
-    let labels = datesWindow;
+    let labels = datesWindow.map(d => String(d).slice(0, 10));
 
     const mainHist = await fetchTemporalSeries(mainFeature);
     const mainSeries = buildChunkSeries(mainHist, labels);
     trendMarkerIndex = null;
     trendLabels = labels;
     if (mainSeries.values.length) {
-        const markerIdx = labels.indexOf(date);
+        const markerIdx = labels.indexOf(String(date).slice(0, 10));
         trendMarkerIndex = markerIdx >= 0 ? markerIdx : labels.length - 1;
         datasets.push({
             label: formatFeatureName(mainFeature),
@@ -775,22 +922,42 @@ async function refreshTrendChart() {
         }
     }
 
-    // Selected cell overlay
+    // Selected cell/admin overlay
     if (state.selection.temporal) {
         const selHex = state.selection.temporal;
-        const selHist = await fetchTemporalSeries(mainFeature, selHex);
+        const selLevel = state.temporal.level;
+        const selHist = await fetchTemporalSeries(mainFeature, selHex, selLevel);
         const selSeries = buildChunkSeries(selHist, labels);
         const nonNull = selSeries.values.filter(v => v !== null);
         if (nonNull.length >= 2) {
             datasets.push({
-                label: `Selected Hex (${selHex.slice(0, 6)}…)`,
+                label: `Selected ${formatFeatureName(selLevel)} (${selHex.slice(0, 8)}…)`,
                 data: normalize ? normalizeSeries(selSeries.values) : selSeries.values,
                 borderColor: '#ff4b4b',
                 backgroundColor: 'transparent',
                 tension: 0.3,
-                pointRadius: 0,
-                borderDash: [2, 2]
+                pointRadius: 0
             });
+        }
+
+        // Hierarchical Comparison: if Subprefecture selected, overlay Prefecture trend
+        if (selLevel === 'subprefecture') {
+            const parentName = await fetchParentAdminName(selHex);
+            if (parentName) {
+                const parentHist = await fetchTemporalSeries(mainFeature, parentName, 'prefecture');
+                const parentSeries = buildChunkSeries(parentHist, labels);
+                if (parentSeries.values.filter(v => v !== null).length >= 2) {
+                    datasets.push({
+                        label: `Parent Prefecture (${parentName})`,
+                        data: normalize ? normalizeSeries(parentSeries.values) : parentSeries.values,
+                        borderColor: '#00e5ff',
+                        backgroundColor: 'transparent',
+                        tension: 0.3,
+                        pointRadius: 0,
+                        borderDash: [5, 5]
+                    });
+                }
+            }
         }
     }
 
@@ -801,7 +968,8 @@ async function refreshTrendChart() {
             if (summary && summary.dates) {
                 const summaryMap = {};
                 summary.dates.forEach((d, idx) => {
-                    summaryMap[d] = { max: summary.max[idx], min: summary.min[idx] };
+                    const key = String(d).slice(0, 10);
+                    summaryMap[key] = { max: summary.max[idx], min: summary.min[idx] };
                 });
                 const maxVals = labels.map(d => summaryMap[d]?.max ?? null);
                 const minVals = labels.map(d => summaryMap[d]?.min ?? null);
@@ -824,16 +992,17 @@ async function refreshTrendChart() {
         }
 
         if (trendChart) trendChart.destroy();
-        trendChart = buildLineChart(trendCanvas, datasets, labels.map(d => d.slice(0, 10)));
+        trendChart = buildLineChart(trendCanvas, datasets, labels);
     }
 }
 
 function updateTrendMarker(date) {
+    const dateKey = String(date).slice(0, 10);
     // If current date is outside the active window, refresh the chart for the new chunk
-    if (!trendLabels.length || trendLabels.indexOf(date) === -1) {
+    if (!trendLabels.length || trendLabels.indexOf(dateKey) === -1) {
         return refreshTrendChart();
     }
-    const idx = trendLabels.indexOf(date);
+    const idx = trendLabels.indexOf(dateKey);
     trendMarkerIndex = idx >= 0 ? idx : trendLabels.length - 1;
     if (trendChart) trendChart.update('none');
 }
@@ -904,25 +1073,95 @@ async function loadStaticData() {
 // RENDERING: PREDICTIONS (Map 1)
 // =============================================================================
 
+function getPredictionRankValue(row, metric) {
+    if (!row) return null;
+    if (metric === 'worst_case') {
+        if (row.fatalities_upper !== undefined && row.fatalities_upper !== null) return row.fatalities_upper;
+        if (row.expected_fatalities !== undefined && row.expected_fatalities !== null) return row.expected_fatalities;
+        return row.fatalities ?? null;
+    }
+    if (metric === 'expected_fatalities') return row.expected_fatalities ?? null;
+    if (metric === 'risk') return row.risk ?? null;
+    if (metric === 'uncertainty_width') {
+        if (row.uncertainty_width !== undefined && row.uncertainty_width !== null) return row.uncertainty_width;
+        if (
+            row.fatalities_upper !== undefined && row.fatalities_upper !== null &&
+            row.fatalities_lower !== undefined && row.fatalities_lower !== null
+        ) {
+            return row.fatalities_upper - row.fatalities_lower;
+        }
+        return null;
+    }
+    return row.expected_fatalities ?? row.risk ?? null;
+}
+
+function rankAndFilterPredictionData(data) {
+    if (!Array.isArray(data) || data.length === 0) return [];
+
+    const metric = state.predictions.rankMetric;
+    const pct = Math.max(1, Math.min(50, parseInt(state.predictions.topPercent, 10) || 5));
+    const total = data.length;
+    const keepN = Math.max(1, Math.ceil(total * (pct / 100)));
+
+    const ranked = data.map(d => {
+        const score = getPredictionRankValue(d, metric);
+        return {
+            ...d,
+            _rankScore: (score === null || score === undefined || Number.isNaN(score)) ? Number.NEGATIVE_INFINITY : Number(score)
+        };
+    }).sort((a, b) => b._rankScore - a._rankScore);
+
+    const selected = ranked.slice(0, keepN).map((d, idx) => ({
+        ...d,
+        _rank: idx + 1,
+        _isTop20: idx < 20
+    }));
+
+    updateTopFilterContext(total, selected.length);
+    return selected;
+}
+
+function updateTopFilterContext(totalCells = null, shownCells = null) {
+    const contextEl = document.getElementById('pred-top-context');
+    if (!contextEl) return;
+    const pct = Math.max(1, Math.min(50, parseInt(state.predictions.topPercent, 10) || 5));
+    const meta = TOP_PERCENT_CONTEXT[pct] || { meaning: 'Operational focus subset.', thesis: null };
+    const metric = RANK_METRIC_LABELS[state.predictions.rankMetric] || state.predictions.rankMetric;
+    const volume = (totalCells !== null && shownCells !== null) ? ` Showing ${shownCells}/${totalCells} cells.` : '';
+    const thesis = meta.thesis ? ` ${meta.thesis}.` : '';
+    contextEl.textContent = `Top ${pct}% by ${metric}. ${meta.meaning}${thesis}${volume}`;
+}
+
 function renderPredictionsLayer() {
     if (!deckOverlays.predictions) return;
     
     const layers = [];
     
     if (state.predictions.showLayer && state.predictions.data) {
+        const filteredData = rankAndFilterPredictionData(state.predictions.data);
+
         layers.push(new deck.H3HexagonLayer({
             id: 'predictions-layer',
-            data: state.predictions.data,
+            data: filteredData,
             pickable: true,
             filled: true,
             extruded: true,
+            stroked: true,
             getHexagon: d => d.hex,
             getFillColor: d => getPredictionColor(d.risk),
-            getElevation: d => (d.fatalities || 0) * 500,
+            getLineColor: d => d._isTop20 ? [255, 215, 0, 220] : (d.is_priority ? [255, 204, 0, 200] : [255, 255, 255, 30]),
+            getLineWidth: d => d._isTop20 ? 120 : (d.is_priority ? 60 : 20),
+            lineWidthUnits: 'meters',
+            // Boost elevation for visibility (low fatalities need high multiplier)
+            getElevation: d => (d.fatalities || 0) * 50000, 
             elevationScale: 1,
             opacity: state.predictions.opacity,
             material: { ambient: 0.6, diffuse: 0.6, shininess: 32, specularColor: [51, 51, 51] },
-            transitions: { getFillColor: { duration: 300 }, getElevation: { duration: 300 } },
+            transitions: { 
+                getFillColor: { duration: 300 }, 
+                getElevation: { duration: 300 },
+                getLineWidth: { duration: 300 }
+            },
             onClick: info => handlePredictionClick(info),
             onHover: info => updateTooltip('predictions', info)
         }));
@@ -953,7 +1192,8 @@ function getPredictionColor(risk) {
     
     const ramp = COLOR_RAMPS.predictions;
     // Stretch low values to improve visual contrast for small risks
-    const stretched = Math.pow(Math.max(0, Math.min(1, risk)), 0.35);
+    // Changed exponent from 0.35 to 0.25 to make low values pop even more
+    const stretched = Math.pow(Math.max(0, Math.min(1, risk)), 0.25);
     const t = Math.max(0, Math.min(1, stretched));
     const idx = t * (ramp.length - 1);
     const lo = Math.floor(idx);
@@ -964,7 +1204,7 @@ function getPredictionColor(risk) {
         Math.round(ramp[lo][0] + frac * (ramp[hi][0] - ramp[lo][0])),
         Math.round(ramp[lo][1] + frac * (ramp[hi][1] - ramp[lo][1])),
         Math.round(ramp[lo][2] + frac * (ramp[hi][2] - ramp[lo][2])),
-        200
+        230 // Increased opacity from 200 to 230
     ];
 }
 
@@ -1053,6 +1293,25 @@ function updateTemporalLegend() {
     document.getElementById('temporal-legend-title').textContent = formatFeatureName(feature);
     document.getElementById('temporal-legend-min').textContent = formatValue(min);
     document.getElementById('temporal-legend-max').textContent = formatValue(max);
+    
+    // Show description if available
+    const desc = FEATURE_DESCRIPTIONS[feature];
+    const legendContainer = document.getElementById('temporal-legend');
+    let descEl = document.getElementById('temporal-legend-desc');
+    
+    if (desc) {
+        if (!descEl) {
+            descEl = document.createElement('p');
+            descEl.id = 'temporal-legend-desc';
+            descEl.className = 'small muted';
+            descEl.style.marginTop = '8px';
+            descEl.style.lineHeight = '1.3';
+            legendContainer.appendChild(descEl);
+        }
+        descEl.textContent = desc;
+    } else if (descEl) {
+        descEl.remove();
+    }
     
     // Update gradient
     const rampKey = TEMPORAL_FEATURE_COLOR_MAP[feature] || 'default';
@@ -1211,6 +1470,24 @@ function updateStaticLegend() {
     document.getElementById('static-legend-title').textContent = formatFeatureName(feature);
     document.getElementById('static-legend-min').textContent = formatValue(min);
     document.getElementById('static-legend-max').textContent = formatValue(max);
+
+    // Dynamic gradient update
+    let ramp;
+    if (STATIC_DISTANCE_FEATURES.has(feature)) {
+        ramp = COLOR_RAMPS.static_distance;
+    } else {
+        ramp = COLOR_RAMPS.static;
+    }
+
+    const gradientStops = ramp.map((rgb, i) => {
+        const pct = (i / (ramp.length - 1)) * 100;
+        return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]}) ${pct}%`;
+    }).join(', ');
+
+    const legendEl = document.querySelector('.static-gradient');
+    if (legendEl) {
+        legendEl.style.background = `linear-gradient(to right, ${gradientStops})`;
+    }
 }
 
 // =============================================================================
@@ -1228,9 +1505,15 @@ async function handlePredictionClick({ object }) {
     try {
         const params = new URLSearchParams({ horizon: state.predictions.horizon });
         if (state.predictions.learner) params.append('learner', state.predictions.learner);
+        
+        // Add mode for SHAP
+        const explainParams = new URLSearchParams(params);
+        explainParams.append('hex', object.hex);
+        if (state.predictions.explanationMode) explainParams.append('mode', state.predictions.explanationMode);
+        
         const [historyRes, explainRes] = await Promise.all([
             fetch(`${CONFIG.API_URL}/analytics/prediction/hex/${object.hex}?${params.toString()}`),
-            fetch(`${CONFIG.API_URL}/analytics/prediction/hex/${object.hex}/explanations?${params.toString()}`)
+            fetch(`${CONFIG.API_URL}/predictions/shap?${explainParams.toString()}`)
         ]);
         if (!historyRes.ok || !explainRes.ok) throw new Error('Prediction fetch failed');
         const historyData = await historyRes.json();
@@ -1255,9 +1538,14 @@ async function refreshPredictionSelection() {
     if (state.predictions.learner) params.append('learner', state.predictions.learner);
     if (PRED_FORWARD_ONLY.enabled) params.append('forward_only', 'true');
     try {
+        // Add mode for SHAP
+        const explainParams = new URLSearchParams(params);
+        explainParams.append('hex', hex);
+        if (state.predictions.explanationMode) explainParams.append('mode', state.predictions.explanationMode);
+
         const [historyRes, explainRes] = await Promise.all([
             fetch(`${CONFIG.API_URL}/analytics/prediction/hex/${hex}?${params.toString()}`),
-            fetch(`${CONFIG.API_URL}/analytics/prediction/hex/${hex}/explanations?${params.toString()}`)
+            fetch(`${CONFIG.API_URL}/predictions/shap?${explainParams.toString()}`)
         ]);
         if (!historyRes.ok || !explainRes.ok) throw new Error('Prediction fetch failed');
         const historyData = await historyRes.json();
@@ -1275,12 +1563,26 @@ async function refreshPredictionSelection() {
 
 function renderPredictionInspector(data, object, explainData) {
     const content = document.getElementById('pred-inspector-content');
+    const lower = (object.fatalities_lower !== undefined && object.fatalities_lower !== null) ? object.fatalities_lower : null;
+    const upper = (object.fatalities_upper !== undefined && object.fatalities_upper !== null) ? object.fatalities_upper : null;
+    const width = (object.uncertainty_width !== undefined && object.uncertainty_width !== null)
+        ? object.uncertainty_width
+        : ((upper !== null && lower !== null) ? (upper - lower) : null);
+    const rankScore = getPredictionRankValue(object, state.predictions.rankMetric);
     
     content.innerHTML = `
         <div class="inspector-meta">
             <span class="label">H3:</span>
             <span class="mono">${object.hex.toString().substring(0, 12)}...</span>
         </div>
+        <div class="inspector-meta">
+            <span class="label">Rank:</span>
+            <span class="mono">#${object._rank || '-'}</span>
+        </div>
+        ${object.is_priority ? `
+        <div class="inspector-badge priority">
+            <i data-feather="alert-circle"></i> PRIORITY TARGET (Top 15)
+        </div>` : ''}
         <div class="inspector-meta">
             <span class="label">Horizon:</span>
             <span class="mono">${state.predictions.horizon}</span>
@@ -1307,14 +1609,62 @@ function renderPredictionInspector(data, object, explainData) {
                     return (exp || 0).toFixed(2);
                 })()}</span>
             </div>
+            <div class="stat-card">
+                <span class="stat-label">Uncertainty Width</span>
+                <span class="stat-value">${width !== null ? width.toFixed(2) : 'n/a'}</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Rank Score (${RANK_METRIC_LABELS[state.predictions.rankMetric] || state.predictions.rankMetric})</span>
+                <span class="stat-value">${(rankScore !== null && rankScore !== undefined) ? Number(rankScore).toFixed(2) : 'n/a'}</span>
+            </div>
+        </div>
+        <div style="margin-top:12px;">
+            <button class="btn tiny full-width" id="pred-download-csv">
+                <i data-feather="download"></i> Download History CSV
+            </button>
         </div>
     `;
+    
+    // Attach download handler
+    setTimeout(() => {
+        const btn = document.getElementById('pred-download-csv');
+        if (btn && data.history) {
+            btn.addEventListener('click', () => downloadHistoryCSV(object.hex, data.history));
+            if (window.feather) feather.replace();
+        }
+    }, 0);
     
     if (data.history && data.history.dates.length > 0) {
         renderPredictionTrend(data.history);
     }
 
     renderPredictionExplanations(explainData);
+}
+
+function downloadHistoryCSV(hex, history) {
+    if (!history || !history.dates) return;
+    
+    const rows = [['Date', 'Risk', 'Predicted_Fatalities', 'Lower_BCCP', 'Upper_BCCP', 'Expected_Fatalities', 'Actual_Fatalities']];
+    history.dates.forEach((date, i) => {
+        rows.push([
+            date,
+            history.risk[i] ?? '',
+            history.fatalities[i] ?? '',
+            history.fatalities_lower ? (history.fatalities_lower[i] ?? '') : '',
+            history.fatalities_upper ? (history.fatalities_upper[i] ?? '') : '',
+            history.expected_fatalities[i] ?? '',
+            history.actual_fatalities ? (history.actual_fatalities[i] ?? '') : ''
+        ]);
+    });
+    
+    const csvContent = "data:text/csv;charset=utf-8," + rows.map(e => e.join(",")).join("\n");
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `prediction_history_${hex}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
 }
 
 async function fetchActualFatalHistory(hex, dateLabels) {
@@ -1342,6 +1692,7 @@ function renderPredictionTrend(history) {
     let dates = history.dates.map(d => d.slice(0, 10));
     let risk = history.risk || [];
     let predFatal = history.fatalities || [];
+    let upperFatal = history.fatalities_upper || [];
     let expectedFatal = history.expected_fatalities || [];
     let actualFatal = history.actual_fatalities || [];
     const forwardOnly = PRED_FORWARD_ONLY.enabled;
@@ -1354,11 +1705,13 @@ function renderPredictionTrend(history) {
             dates = dates.slice(idx, idx + TREND_WINDOW_STEPS);
             risk = risk.slice(idx, idx + TREND_WINDOW_STEPS);
             predFatal = predFatal.slice(idx, idx + TREND_WINDOW_STEPS);
+            upperFatal = upperFatal.slice(idx, idx + TREND_WINDOW_STEPS);
             expectedFatal = expectedFatal.slice(idx, idx + TREND_WINDOW_STEPS);
         } else {
             dates = [];
             risk = [];
             predFatal = [];
+            upperFatal = [];
             expectedFatal = [];
         }
         actualFatal = [];
@@ -1373,6 +1726,7 @@ function renderPredictionTrend(history) {
             dates = dates.slice(start);
             risk = risk.slice(start);
             predFatal = predFatal.slice(start);
+            upperFatal = upperFatal.slice(start);
             expectedFatal = expectedFatal.slice(start);
             actualFatal = actualFatal.slice(start);
             if (trendMarkerIndex !== null) {
@@ -1405,6 +1759,16 @@ function renderPredictionTrend(history) {
             borderColor: '#ffa0bf',
             backgroundColor: 'transparent',
             tension: 0.3,
+            pointRadius: 0,
+            yAxisID: 'y1'
+        },
+        {
+            label: 'BCCP Upper',
+            data: upperFatal,
+            borderColor: '#f59e0b',
+            backgroundColor: 'transparent',
+            borderDash: [4, 4],
+            tension: 0.25,
             pointRadius: 0,
             yAxisID: 'y1'
         }
@@ -1441,25 +1805,59 @@ function renderPredictionTrend(history) {
 function renderPredictionExplanations(explainData) {
     const container = document.getElementById('pred-explain');
     if (!container) return;
-    if (!explainData || explainData.error || !explainData.explanations) {
+    
+    // Support both new "top_features" and legacy "explanations"
+    const groups = explainData.top_features || explainData.explanations;
+    
+    if (!explainData || explainData.error || !groups || !groups.length) {
         container.innerHTML = '<p class="muted">No explanations available</p>';
         if (predExplainChart) predExplainChart.destroy();
         predExplainChart = null;
         return;
     }
 
-    const groups = explainData.explanations;
-    if (!groups.length) {
-        container.innerHTML = '<p class="muted">No explanations available</p>';
-        if (predExplainChart) predExplainChart.destroy();
-        predExplainChart = null;
-        return;
-    }
+    // Map new format (feature/value) or legacy (group/contribution)
+    const labels = groups.map(g => g.feature || g.group);
+    const values = groups.map(g => g.value !== undefined ? g.value : (g.contribution || 0));
+    
+    // Theme color mapping for both UI and Chart
+    const themeColors = {
+        'environment': '#4caf50',
+        'past_conflict': '#f44336',
+        'markets': '#ff9800',
+        'nlp': '#9c27b0',
+        'displacement': '#2196f3',
+        'other': '#6b7a9a'
+    };
 
-    const labels = groups.map(g => g.group);
-    const values = groups.map(g => g.contribution || 0);
+    // Build prominent text list
+    let listHtml = '<ul class="explain-list">';
+    groups.slice(0, 5).forEach((g, i) => {
+        const theme = g.theme || 'other';
+        const val = g.value !== undefined ? g.value : (g.contribution || 0);
+        const feature = g.feature || g.group;
+        const colorClass = val >= 0 ? 'pos' : 'neg';
+        const sign = val >= 0 ? '+' : '';
+        
+        listHtml += `
+            <li class="explain-item theme-${theme}">
+                <div class="explain-main">
+                    <span class="explain-feature">${feature.replace(/_/g, ' ')}</span>
+                    <span class="explain-theme" style="background:${themeColors[theme]}22; color:${themeColors[theme]}">${theme}</span>
+                </div>
+                <span class="explain-value ${colorClass}">${sign}${val.toFixed(3)}</span>
+            </li>
+        `;
+    });
+    listHtml += '</ul>';
 
-    container.innerHTML = '<canvas id="pred-explain-chart" height="220"></canvas>';
+    container.innerHTML = `
+        ${listHtml}
+        <div style="height: 200px; position: relative;">
+            <canvas id="pred-explain-chart"></canvas>
+        </div>
+    `;
+
     const ctx = document.getElementById('pred-explain-chart');
     if (predExplainChart) predExplainChart.destroy();
 
@@ -1470,16 +1868,43 @@ function renderPredictionExplanations(explainData) {
             datasets: [{
                 label: 'Contribution',
                 data: values,
-                backgroundColor: values.map(v => v >= 0 ? '#4caf50' : '#e53935')
+                backgroundColor: groups.map((g, i) => {
+                    // Use theme color if available, otherwise fallback to pos/neg
+                    const theme = g.theme || 'other';
+                    if (themeColors[theme]) return themeColors[theme];
+                    return values[i] >= 0 ? '#ef5350' : '#66bb6a'; 
+                }),
+                borderRadius: 4
             }]
         },
         options: {
+            indexAxis: 'y',
             responsive: true,
             maintainAspectRatio: false,
-            plugins: { legend: { display: false } },
+            plugins: { 
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: (ctx) => `Contribution: ${ctx.raw.toFixed(4)}`
+                    }
+                }
+            },
             scales: {
-                x: { ticks: { color: '#666', font: { size: 10 } }, grid: { display: false } },
-                y: { ticks: { color: '#666', font: { size: 9 } }, grid: { display: true } }
+                x: { 
+                    ticks: { color: '#6b7a9a', font: { size: 9 } }, 
+                    grid: { color: 'rgba(255,255,255,0.05)' } 
+                },
+                y: { 
+                    ticks: { 
+                        color: '#f0f4fc', 
+                        font: { size: 10, weight: '500' },
+                        callback: function(val, index) {
+                            const label = this.getLabelForValue(val);
+                            return label.length > 20 ? label.substring(0, 18) + '...' : label;
+                        }
+                    }, 
+                    grid: { display: false } 
+                }
             }
         }
     });
@@ -1488,14 +1913,23 @@ function renderPredictionExplanations(explainData) {
 async function handleTemporalClick({ object }) {
     if (!object) return;
     
-    state.selection.temporal = object.hex;
+    // Store either admin name or hex string
+    state.selection.temporal = object.admin_name || object.hex;
     const content = document.getElementById('temporal-inspector-content');
     
+    const label = object.admin_name ? formatFeatureName(state.temporal.level) : "H3";
+    const value_str = object.admin_name || object.hex.toString().substring(0, 12) + "...";
+
     content.innerHTML = `
         <div class="inspector-meta">
-            <span class="label">H3:</span>
-            <span class="mono">${object.hex.toString().substring(0, 12)}...</span>
+            <span class="label">${label}:</span>
+            <span class="mono">${value_str}</span>
         </div>
+        ${object.coverage ? `
+        <div class="inspector-meta">
+            <span class="label">Coverage:</span>
+            <span class="mono">${(object.coverage * 100).toFixed(1)}%</span>
+        </div>` : ''}
         <div class="inspector-stats">
             <div class="stat-card">
                 <span class="stat-label">${formatFeatureName(state.temporal.feature)}</span>
@@ -1504,7 +1938,7 @@ async function handleTemporalClick({ object }) {
         </div>
     `;
     
-    // Add selected cell signature to trend chart
+    // Add selected signature to trend chart
     await refreshTrendChart();
 }
 
@@ -1546,6 +1980,14 @@ function setupEventListeners() {
             await loadPredictionsData();
         });
     }
+
+    const predLevelSelect = document.getElementById('pred-level-select');
+    if (predLevelSelect) {
+        predLevelSelect.addEventListener('change', async e => {
+            state.predictions.level = e.target.value;
+            await loadPredictionsData();
+        });
+    }
     
     document.getElementById('pred-show-layer').addEventListener('change', e => {
         state.predictions.showLayer = e.target.checked;
@@ -1562,6 +2004,34 @@ function setupEventListeners() {
         state.predictions.opacity = parseFloat(e.target.value);
         renderPredictionsLayer();
     });
+
+    const topPercentSelect = document.getElementById('pred-top-percent');
+    if (topPercentSelect) {
+        topPercentSelect.addEventListener('change', e => {
+            state.predictions.topPercent = parseInt(e.target.value, 10);
+            updateTopFilterContext();
+            renderPredictionsLayer();
+        });
+    }
+
+    const rankMetricSelect = document.getElementById('pred-rank-metric');
+    if (rankMetricSelect) {
+        rankMetricSelect.addEventListener('change', e => {
+            state.predictions.rankMetric = e.target.value;
+            updateTopFilterContext();
+            renderPredictionsLayer();
+        });
+    }
+
+    const shapModeCheckbox = document.getElementById('shap-mode-checkbox');
+    const shapModeLabel = document.getElementById('shap-mode-label');
+    if (shapModeCheckbox && shapModeLabel) {
+        shapModeCheckbox.addEventListener('change', () => {
+            state.predictions.explanationMode = shapModeCheckbox.checked ? 'fast' : 'standard';
+            shapModeLabel.textContent = shapModeCheckbox.checked ? 'Fast' : 'Standard';
+            refreshPredictionSelection();
+        });
+    }
     
     document.getElementById('pred-clear-selection').addEventListener('click', () => {
         state.selection.predictions = null;
@@ -1593,6 +2063,14 @@ function setupEventListeners() {
     }
     
     // --- Temporal Controls ---
+    const temporalLevelSelect = document.getElementById('temporal-level-select');
+    if (temporalLevelSelect) {
+        temporalLevelSelect.addEventListener('change', async e => {
+            state.temporal.level = e.target.value;
+            await loadTemporalData();
+        });
+    }
+
     document.getElementById('temporal-feature-select').addEventListener('change', async e => {
         state.temporal.feature = e.target.value;
         stopTemporalPlayback();
@@ -1876,7 +2354,8 @@ function updateTooltip(mapId, { object, x, y }) {
             const exp = (object.expected_fatalities !== undefined && object.expected_fatalities !== null)
                 ? object.expected_fatalities
                 : (object.risk || 0) * (object.fatalities || 0);
-            content = `<strong>Risk:</strong> ${((object.risk || 0) * 100).toFixed(1)}%<br><strong>Fatalities:</strong> ${(object.fatalities || 0).toFixed(1)}<br><strong>Expected:</strong> ${(exp || 0).toFixed(2)}`;
+            const metricScore = getPredictionRankValue(object, state.predictions.rankMetric);
+            content = `<strong>Rank:</strong> #${object._rank || '-'}<br><strong>Risk:</strong> ${((object.risk || 0) * 100).toFixed(1)}%<br><strong>Fatalities:</strong> ${(object.fatalities || 0).toFixed(1)}<br><strong>Expected:</strong> ${(exp || 0).toFixed(2)}${metricScore !== null && metricScore !== undefined ? `<br><strong>Rank Score:</strong> ${Number(metricScore).toFixed(2)}` : ''}`;
         } else {
             content = `<strong>Value:</strong> ${formatValue(object.value)}`;
         }

@@ -25,8 +25,12 @@ Updated: 2026-01-25
 
 import sys
 import json
+import argparse
+import gc
 import pandas as pd
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 from pathlib import Path
 from typing import Dict, List, Tuple, Set, Any, Optional
 from sqlalchemy import text, Engine
@@ -39,6 +43,7 @@ if "utils" not in sys.modules:
     sys.path.append(str(ROOT_DIR))
 
 from utils import logger, PATHS, get_db_engine, load_configs, SCHEMA, ensure_h3_int64, validate_h3_types
+from pipeline.modeling.load_data_utils import sanitize_dataframe
 
 
 # ==============================================================================
@@ -167,6 +172,7 @@ def classify_features(
     taxonomy_alias_map: Optional[Dict[str, str]] = None
 ) -> Tuple[List[str], List[str], List[str]]:
     """Classify features by source table (temporal, static, or hybrid)."""
+
     temporal_cols = _table_columns(engine, SCHEMA, "temporal_features")
     static_cols = _table_columns(engine, SCHEMA, "features_static")
     hybrid_cols = _table_columns(engine, SCHEMA, "features_acled_hybrid")
@@ -198,41 +204,20 @@ def classify_features(
 
 
 def build_dynamic_query(
-    start_date: str, 
-    end_date: str, 
-    temp_cols: List[str], 
-    static_cols: List[str], 
+    start_date: str,
+    end_date: str,
+    temp_cols: List[str],
+    static_cols: List[str],
     horizons: List[Dict[str, Any]]
 ) -> str:
-    """Constructs SQL query dynamically handling Targets and Joins."""
+    """Constructs SQL query. No LEAD window functions — targets computed Python-side."""
     all_selects = temp_cols + static_cols
     select_sql = ",\n        ".join(all_selects)
-    
-    # Target Generation (Dynamic LEADs)
-    target_clauses = []
-    for h in horizons:
-        steps = h["steps"]
-        # Fatality count target
-        target_clauses.append(
-            f"LEAD(t.fatalities_14d_sum, {steps}) "
-            f"OVER (PARTITION BY t.h3_index ORDER BY t.date) "
-            f"as target_fatalities_{steps}_step"
-        )
-        # Binary occurrence target
-        target_clauses.append(
-            f"CASE WHEN LEAD(t.fatalities_14d_sum, {steps}) "
-            f"OVER (PARTITION BY t.h3_index ORDER BY t.date) > 0 THEN 1 ELSE 0 END "
-            f"as target_binary_{steps}_step"
-        )
-        
-    target_sql = ",\n        ".join(target_clauses)
-    
     sql = f"""
     SELECT
         t.h3_index,
         t.date,
-        {select_sql},
-        {target_sql}
+        {select_sql}
     FROM {SCHEMA}.temporal_features t
     JOIN {SCHEMA}.features_static s ON t.h3_index = s.h3_index
     WHERE t.date BETWEEN '{start_date}' AND '{end_date}'
@@ -355,222 +340,179 @@ def run(
         try:
             validate_columns(engine, "features_acled_hybrid", hybrid_fields)
         except ValueError as e:
-            logger.warning(f"features_acled_hybrid missing expected columns; will fill with 0: {e}")
-
+            logger.warning(f"features_acled_hybrid missing expected columns; will fill with NaN: {e}")
     # Build Query
     horizons = models_cfg["horizons"]
     sql = build_dynamic_query(start_date, end_date, t_cols, s_cols, horizons)
     
-    # Stream & Process
+    # ---------------------------------------------------------------
+    # PASS 1: Stream features to a temp parquet.
+    # Simultaneously collect a tiny 3-column companion DataFrame
+    # (h3_index, date, fatalities_14d_sum) for Python-side LEAD.
+    # Peak RAM during this pass: ~1 chunk (~28 MB) + ~43 MB companion.
+    # ---------------------------------------------------------------
     out_path = PATHS["data_proc"] / "feature_matrix.parquet"
+    tmp_path = out_path.with_suffix(".tmp.parquet")
     chunk_size = 50000
-    
-    logger.info("Executing Query (Streaming)...")
-    chunks = pd.read_sql(sql, engine, chunksize=chunk_size)
-    
-    master_df = None
+
+    logger.info("PASS 1: Streaming features to temp parquet...")
     total_rows = 0
-    
-    for i, chunk in enumerate(chunks):
-        chunk["h3_index"] = chunk["h3_index"].apply(ensure_h3_int64).astype("int64")
-        chunk["date"] = pd.to_datetime(chunk["date"])
-        
-        if master_df is None:
-            master_df = chunk
-        else:
-            master_df = pd.concat([master_df, chunk], ignore_index=True)
-            
-        total_rows += len(chunk)
-        print(f"  Batch {i+1}: {total_rows} rows accumulated...", end="\r")
-        
-    print()
-    
-    if master_df is None or master_df.empty:
-        logger.error("Query returned no data! Check database population.")
-        sys.exit(1)
+    writer = None
+    target_rows = []  # companion: only 3 cols, ~43 MB total
+    target_dtypes = None  # dtype map from first chunk; enforced on all subsequent chunks
 
-    # ==================================================================
-    # CRITICAL FIX: Identify and preserve target columns (Task 2)
-    # ==================================================================
-    target_cols = identify_target_columns(master_df, horizons)
-    logger.info(f"Identified {len(target_cols)} target columns to preserve: {target_cols}")
-    
-    # Validate targets exist
-    missing_targets = [t for t in target_cols if t not in master_df.columns]
-    if missing_targets:
-        logger.warning(f"Expected target columns missing from query result: {missing_targets}")
+    raw_conn = engine.raw_connection()
+    try:
+        raw_conn.autocommit = False
+        with raw_conn.cursor() as setup_cur:
+            setup_cur.execute("SET work_mem = '128MB'")
 
-    # ==================================================================
-    # ACLED HYBRID FEATURES (New mech_* schema)
-    # ==================================================================
-    # CHECK: If columns already exist in master_df (from temporal_features), skip redundant merge
-    existing_hybrid_cols = [c for c in EXPECTED_HYBRID_COLS if c in master_df.columns]
-    
-    if len(existing_hybrid_cols) == len(EXPECTED_HYBRID_COLS):
-        logger.info("✅ ACLED Hybrid features already present in temporal_features. Skipping redundant merge.")
-    else:
-        logger.info("Loading Optimized ACLED Hybrid Features (mech_* schema)...")
-        
-        # Build query for new schema columns
-        query_acled = f"""
-            SELECT 
-                event_date as date, 
-                h3_index,
-                mech_gold_pivot,
-                mech_predatory_tax,
-                mech_factional_infighting,
-                mech_collective_punishment,
-                mech_gold_pivot_uncertainty,
-                mech_predatory_tax_uncertainty,
-                mech_factional_infighting_uncertainty,
-                mech_collective_punishment_uncertainty,
-                acled_actor_risk_score,
-                acled_mechanism_intensity,
-                acled_combined_risk_score
-            FROM {SCHEMA}.features_acled_hybrid
-        """
-        
-        try:
-            df_acled = pd.read_sql(query_acled, engine)
-        except Exception as e:
-            logger.error(f"Failed to load ACLED hybrid features: {e}")
-            df_acled = pd.DataFrame()
-        
-        if df_acled.empty:
-            logger.warning(f"ACLED hybrid table empty. Filling {len(EXPECTED_HYBRID_COLS)} columns with 0.")
-            for col in EXPECTED_HYBRID_COLS:
-                if col not in master_df.columns:
-                    master_df[col] = 0
-        else:
-            actual_cols = [c for c in EXPECTED_HYBRID_COLS if c in df_acled.columns]
-            missing_cols = [c for c in EXPECTED_HYBRID_COLS if c not in df_acled.columns]
-            
-            if missing_cols:
-                logger.warning(f"Missing ACLED hybrid columns (will fill with 0): {missing_cols}")
-            
-            logger.info(f"ACLED hybrid: {len(df_acled):,} rows, {len(actual_cols)}/{len(EXPECTED_HYBRID_COLS)} columns")
-            
-            # CRITICAL FIX: Normalize dates to midnight for consistent merging
-            # The hybrid table stores DATE (no time), spine has datetime64 (with time)
-            df_acled["date"] = pd.to_datetime(df_acled["date"]).dt.normalize()
-            df_acled["h3_index"] = df_acled["h3_index"].astype("int64")
-            
-            # Also normalize master_df dates for consistent comparison
-            master_df["date"] = pd.to_datetime(master_df["date"]).dt.normalize()
-            
-            # Debug: Log date alignment info
-            acled_dates = set(df_acled["date"].unique())
-            master_dates = set(master_df["date"].unique())
-            date_overlap = len(acled_dates.intersection(master_dates))
-            logger.info(f"  Date alignment: {len(acled_dates)} hybrid dates, {len(master_dates)} spine dates, {date_overlap} overlap")
-            
-            if date_overlap == 0:
-                logger.error("CRITICAL: No date overlap between ACLED hybrid and spine!")
-                logger.error(f"  Hybrid date range: {df_acled['date'].min()} to {df_acled['date'].max()}")
-                logger.error(f"  Spine date range: {master_df['date'].min()} to {master_df['date'].max()}")
-                # Sample dates for debugging
-                logger.error(f"  Sample hybrid dates: {sorted(list(acled_dates))[:5]}")
-                logger.error(f"  Sample spine dates: {sorted(list(master_dates))[:5]}")
-            
-            acled_date_range = (df_acled["date"].min(), df_acled["date"].max())
-            master_date_range = (master_df["date"].min(), master_df["date"].max())
-            
-            if acled_date_range[0] > master_date_range[0]:
-                logger.warning(
-                    f"ACLED hybrid starts at {acled_date_range[0].date()}, "
-                    f"after feature matrix start {master_date_range[0].date()}."
-                )
-            
-            # Drop columns from master_df that we are about to merge (to avoid _x/_y)
-            cols_to_drop = [c for c in df_acled.columns if c in master_df.columns and c not in ["date", "h3_index"]]
-            if cols_to_drop:
-                logger.info(f"Dropping {len(cols_to_drop)} partial columns from spine before merge to prevent duplicates.")
-                master_df.drop(columns=cols_to_drop, inplace=True)
+        with raw_conn.cursor(name="feature_matrix_cursor") as cursor:
+            cursor.itersize = chunk_size
+            cursor.execute(sql)
+            rows = cursor.fetchmany(chunk_size)
+            if not rows:
+                logger.error("Query returned no data! Check database population.")
+                sys.exit(1)
 
-            pre_merge_rows = len(master_df)
-            master_df = master_df.merge(df_acled, on=["date", "h3_index"], how="left", validate="1:1")
-            post_merge_rows = len(master_df)
-            
-            if pre_merge_rows != post_merge_rows:
-                raise ValueError(
-                    f"ACLED hybrid merge changed row count: {pre_merge_rows} -> {post_merge_rows}."
-                )
-            
-            for col in EXPECTED_HYBRID_COLS:
-                if col not in master_df.columns:
-                    master_df[col] = 0
+            col_names = [desc[0] for desc in cursor.description]
+
+            while rows:
+                chunk = pd.DataFrame(rows, columns=col_names)
+
+                # Type enforcement
+                chunk["h3_index"] = chunk["h3_index"].apply(ensure_h3_int64).astype("int64")
+                chunk["date"] = pd.to_datetime(chunk["date"]).dt.normalize()
+                float_cols = chunk.select_dtypes(include=["float64"]).columns
+                if not float_cols.empty:
+                    chunk[float_cols] = chunk[float_cols].astype("float32")
+                dist_cols = [c for c in chunk.columns if c.startswith("dist_")]
+                for col in dist_cols:
+                    chunk[col] = pd.to_numeric(chunk[col], errors="coerce").astype("float32")
+
+                # Sanitize
+                chunk, _ = sanitize_dataframe(chunk, verbose=False)
+
+                # Schema consistency: all-NULL columns arrive as object dtype in some
+                # chunks, causing float32 vs float64 (double) mismatches across chunks.
+                # Establish dtype map from first chunk; coerce every subsequent chunk to match.
+                if target_dtypes is None:
+                    target_dtypes = {col: chunk[col].dtype for col in chunk.columns}
                 else:
-                    null_count = master_df[col].isna().sum()
-                    if null_count > 0:
-                        logger.debug(f"  {col}: filling {null_count:,} nulls with 0")
-                    master_df[col] = master_df[col].fillna(0)
-            
-            coverage_stats = {}
-            for col in EXPECTED_HYBRID_COLS:
-                non_zero = (master_df[col] != 0).sum()
-                coverage_stats[col] = non_zero / len(master_df) * 100
-            
-            avg_coverage = sum(coverage_stats.values()) / len(coverage_stats)
-            logger.info(f"ACLED hybrid merge complete. Average non-zero coverage: {avg_coverage:.1f}%")
+                    for col in chunk.columns:
+                        if col in target_dtypes and chunk[col].dtype != target_dtypes[col]:
+                            try:
+                                chunk[col] = chunk[col].astype(target_dtypes[col])
+                            except (ValueError, TypeError):
+                                chunk[col] = pd.to_numeric(
+                                    chunk[col], errors="coerce"
+                                ).astype(target_dtypes[col])
 
-    # Distance columns type safety
-    dist_cols = [c for c in master_df.columns if c.startswith("dist_")]
-    if dist_cols:
-        logger.info(f"Enforcing numeric types for distance columns: {dist_cols}")
-        MAX_DISTANCE_KM = 500.0
-        for col in dist_cols:
-            master_df[col] = pd.to_numeric(master_df[col], errors="coerce")
-            null_pct = master_df[col].isna().mean()
-            if null_pct == 1.0:
-                logger.warning(f"  ⚠ {col} is 100% null — filling with sentinel {MAX_DISTANCE_KM} km.")
-                master_df[col] = MAX_DISTANCE_KM
-            elif null_pct > 0.5:
-                logger.warning(f"  ⚠ {col} has {null_pct:.1%} nulls.")
-            master_df[col] = master_df[col].astype("float32")
+                # Collect companion rows (3 cols only)
+                if "fatalities_14d_sum" in chunk.columns:
+                    target_rows.append(
+                        chunk[["h3_index", "date", "fatalities_14d_sum"]].copy()
+                    )
+
+                # Write chunk to temp parquet
+                if not chunk.empty:
+                    table = pa.Table.from_pandas(chunk, preserve_index=False)
+                    if writer is None:
+                        writer = pq.ParquetWriter(tmp_path, table.schema, compression="snappy")
+                    writer.write_table(table)
+                    total_rows += len(chunk)
+
+                rows = cursor.fetchmany(chunk_size)
+                print(f"  Streamed {total_rows:,} rows...", end="\r")
+    finally:
+        if writer:
+            writer.close()
+        raw_conn.close()
+    print()
+    logger.info(f"Pass 1 complete: {total_rows:,} rows written to temp parquet.")
+
+    # ---------------------------------------------------------------
+    # PASS 2: Compute targets Python-side on the tiny companion DataFrame.
+    # target_df: ~43 MB. Sort + groupby/shift is all in-memory on 3 cols.
+    # ---------------------------------------------------------------
+    logger.info("PASS 2: Computing target columns (Python-side LEAD)...")
+    target_df = pd.concat(target_rows, ignore_index=True)
+    del target_rows; gc.collect()
+
+    target_df.sort_values(["h3_index", "date"], inplace=True)
+    for h in horizons:
+        steps = h["steps"]
+        lead_vals = target_df.groupby("h3_index")["fatalities_14d_sum"].shift(-steps)
+        target_df[f"target_fatalities_{steps}_step"] = lead_vals.astype("float32")
+        target_df[f"target_binary_{steps}_step"] = (
+            lead_vals.map(lambda x: 1.0 if x > 0 else (np.nan if pd.isna(x) else 0.0))
+        ).astype("float32")
+
+    target_col_names = [c for c in target_df.columns if c.startswith("target_")]
+
+    # ---------------------------------------------------------------
+    # PASS 3: Read temp parquet (~200 MB), merge targets, drop NaN
+    # target rows, write final parquet. Peak RAM: ~250 MB.
+    # ---------------------------------------------------------------
+    logger.info("PASS 3: Merging targets into feature matrix...")
+    master_df = pd.read_parquet(tmp_path)
+    master_df = master_df.merge(
+        target_df[["h3_index", "date"] + target_col_names],
+        on=["h3_index", "date"],
+        how="left",
+    )
+    del target_df; gc.collect()
+
+    final_target_cols = identify_target_columns(master_df, horizons)
+    logger.info(f"Identified {len(final_target_cols)} target columns: {final_target_cols}")
+
+    before_drop = len(master_df)
+    master_df = master_df.dropna(subset=final_target_cols)
+    dropped_count = before_drop - len(master_df)
+    if dropped_count > 0:
+        logger.warning(f"Dropped {dropped_count:,} rows with missing targets (temporal boundary).")
 
     logger.info(f"Final Matrix Shape: {master_df.shape}")
-    
-    # ==================================================================
-    # CRITICAL: Verify target columns are still present before saving
-    # ==================================================================
-    final_target_cols = [t for t in target_cols if t in master_df.columns]
-    if len(final_target_cols) < len(target_cols):
-        dropped = set(target_cols) - set(final_target_cols)
-        logger.error(f"TARGET COLUMNS WERE DROPPED DURING PROCESSING: {dropped}")
-        raise ValueError(f"Target columns missing from final output: {dropped}")
-    
-    logger.info(f"✓ Target columns preserved in output: {final_target_cols}")
-    
-    # Fill NaN in target columns (downstream analysis expects no NaN)
-    for col in final_target_cols:
-        null_count = master_df[col].isna().sum()
-        if null_count > 0:
-            logger.info(f"  Filling {null_count:,} NaN values in {col} with 0")
-            master_df[col] = master_df[col].fillna(0)
-    
-    # Save
+
+    # Verify targets survived
+    final_target_cols = [t for t in final_target_cols if t in master_df.columns]
+    if not final_target_cols:
+        raise ValueError("No target columns present in final output — aborting.")
+    logger.info(f"✓ Target columns preserved: {final_target_cols}")
+
     master_df.to_parquet(out_path, index=False)
-    logger.info(f"Saved to {out_path}")
-    
-    # Verify saved file contains targets
-    saved_df = pd.read_parquet(out_path)
-    saved_targets = [c for c in saved_df.columns if any(c.startswith(p) for p in TARGET_COL_PATTERNS)]
-    logger.info(f"✓ Verification: Saved parquet contains {len(saved_targets)} target columns")
-    
-    # Save Meta
+    final_row_count = len(master_df)
+    del master_df; gc.collect()
+
+    tmp_path.unlink(missing_ok=True)
+    logger.info(f"✓ Saved final feature matrix to {out_path}")
+
+    # Schema-only verification
+    schema = pq.read_schema(out_path)
+    saved_targets = [f.name for f in schema if any(f.name.startswith(p) for p in TARGET_COL_PATTERNS)]
+    logger.info(f"✓ Verification: parquet contains {len(saved_targets)} target columns")
+
+    # Save meta
     meta = {
         "start": str(start_date),
         "end": str(end_date),
-        "rows": len(master_df),
+        "rows": final_row_count,
         "features": req_feats,
         "horizons": [h["name"] for h in horizons],
-        "target_columns": final_target_cols,  # Include targets in metadata
+        "target_columns": final_target_cols,
     }
     with open(PATHS["data_proc"] / "matrix_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
+    gc.collect()
+
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start-date", type=str, help="YYYY-MM-DD")
+    parser.add_argument("--end-date", type=str, help="YYYY-MM-DD")
+    args = parser.parse_args()
+
     try:
         cfg = load_configs()
         if isinstance(cfg, tuple):
@@ -579,9 +521,10 @@ if __name__ == "__main__":
             configs = cfg
             
         engine = get_db_engine()
-        run(configs, engine)
+        run(configs, engine, start_date=args.start_date, end_date=args.end_date)
     except Exception as e:
         logger.error(f"Matrix Build Failed: {e}", exc_info=True)
+        sys.exit(1)
     finally:
         if "engine" in locals():
             engine.dispose()

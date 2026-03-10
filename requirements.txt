@@ -61,6 +61,7 @@ transformers>=4.36.0
 bertopic>=0.15.0
 umap-learn>=0.5.5
 hdbscan>=0.8.33
+rapidfuzz>=3.0.0
 geopy>=2.4.0
 networkx>=3.2.0
 rasterstats>=0.19.0

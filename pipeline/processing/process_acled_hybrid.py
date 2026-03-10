@@ -621,15 +621,18 @@ def run(configs=None):
     risk_weights = calibrate_actor_risk_model(engine)
     
     # Fetch data with actor columns
+    # Filter to precision levels 1-2 for reliable H3 spatial assignment
     query = """
-        SELECT 
-            event_date, 
-            h3_index, 
+        SELECT
+            event_date,
+            h3_index,
             notes,
             actor1,
             actor2
-        FROM car_cewp.acled_events 
+        FROM car_cewp.acled_events
         WHERE notes IS NOT NULL
+          AND geo_precision IN (1, 2)
+          AND time_precision IN (1, 2)
     """
     
     try:

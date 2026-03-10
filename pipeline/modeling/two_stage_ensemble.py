@@ -38,13 +38,14 @@ class TwoStageEnsemble:
     
     Architecture:
     - Level 1: Theme-specific base learners (classifiers + regressors)
-    - Level 2: Meta-learners (LogisticRegression for binary, PoissonRegressor for counts)
-    - Level 3: Calibration layer (sigmoid default)
+    - Level 2: Meta-learners (XGBoost for binary onset, PoissonRegressor for fatality intensity)
+    - Level 3: Calibration layer (optional, defaults to none in v2.0+)
     
-    CRITICAL FIXES v3:
-    - Clips base regressor outputs to prevent Poisson explosion.
-    - predict() returns UNCONDITIONAL expected fatalities (prob * count).
-    - Validates feature availability before fitting to prevent empty DataFrame errors.
+    CRITICAL FEATURES:
+    - XGBoost Meta-Learner: Captures non-linear interactions between thematic themes.
+    - Intensity Clipping: Base regressor outputs are capped at 500 (99.9th percentile) 
+      to prevent numerical explosion in the Poisson log-link function.
+    - Unconditional Prediction: predict() returns P(Conflict) * E[Fatalities | Conflict].
     """
 
     def __init__(
@@ -53,14 +54,15 @@ class TwoStageEnsemble:
         n_folds: int = 5,
         random_state: int = 42,
         calibration_config: Optional[Dict[str, Any]] = None,
+        meta_config: Optional[Dict[str, Any]] = None,
         # Safety cap for base regressor outputs before they hit the Poisson meta-learner
-        # e.g., if a base model predicts 10,000 deaths, clip it to 500 to stop explosion
-        regressor_input_cap: float = 1000.0 
+        regressor_input_cap: float = 500.0 
     ) -> None:
         self.theme_models = theme_models
         self.n_folds = n_folds
         self.random_state = random_state
         self.regressor_input_cap = regressor_input_cap
+        self.meta_config = meta_config or {"type": "xgboost", "params": {"n_estimators": 50, "max_depth": 3, "scale_pos_weight": 8}}
         
         # Parse calibration config (SINGLE SOURCE OF TRUTH)
         cal_cfg = calibration_config or {}
@@ -71,7 +73,7 @@ class TwoStageEnsemble:
         self.fallback_fraction = cal_cfg.get("fallback_fraction", 0.3)
         self.calibration_random_seed = cal_cfg.get("random_seed", 42)
 
-        self.meta_binary: Optional[LogisticRegression] = None
+        self.meta_binary: Optional[Any] = None
         self.meta_regress: Optional[PoissonRegressor] = None
         self.calibrator: Optional[Any] = None
         self.is_fitted: bool = False
@@ -173,7 +175,7 @@ class TwoStageEnsemble:
         X: pd.DataFrame,
         y_binary: pd.Series,
         y_fatalities: pd.Series,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Generate out-of-fold predictions for stacking."""
         n_samples = len(X)
         n_themes = len(self._validated_theme_models)
@@ -183,6 +185,7 @@ class TwoStageEnsemble:
 
         oof_binary = np.zeros((n_samples, n_themes), dtype=float)
         oof_regress = np.zeros((n_samples, n_themes), dtype=float)
+        is_valid_oof = np.zeros(n_samples, dtype=bool)
 
         tscv = TimeSeriesSplit(n_splits=self.n_folds)
 
@@ -227,8 +230,11 @@ class TwoStageEnsemble:
                 if conflict_mask.sum() > 0:
                     reg_fold.fit(X_train[conflict_mask], y_train_fat[conflict_mask])
                     oof_regress[val_idx, theme_idx] = reg_fold.predict(X_val)
+                
+                # Mark these indices as valid for meta-learner training
+                is_valid_oof[val_idx] = True
 
-        return oof_binary, oof_regress
+        return oof_binary, oof_regress, is_valid_oof
 
     def _compute_calibration_indices(
         self,
@@ -365,10 +371,15 @@ class TwoStageEnsemble:
             "n_calibration_samples": n_cal,
             "raw_brier": float(brier_score_loss(y_cal, raw_probs)),
             "calibrated_brier": float(brier_score_loss(y_cal, cal_probs)),
+            "calibrated_std": float(np.std(cal_probs))
         }
         
         logger.info(f"Brier improvement: {self.calibration_diagnostics['raw_brier']:.4f} -> "
                     f"{self.calibration_diagnostics['calibrated_brier']:.4f}")
+        
+        if self.calibration_diagnostics["calibrated_std"] < 1e-5:
+            logger.warning("🚨 CALIBRATOR COLLAPSE DETECTED: Output variance is near zero. "
+                           "Consider increasing calibration_fraction or using isotonic method.")
 
     def fit(self, X: pd.DataFrame, y_binary: pd.Series, y_fatalities: pd.Series) -> None:
         """Fit the complete two-stage ensemble with calibration."""
@@ -389,19 +400,54 @@ class TwoStageEnsemble:
             X_train, X_cal, y_bin_train, y_bin_cal, y_fat_train, y_fat_cal = \
                 self._split_for_calibration(X, y_binary, y_fatalities)
         else:
-            X_train, X_cal = X, None
-            y_bin_train, y_bin_cal = y_binary, None
-            y_fat_train, y_fat_cal = y_fatalities, None
+            # Fallback: If no calibration split, indices point to full dataset
+            self.train_idx_ = np.arange(len(X))
+            self.cal_idx_ = self.train_idx_
+            X_train, X_cal = X, X
+            y_bin_train, y_bin_cal = y_binary, y_binary
+            y_fat_train, y_fat_cal = y_fatalities, y_fatalities
 
         # 2. Generate OOF Predictions (Level 1) on training data
-        oof_binary, oof_regress = self._generate_oof_predictions(X_train, y_bin_train, y_fat_train)
+        oof_binary, oof_regress, is_valid_oof = self._generate_oof_predictions(X_train, y_bin_train, y_fat_train)
 
-        # 3. Train Meta-Classifier
-        self.meta_binary = LogisticRegression(solver="lbfgs", max_iter=1000, n_jobs=-1, random_state=self.random_state)
-        self.meta_binary.fit(oof_binary, y_bin_train)
+        # 3. Train Meta-Classifier (using only rows with valid OOF predictions)
+        X_meta_bin = oof_binary[is_valid_oof]
+        y_meta_bin = y_bin_train[is_valid_oof]
+        
+        meta_type = self.meta_config.get("type", "logistic")
+        meta_params = self.meta_config.get("params", {})
+        
+        if meta_type == "xgboost":
+            from xgboost import XGBClassifier
+            # Ensure basic defaults if not provided
+            params = {
+                "n_estimators": 100,
+                "max_depth": 3,
+                "learning_rate": 0.1,
+                "n_jobs": -1,
+                "random_state": self.random_state,
+                "tree_method": "hist"
+            }
+            params.update(meta_params)
+            self.meta_binary = XGBClassifier(**params)
+        else:
+            # Logistic Default
+            params = {
+                "solver": "lbfgs",
+                "max_iter": 1000,
+                "n_jobs": -1,
+                "random_state": self.random_state,
+                "class_weight": "balanced"
+            }
+            params.update(meta_params)
+            self.meta_binary = LogisticRegression(**params)
+            
+        self.meta_binary.fit(X_meta_bin, y_meta_bin)
 
         # 4. Train Meta-Regressor (Poisson) with Safety Clipping
-        conflict_mask = y_bin_train == 1
+        # Also using only rows with valid OOF predictions AND positive onset
+        conflict_mask = (y_bin_train == 1) & is_valid_oof
+        
         if conflict_mask.sum() > 0:
             self.meta_regress = PoissonRegressor(alpha=1.0, max_iter=1000)
             y_fat_conflict = np.maximum(y_fat_train[conflict_mask], 0)
@@ -448,6 +494,12 @@ class TwoStageEnsemble:
         if self._validated_theme_models is None:
             raise RuntimeError("Model fitted but no validated theme models found (internal error)")
 
+        # Ensure X is a DataFrame for consistent feature name handling
+        if not isinstance(X, pd.DataFrame):
+            # This is a fallback; ideally X is always a DataFrame from upstream
+            logger.warning("predict() received non-DataFrame input. Attempting to convert, but feature alignment risk is high.")
+            X = pd.DataFrame(X)
+
         n_samples = len(X)
         n_themes = len(self._validated_theme_models)
         
@@ -456,7 +508,10 @@ class TwoStageEnsemble:
 
         # Level 1 Predictions
         for i, theme in enumerate(self._validated_theme_models):
-            X_theme = self._safe_get_features(X, theme["features"])
+            feature_cols = theme["features"]
+            X_theme = self._safe_get_features(X, feature_cols)
+            
+            # Ensure we pass a DataFrame with names to base models
             try:
                 l1_binary[:, i] = theme["binary_model"].predict_proba(X_theme)[:, 1]
             except AttributeError:

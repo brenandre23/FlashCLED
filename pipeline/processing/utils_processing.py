@@ -80,9 +80,12 @@ SPARSE_PATTERNS = [
     r'food_price',
     r'displacement',
     r'^iom_',
+    r'_recency_days$',
 ]
 
-# Patterns that indicate computed/derived columns (always 0% NaN expected)
+# Patterns that indicate computed/derived columns (expected 0% NaN)
+# NOTE: Recency flags are *sparse* (undefined when the parent series is missing),
+# so they are classified above in SPARSE_PATTERNS, not here.
 COMPUTED_PATTERNS = [
     r'^target_',
     r'_available$',
@@ -386,6 +389,15 @@ def find_column_source(
     if col_lower.startswith('fusion_'):
         return (None, None, 'computed')
     
+    # NTL kinetic delta is a derived feature (computed from ntl_peak - ntl_mean)
+    if col_lower == 'ntl_kinetic_delta':
+        # Map to environmental_features since it's derived from VIIRS data
+        if 'environmental_features' in tables_info:
+            info = tables_info['environmental_features']
+            if info.get('min_date') is not None:
+                return ('environmental_features', info['min_date'], 'derived')
+        return (None, None, 'derived')
+    
     # Decay features - derived from parent, map to parent's source if possible
     if '_decay_' in col_lower:
         # Try to find the base column's source
@@ -510,7 +522,7 @@ def find_column_source(
                 return ('internet_outages', info['min_date'], 'raw')
         return (None, None, 'unknown')
     
-    # Environmental features
+    # Environmental features (including NTL/VIIRS)
     if any(kw in col_lower for kw in ['precip', 'temp', 'ndvi', 'ntl', 'nightlight', 'soil', 'water', 'chirps', 'era5', 'modis', 'viirs']):
         if 'environmental_features' in tables_info:
             info = tables_info['environmental_features']
@@ -567,17 +579,49 @@ def find_column_source(
     return (None, None, 'unknown')
 
 
+def get_available_from_date(col: str, features_config: Optional[dict]) -> Optional[str]:
+    """
+    Look up the available_from date for a column from features.yaml.
+
+    Args:
+        col: Column name (output_col)
+        features_config: Parsed features.yaml config dict
+
+    Returns:
+        available_from date string (e.g., "2012-01-28") or None
+    """
+    if not features_config:
+        return None
+
+    # Check 'registry' (Standard CEWP structure)
+    registry = features_config.get('registry', [])
+    for item in registry:
+        if item.get('output_col') == col:
+            return item.get('available_from')
+
+    # Fallback: check feature_groups section
+    feature_groups = features_config.get('feature_groups', [])
+    for group in feature_groups:
+        features = group.get('features', [])
+        for feature in features:
+            if feature.get('output_col') == col:
+                return feature.get('available_from')
+
+    return None
+
+
 def compute_expected_nan_percentage(
     col: str,
     spine_start: pd.Timestamp,
     spine_end: pd.Timestamp,
     step_days: int,
     source_min_date: Optional[pd.Timestamp],
-    col_type: str
+    col_type: str,
+    available_from: Optional[str] = None
 ) -> Tuple[Optional[float], str]:
     """
     Compute expected NaN percentage for a column.
-    
+
     Args:
         col: Column name
         spine_start: Start date of the temporal spine
@@ -585,35 +629,46 @@ def compute_expected_nan_percentage(
         step_days: Temporal step size in days
         source_min_date: MIN(date) from the source table, or None
         col_type: One of 'flow', 'sparse', 'computed', 'stock'
-    
+        available_from: Optional per-column availability date from features.yaml
+
     Returns:
         Tuple of (expected_nan_pct, reason)
     """
     # Computed columns should always be 0% NaN
     if col_type == 'computed':
         return (0.0, "Computed/derived column")
-    
-    # If no source found, we can't compute expectation
-    if source_min_date is None:
+
+    # Prefer per-column available_from date over table-level MIN(date)
+    if available_from:
+        try:
+            availability_date = pd.Timestamp(available_from)
+        except:
+            logger.warning(f"Invalid available_from date '{available_from}' for {col}, falling back to table MIN(date)")
+            availability_date = source_min_date
+    else:
+        availability_date = source_min_date
+
+    # If no availability date found, we can't compute expectation
+    if availability_date is None:
         return (None, "Source table not found")
-    
+
     # Total number of steps in spine
     total_days = (spine_end - spine_start).days
     total_steps = max(1, total_days // step_days)
-    
+
     # Calculate expected NaN% based on availability date
-    if source_min_date <= spine_start:
-        return (0.0, f"Available from {source_min_date.date()}")
-    
-    if source_min_date >= spine_end:
-        return (100.0, f"Starts {source_min_date.date()} (after spine)")
-    
+    if availability_date <= spine_start:
+        return (0.0, f"Available from {availability_date.date()}")
+
+    if availability_date >= spine_end:
+        return (100.0, f"Starts {availability_date.date()} (after spine)")
+
     # Partial availability
-    unavailable_days = (source_min_date - spine_start).days
+    unavailable_days = (availability_date - spine_start).days
     unavailable_steps = unavailable_days // step_days
     expected_nan_pct = (unavailable_steps / total_steps) * 100
-    
-    return (expected_nan_pct, f"Available from {source_min_date.date()}")
+
+    return (expected_nan_pct, f"Available from {availability_date.date()}")
 
 
 def sanitize_numeric_columns(
@@ -711,7 +766,7 @@ def sanitize_numeric_columns(
         anomalies = []
         unmapped = []
         
-        header = f"{'Column':<40} {'Observed':>9} {'Expected':>9} {'Delta':>8} {'Type':<10} {'Status':<12} {'Source'}"
+        header = f"{'Column':<40} {'Observed':>10} {'Expected':>10} {'Delta':>10} {'Type':<10} {'Status':<12} {'Source'}"
         logger.info(header)
         logger.info("-" * 110)
         
@@ -727,10 +782,13 @@ def sanitize_numeric_columns(
             # Override col_type if provenance indicates computed/derived
             if provenance == 'computed':
                 col_type = 'computed'
-            
-            # Compute expected NaN%
+
+            # Look up per-column availability date from features.yaml
+            available_from = get_available_from_date(col, features_config)
+
+            # Compute expected NaN% (uses available_from if provided, else falls back to table MIN(date))
             expected_nan_pct, reason = compute_expected_nan_percentage(
-                col, spine_start, spine_end, step_days, source_min_date, col_type
+                col, spine_start, spine_end, step_days, source_min_date, col_type, available_from
             )
             
             # Determine status
@@ -742,8 +800,8 @@ def sanitize_numeric_columns(
                         anomalies.append((col, observed_nan_pct, 0.0, "Computed column has NaN", 'computed'))
                     else:
                         status = "✓ computed"
-                    delta_str = f"{observed_nan_pct:+7.1f}%"
-                    expected_str = "    0.0%"
+                    delta_str = f"{observed_nan_pct:+9.3f}%"
+                    expected_str = "     0.000%"
                 else:  # derived
                     status = "✓ derived"
                     delta_str = "--"
@@ -757,8 +815,8 @@ def sanitize_numeric_columns(
                 source_str = reason
             else:
                 delta = observed_nan_pct - expected_nan_pct
-                delta_str = f"{delta:+7.1f}%"
-                expected_str = f"{expected_nan_pct:8.1f}%"
+                delta_str = f"{delta:+9.3f}%"
+                expected_str = f"{expected_nan_pct:9.3f}%"
                 
                 if col_type == 'computed':
                     if observed_nan_pct > tolerance_pct:
@@ -793,7 +851,7 @@ def sanitize_numeric_columns(
                 source_str = source_str[:32] + "..."
             
             logger.info(
-                f"{col:<40} {observed_nan_pct:>8.1f}% {expected_str:>9} {delta_str:>8} "
+                f"{col:<40} {observed_nan_pct:>9.3f}% {expected_str:>10} {delta_str:>10} "
                 f"{col_type:<10} {status:<12} {source_str}"
             )
         
@@ -804,7 +862,7 @@ def sanitize_numeric_columns(
             logger.warning("")
             logger.warning(f"⚠️  {len(anomalies)} COLUMNS WITH UNEXPECTED NaN LEVELS:")
             for col, obs, exp, reason, ctype in anomalies:
-                logger.warning(f"   [{ctype}] {col}: {obs:.1f}% observed vs {exp:.1f}% expected ({reason})")
+                logger.warning(f"   [{ctype}] {col}: {obs:.3f}% observed vs {exp:.3f}% expected ({reason})")
             logger.warning("")
             logger.warning("Possible causes:")
             logger.warning("  - ETL failures or data ingestion gaps")

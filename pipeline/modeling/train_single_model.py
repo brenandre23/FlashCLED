@@ -27,6 +27,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from utils import logger, load_configs, PATHS
+from pipeline.modeling.load_data_utils import sanitize_dataframe
 from pipeline.modeling.two_stage_ensemble import TwoStageEnsemble
 from pipeline.modeling.conformal_prediction import (
     BinConditionalConformalPredictor,
@@ -71,10 +72,13 @@ def extract_feature_importance(theme_models: List[Dict], importance_type: str = 
 
 def analyze_nlp_feature_contribution(
     importance: Dict[str, float],
-    nlp_features: List[str],
+    nlp_features: List[str] | None,
     min_threshold_pct: float = 5.0,
 ) -> Dict[str, Any]:
     """Analyze whether NLP features are being discovered by the model."""
+    if nlp_features is None:
+        nlp_features = []
+        
     if not importance:
         return {"error": "No feature importance available"}
     
@@ -156,15 +160,16 @@ def log_feature_importance_report(analysis: Dict[str, Any], horizon: str, learne
 # =============================================================================
 
 def process_pca_subsampled(df, config):
-    """Fits PCA if enabled."""
+    """Fits PCA if enabled using robust imputation and scaling."""
     from sklearn.decomposition import PCA
     from sklearn.preprocessing import StandardScaler
+    from sklearn.impute import SimpleImputer
 
     pca_cfg = config.get("submodels", {}).get("broad_pca", {})
     if not pca_cfg.get("enabled", False):
         return df, {}
 
-    logger.info("🎨 Fitting Broad PCA (Subsampled)...")
+    logger.info("🎨 Fitting Broad PCA (Robust Subsampled)...")
 
     input_features = []
     for name, sub in config["submodels"].items():
@@ -174,42 +179,47 @@ def process_pca_subsampled(df, config):
     valid_inputs = [f for f in set(input_features) if f in df.columns]
 
     if not valid_inputs:
+        logger.warning("⚠️ No valid input features for PCA. Skipping.")
         return df, {}
 
     try:
+        # Use a representative sample for PCA fitting
         sample_size = 300000
         if len(df) > sample_size:
-            df_sample = (
-                df[valid_inputs]
-                .sample(n=sample_size, random_state=42)
-                .fillna(0)
-                .astype(np.float32)
-            )
+            df_sample = df[valid_inputs].sample(n=sample_size, random_state=42)
         else:
-            df_sample = df[valid_inputs].fillna(0).astype(np.float32)
+            df_sample = df[valid_inputs]
 
+        # Robust preprocessing: Median Imputation + Scaling
+        imputer = SimpleImputer(strategy='median')
         scaler = StandardScaler()
-        X_sample_scaled = scaler.fit_transform(df_sample.values)
+        
+        X_sample_imputed = imputer.fit_transform(df_sample)
+        X_sample_scaled = scaler.fit_transform(X_sample_imputed)
 
-        variance = pca_cfg.get("variance_retention", 0.9)
+        variance = pca_cfg.get("variance_retention", 0.95)
         pca = PCA(n_components=variance, random_state=42)
         pca.fit(X_sample_scaled)
 
-        pca_cols = [f"pca_{i+1}" for i in range(pca.n_components_)]
+        n_comps = pca.n_components_
+        if n_comps == 0:
+            logger.error("❌ PCA generated 0 components. Variance retention threshold too high?")
+            return df, {}
+
+        pca_cols = [f"pca_{i+1}" for i in range(n_comps)]
+        logger.info(f"   -> Reduced {len(valid_inputs)} inputs to {n_comps} components")
+
         pca_results = []
         chunk_size = 100000
 
+        # Process full dataframe in chunks to prevent memory blowup
         for start in range(0, len(df), chunk_size):
             end = min(start + chunk_size, len(df))
-            X_chunk = (
-                df[valid_inputs]
-                .iloc[start:end]
-                .fillna(0)
-                .astype(np.float32)
-                .values
-            )
-            X_chunk = scaler.transform(X_chunk)
-            X_chunk_pca = pca.transform(X_chunk)
+            X_chunk = df[valid_inputs].iloc[start:end].values
+            X_chunk_imputed = imputer.transform(X_chunk)
+            X_chunk_scaled = scaler.transform(X_chunk_imputed)
+            X_chunk_pca = pca.transform(X_chunk_scaled)
+            
             pca_results.append(
                 pd.DataFrame(
                     X_chunk_pca, columns=pca_cols, index=df.index[start:end]
@@ -219,10 +229,13 @@ def process_pca_subsampled(df, config):
         pca_df = pd.concat(pca_results, axis=0)
         df_out = pd.concat([df, pca_df], axis=1)
 
+        # Sync the config so the model knows which features to use
         config["submodels"]["broad_pca"]["features"] = pca_cols
+        
         bundle = {
             "pca": pca,
             "pca_scaler": scaler,
+            "pca_imputer": imputer,  # Crucial for prediction consistency
             "pca_input_features": valid_inputs,
             "pca_component_names": pca_cols,
         }
@@ -230,6 +243,8 @@ def process_pca_subsampled(df, config):
 
     except Exception as e:
         logger.error(f"❌ PCA Failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return df, {}
 
 
@@ -237,7 +252,7 @@ def process_pca_subsampled(df, config):
 # MODEL FACTORY
 # =============================================================================
 
-def build_theme_models(config, learner_name):
+def build_theme_models(config, learner_name, pruned_features: set | None = None):
     """Factory for initializing sub-models with stochastic gradient boosting."""
     try:
         from xgboost import XGBClassifier, XGBRegressor
@@ -281,6 +296,8 @@ def build_theme_models(config, learner_name):
     hurdle_cfg = config.get("hurdle_params", {})
     scale_pos_weight = hurdle_cfg.get("classifier_scale_pos_weight", 1.0)
 
+    pruned_features = set(pruned_features) if pruned_features else None
+
     for name, info in config["submodels"].items():
         if not info.get("enabled", False):
             continue
@@ -290,10 +307,19 @@ def build_theme_models(config, learner_name):
         clf_params = base_params.copy()
         clf_params["scale_pos_weight"] = scale_pos_weight
 
+        feat_list = info.get("features", [])
+        if pruned_features is not None and name != "broad_pca":
+            before = len(feat_list)
+            feat_list = [f for f in feat_list if f in pruned_features]
+            logger.info(f"[PRUNING] Theme '{name}': {before} -> {len(feat_list)} features after pruning filter.")
+            if before > 0 and len(feat_list) == 0:
+                logger.warning(f"⚠️ [PRUNING] Theme '{name}' has zero features after applying pruned_features.yaml. Skipping theme.")
+                continue
+
         theme_models.append(
             {
                 "name": name,
-                "features": info["features"],
+                "features": feat_list,
                 "binary_model": Cls(**clf_params),
                 "regress_model": Reg(**reg_params),
             }
@@ -323,6 +349,9 @@ def run_single_training(horizon, learner_name):
 
         logger.info("📦 Loading Feature Matrix...")
         df = pd.read_parquet(PATHS["data_proc"] / "feature_matrix.parquet")
+        
+        # Sanitize (Fix for [9.63E0] strings)
+        df, _ = sanitize_dataframe(df, verbose=True)
 
         target_col = f"target_fatalities_{lookahead_steps}_step"
         if target_col not in df.columns:
@@ -342,11 +371,23 @@ def run_single_training(horizon, learner_name):
         y_bin = (y_reg > 0).astype(int)
 
         logger.info(f"🏭 Building models for {learner_name}...")
-        theme_models = build_theme_models(models_cfg, learner_name)
+        pruned_path = PATHS["root"] / "configs" / "pruned_features.yaml"
+        pruned_set = None
+        if pruned_path.exists():
+            try:
+                import yaml
+                pruned_cfg = yaml.safe_load(pruned_path.read_text()) or {}
+                pruned_set = set(pruned_cfg.get("active_features", []))
+                logger.info(f"[PRUNING] Loaded {len(pruned_set)} active features from {pruned_path}")
+            except Exception as exc:
+                logger.warning(f"[PRUNING] Failed to load {pruned_path}: {exc}. Proceeding without pruning.")
+
+        theme_models = build_theme_models(models_cfg, learner_name, pruned_set)
 
         ensemble = TwoStageEnsemble(
             theme_models=theme_models,
-            calibration_config=models_cfg["calibration"],  # Pass entire calibration config
+            calibration_config=models_cfg.get("calibration", {}),
+            meta_config=models_cfg.get("meta_learner", {}),
         )
         # FIT the ensemble (computes and stores train_idx_ and cal_idx_ internally)
         ensemble.fit(df, y_bin, y_reg)
@@ -355,14 +396,29 @@ def run_single_training(horizon, learner_name):
         # USE ENSEMBLE-DEFINED CALIBRATION INDICES (Single Source of Truth)
         # =================================================================
         # DEFENSIVE ASSERTIONS: Ensure calibration indices are valid
-        assert hasattr(ensemble, "cal_idx_"), "Calibration indices missing from ensemble"
-        assert hasattr(ensemble, "train_idx_"), "Training indices missing from ensemble"
-        assert len(ensemble.cal_idx_) > 0, "Empty calibration set"
-        assert len(set(ensemble.cal_idx_) & set(ensemble.train_idx_)) == 0, \
-            "Train/Cal indices overlap! Data leakage detected."
+        if not hasattr(ensemble, "cal_idx_") or ensemble.cal_idx_ is None:
+            logger.error("❌ Calibration indices (cal_idx_) missing or None after fit!")
+            raise ValueError("cal_idx_ is None")
+        
+        if not hasattr(ensemble, "train_idx_") or ensemble.train_idx_ is None:
+            logger.error("❌ Training indices (train_idx_) missing or None after fit!")
+            raise ValueError("train_idx_ is None")
+        
+        # Only enforce strict separation if a calibration layer is actually being fitted
+        cal_method = getattr(ensemble, "calibration_method", "none")
+        if cal_method != "none":
+            if ensemble.cal_idx_ is None:
+                 raise ValueError("cal_idx_ is None but calibration_method is not 'none'")
+            assert len(ensemble.cal_idx_) > 0, "Empty calibration set"
+            assert len(set(ensemble.cal_idx_) & set(ensemble.train_idx_)) == 0, \
+                "Train/Cal indices overlap! Data leakage detected."
+        else:
+            logger.info("ℹ️ Calibration disabled; metrics/BCCP using training indices.")
         
         cal_idx = ensemble.cal_idx_
-        
+        if cal_idx is None:
+            raise ValueError("cal_idx is None before indexing df")
+            
         # Isolate the Calibration Set using ensemble-defined indices
         df_cal = df.iloc[cal_idx]
         y_reg_cal = y_reg.iloc[cal_idx]
@@ -392,30 +448,55 @@ def run_single_training(horizon, learner_name):
         # =================================================================
         # METRICS & CONFORMAL PREDICTION (On Calibration Set)
         # =================================================================
-        logger.info("🔮 Fitting Conformal Intervals (Calibration Set Only)...")
+        cp_cfg = models_cfg.get("conformal_prediction", {"enabled": False})
+        bccp = None
 
-        # Metrics now calculated on Calibration Set using Unconditional Expectation
-        y_true_clip = np.clip(y_reg_cal.values, 0, None)
-        y_pred_clip = np.clip(expected_fatalities_cal, 0, None)
-        
-        rmse = np.sqrt(mean_squared_error(y_true_clip, y_pred_clip))
-        try:
-            mpd = mean_poisson_deviance(y_true_clip, np.maximum(y_pred_clip, 1e-9))
-        except ValueError:
-            mpd = float("nan")
+        if cp_cfg.get("enabled", False):
+            logger.info("🔮 Fitting Conformal Intervals (Calibration Set Only)...")
+
+            # Metrics now calculated on Calibration Set using Unconditional Expectation
+            # --- SAFETY CLIP (Prevent Metric Explosion) ---
+            y_true_clip = np.clip(y_reg_cal.values, 0, 500)
+            y_pred_clip = np.clip(expected_fatalities_cal, 0, 500)
             
-        logger.info(f"Intensity metrics (Cal Set) -> RMSE: {rmse:.4f}, Mean Poisson Deviance: {mpd:.4f}")
+            rmse = np.sqrt(mean_squared_error(y_true_clip, y_pred_clip))
+            try:
+                mpd = mean_poisson_deviance(y_true_clip, np.maximum(y_pred_clip, 1e-9))
+            except ValueError:
+                mpd = float("nan")
+                
+            logger.info(f"Intensity metrics (Cal Set) -> RMSE: {rmse:.4f}, Mean Poisson Deviance: {mpd:.4f}")
 
-        # BCCP Fit on Calibration Set
-        y_reg_log_cal = np.log1p(y_reg_cal.values)
-        preds_log_cal = np.log1p(expected_fatalities_cal)
+            # BCCP Fit on Calibration Set
+            use_log = cp_cfg.get("log_scale", True)
+            if use_log:
+                y_fit = np.log1p(y_reg_cal.values)
+                preds_fit = np.log1p(expected_fatalities_cal)
+            else:
+                y_fit = y_reg_cal.values
+                preds_fit = expected_fatalities_cal
 
-        bccp = BinConditionalConformalPredictor(
-            bins=create_default_fatality_bins(),
-            alpha=models_cfg["conformal_prediction"]["alpha"],
-            log_scale=True,
-        )
-        bccp.fit(y_reg_log_cal, preds_log_cal)
+            # BCCP bin edges sourced from models.yaml (support ".inf"/"inf" strings)
+            bins_cfg = cp_cfg.get("bins")
+            if not bins_cfg:
+                raise ValueError("conformal_prediction.bins is required in models.yaml when enabled")
+
+            def _coerce_bin(val):
+                if isinstance(val, str) and val.lower().strip(".") == "inf":
+                    return np.inf
+                return float(val)
+
+            bins = [_coerce_bin(b) for b in bins_cfg]
+
+            bccp = BinConditionalConformalPredictor(
+                bins=bins,
+                alpha=cp_cfg.get("alpha", 0.1),
+                contiguous=cp_cfg.get("contiguous", False),
+                log_scale=use_log,
+            )
+            bccp.fit(y_fit, preds_fit)
+        else:
+            logger.info("⏭️ Conformal Prediction disabled in models.yaml. Skipping BCCP fit.")
 
         # =================================================================
         # SAVE MODEL

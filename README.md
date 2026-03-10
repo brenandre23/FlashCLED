@@ -2,7 +2,7 @@
 
 A production-grade geospatial machine learning pipeline for forecasting sub-national conflict in the **Central African Republic (CAR)**.
 
-The system ingests multi-source data (satellite, economic, political, NLP-derived), engineers **141 features** (unique columns pre-pruning) on a hexagonal grid (**H3 resolution 5, ~10km cells**), and predicts conflict probability and fatality magnitude using a **Two-Stage Hurdle Ensemble** with calibrated uncertainty quantification.
+The system ingests multi-source data (satellite, economic, political, NLP-derived), engineers **136 features** (unique columns pre-pruning) on a hexagonal grid (**H3 resolution 5, ~10km cells**), and predicts conflict probability and fatality magnitude using a **Two-Stage Hurdle Ensemble** with calibrated uncertainty quantification.
 
 ---
 
@@ -87,8 +87,8 @@ You should see:
 | [USAGE.md](docs/USAGE.md) | CLI examples and pipeline workflows |
 | [DATABASE_SETUP.md](docs/DATABASE_SETUP.md) | PostgreSQL schema and performance tuning |
 | [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker production deployment |
-| [CEWP_Thesis_Overview.pdf](docs/CEWP_Thesis_Overview.pdf) | Complete thesis methodology |
-| [CEWP_Data_Source_Audit.pdf](docs/CEWP_Data_Source_Audit.pdf) | Data source specifications |
+| [CEWP_Thesis_Overview.md](docs/CEWP_Thesis_Overview.md) | Complete thesis methodology |
+| [CEWP_Data_Source_Audit.md](docs/CEWP_Data_Source_Audit.md) | Data source specifications |
 
 ---
 
@@ -112,7 +112,7 @@ Orchestrated by `main.py`:
 | **1. Static Ingestion** | Generate H3 grid and process invariant geography (terrain, rivers, roads, settlements, mines). | `create_h3_grid`, `fetch_dem`, `fetch_rivers`, `fetch_mines` |
 | **2. Dynamic Ingestion** | Fetch time-series data from APIs (ACLED, GDELT, IODA, WorldPop, GEE, FEWS NET, Yahoo Finance). | `fetch_acled`, `fetch_gee_server_side`, `fetch_food_security`, `fetch_ioda` |
 | **3. NLP Processing** | Extract semantic themes and conflict drivers from ACLED narratives. | `process_acled_hybrid.py` |
-| **4. Feature Engineering** | 14-day spine, climatological anomalies, price shocks, conflict decay, spatial diffusion. | `feature_engineering.py` |
+| **4. Feature Engineering** | 14-day spine, climatological anomalies, price shocks, conflict decay, spatial diffusion. | `process_spine_and_infrastructure.py`, `process_conflict_features.py` |
 | **5. Modeling** | Build ABT + train Two-Stage Hurdle Ensemble (classifier + regressor). | `build_feature_matrix`, `train_models` |
 | **6. Calibration** | Sigmoid (Platt) calibration + BCCP prediction intervals. Isotonic remains optional. | `calibrate_models` |
 | **7. Inference** | Generate risk forecasts with uncertainty quantification. | `generate_predictions` |
@@ -125,14 +125,14 @@ Orchestrated by `main.py`:
 .
 ├── configs/                 # YAML config files (pipeline control panel)
 │   ├── data.yaml            # data sources, URLs, date windows
-│   ├── features.yaml        # feature registry (111 features), lags, decay rates
+│   ├── features.yaml        # feature registry (136 features), lags, decay rates
 │   └── models.yaml          # hyperparameters, target horizons, calibration settings
 ├── docs/                    # Documentation
 │   ├── INSTALL.md           # Full installation guide
 │   ├── USAGE.md             # CLI examples and workflows
 │   ├── DATABASE_SETUP.md    # PostgreSQL configuration
 │   ├── DEPLOYMENT.md        # Docker deployment
-│   └── *.pdf                # Thesis documents
+│   └── *.md                 # Thesis and audit documentation
 ├── data/                    # Data storage (ignored by git)
 │   ├── raw/                 # Manual downloads (ACLED.csv, EPR-2021.csv)
 │   ├── processed/           # Intermediate outputs (parquet/geotiffs)
@@ -165,16 +165,35 @@ Orchestrated by `main.py`:
 
 ## 🧠 Model Architecture
 
-### Two-Stage Hurdle Ensemble
+### Four-Layer Operational System
 
-**Stage 1:** 9 thematic sub-models (each with XGBoost/LightGBM base learners)  
-**Stage 2:** Meta-learners aggregate predictions through stacking  
-**Stage 3:** Sigmoid (Platt) calibration maps raw scores to calibrated probabilities (isotonic optional)  
-**Stage 4:** BCCP provides prediction intervals with guaranteed coverage (fit on log-scale, served on count-scale)
+The CEWP system operates through four sequential layers:
 
-**Theme grouping note:**  
-- `conflict_history` uses the curated ACLED dataset (location-aware, structured peace/violence categories).  
-- `news_ops` bundles GDELT media signals, CrisisWatch scores, and IODA outage indicators alongside ACLED hybrid drivers.
+**Layer 1: Binary Onset Prediction (Stage 1 Hurdle)**
+- 9 thematic sub-models (each with XGBoost/LightGBM base learners)
+- Meta-learner aggregation via **shallow XGBoost ensemble** (`n_estimators=50`, `max_depth=3`)
+- Sigmoid (Platt) calibration for probability estimates
+
+**Layer 2: Operational Tiering**
+- Dynamic quantile-based risk stratification
+- **Critical (Top 5%):** ~900 cells requiring immediate field verification
+- **High (Top 15%):** ~2,700 cells warranting daily monitoring
+- **Elevated (Top 30%):** ~5,400 cells entering watchlists
+- Adapts to violence trajectory (prevents alert fatigue during lulls, maintains sensitivity during escalation)
+
+**Layer 3: Intensity Prediction (Stage 2 Hurdle)**
+- Poisson regression for conditional fatality magnitude
+- 500-fatality stability cap (99.9th percentile) prevents numerical overflow
+- Meta-learner aggregation across thematic sub-models
+
+**Layer 4: Uncertainty Quantification**
+- BCCP provides 90% prediction intervals
+- Fit on log-scale, served on count-scale for operational interpretation
+
+**Architectural design decisions:**
+- **Meta-learner strategy:** A shallow XGBoost meta-learner is used to capture non-linear interactions between thematic themes (e.g., Conflict History AND Economic Stress jointly indicating high risk). This replaces simple linear stacking, allowing the model to learn complex, non-additive risk patterns while maintaining high sensitivity via cost-sensitive learning (`scale_pos_weight`).
+- **Feature allocation:** NLP-derived mechanism features (`mech_gold_pivot`, `mech_predatory_tax`, `mech_factional_infighting`, `mech_collective_punishment`) are exclusively assigned to the `nlp_acled` sub-model. This ensures clean signal attribution and prevents the meta-learner from arbitrarily splitting weight between correlated sub-models.
+- **Theme grouping:** `conflict_history` focuses on pure event counts and temporal lags (autoregressive signals), while `nlp_acled` handles semantic mechanism scores from text classification.
 
 ### Prediction Horizons
 
@@ -184,10 +203,24 @@ Orchestrated by `main.py`:
 | **1-month** | 2 steps | Operational planning |
 | **3-month** | 6 steps | Strategic allocation |
 
-### Output
+### Output Schema
 
+Each prediction includes:
+
+| Column | Description | Example Values |
+|--------|-------------|----------------|
+| `h3_index` | Hexagonal cell identifier | `599686042433355775` |
+| `date` | Forecast target date | `2024-06-15` |
+| `onset_prob` | Calibrated conflict probability | `0.0342` |
+| `predicted_fatalities` | Expected fatality count | `2.47` |
+| `fatalities_lower` | BCCP 90% interval lower bound | `0` |
+| `fatalities_upper` | BCCP 90% interval upper bound | `12` |
+| `risk_tier` | Operational priority tier | `Critical`, `High`, `Elevated`, `Low` |
+| `is_priority_target` | Binary flag for Critical tier | `true` / `false` |
+
+**Composite Risk Score:**
 ```
-risk_score = calibrated_probability × expected_fatalities
+risk_score = onset_prob × predicted_fatalities
 ```
 
 ---
@@ -286,7 +319,7 @@ See [docs/DIAGNOSTIC_FILTERING.md](docs/DIAGNOSTIC_FILTERING.md) for complete do
 
 ## 📈 Feature Summary
 
-**Total Features: 141 (unique columns pre-pruning)**
+**Total Features: 136 (unique columns pre-pruning)**
 
 | Category | Count |
 | --- | --- |
@@ -308,7 +341,8 @@ Model performance is assessed on operational utility rather than raw accuracy (d
 
 | Metric | Description |
 | --- | --- |
-| **Top-10% Recall** | Primary operational metric — % of actual conflict captured if intervention targets top 10% highest-risk cells |
+| **Recall @ Tier** | Primary operational metric — % of fatalities captured at Critical (5%), High (15%), and Elevated (30%) risk tiers |
+| **Pareto Efficiency** | Ratio of fatality recall to monitoring coverage (e.g., 13.5:1 means capturing 67.5% of fatalities in top 5% of cells) |
 | **PR-AUC** | Discrimination capability under class imbalance |
 | **Brier Score** | Calibration quality (lower is better) |
 | **RMSE** | Intensity prediction accuracy (absolute error on counts) |

@@ -360,59 +360,63 @@ def main(full_refresh: bool = False) -> None:
     
     client = IOMClientV3(base_url=iom_cfg.base_url, api_key=api_key)
 
+    df = pd.DataFrame()
     try:
         logger.info(f"Fetching IOM DTM data for: {iom_cfg.country_name}")
         records = client.get_admin2_displacement(iom_cfg.country_name)
         df = _standardize_admin2_records(records)
+    except Exception as e:
+        logger.error(f"IOM API failed ({e}); will attempt local fallback if configured.")
 
-        # Local fallback (only if API yields nothing)
-        if df.empty and iom_cfg.local_file:
-            local_path = PATHS["root"] / iom_cfg.local_file
-            if local_path.exists():
-                logger.warning(f"API empty. Using local file: {local_path}")
-                df_local = pd.read_csv(local_path)
-                if "reporting_date" in df_local.columns:
-                    df_local["reporting_date"] = pd.to_datetime(df_local["reporting_date"], errors="coerce").dt.date
-                if "id" not in df_local.columns:
-                    raise RuntimeError("Manual IOM CSV must contain a unique 'id' column.")
-                df = df_local
+    # Local fallback (also used when API errored or returned empty)
+    if df.empty and iom_cfg.local_file:
+        local_path = PATHS["root"] / iom_cfg.local_file
+        if local_path.exists():
+            logger.warning(f"Using local IOM file: {local_path}")
+            df_local = pd.read_csv(local_path)
+            if "reporting_date" in df_local.columns:
+                df_local["reporting_date"] = pd.to_datetime(df_local["reporting_date"], errors="coerce").dt.date
+            if "id" not in df_local.columns:
+                raise RuntimeError("Manual IOM CSV must contain a unique 'id' column.")
+            df = df_local
+        else:
+            logger.error(f"Configured local IOM file not found: {local_path}")
 
-        if df.empty:
-            logger.warning("No IOM data extracted from API or local file. Nothing to upload.")
-            return
+    if df.empty:
+        logger.warning("No IOM data extracted from API or local file. Nothing to upload.")
+        return
 
-        # -------------------------------------------------------------------------
-        # INCREMENTAL FILTER: Only keep records in our target window
-        # -------------------------------------------------------------------------
-        original_count = len(df)
-        df['reporting_date'] = pd.to_datetime(df['reporting_date']).dt.date
-        fetch_start_date = fetch_start.date()
-        
-        df = df[df['reporting_date'] >= fetch_start_date]
-        df = df[df['reporting_date'] <= pd.to_datetime(end).date()]
-        logger.info(f"  Filtered to {len(df)} records (from {original_count} total)")
-        
-        if df.empty:
-            logger.info("✅ IOM data already up to date. No new records after filtering.")
-            return
+    # -------------------------------------------------------------------------
+    # INCREMENTAL FILTER: Only keep records in our target window
+    # -------------------------------------------------------------------------
+    original_count = len(df)
+    df['reporting_date'] = pd.to_datetime(df['reporting_date']).dt.date
+    fetch_start_date = fetch_start.date()
+    
+    df = df[df['reporting_date'] >= fetch_start_date]
+    df = df[df['reporting_date'] <= pd.to_datetime(end).date()]
+    logger.info(f"  Filtered to {len(df)} records (from {original_count} total)")
+    
+    if df.empty:
+        logger.info("✅ IOM data already up to date. No new records after filtering.")
+        return
 
-        # Integer coercion and invariant enforcement before upload
-        df = _coerce_integer_like_columns(df)
-        _assert_no_float_strings(df)
+    # Integer coercion and invariant enforcement before upload
+    df = _coerce_integer_like_columns(df)
+    _assert_no_float_strings(df)
 
-        # Save CSV snapshot
-        out_path = PATHS["data_proc"] / OUTPUT_FILENAME
-        df.to_csv(out_path, index=False)
-        logger.info(f"Saved: {out_path} ({len(df):,} rows)")
+    # Save CSV snapshot
+    out_path = PATHS["data_proc"] / OUTPUT_FILENAME
+    df.to_csv(out_path, index=False)
+    logger.info(f"Saved: {out_path} ({len(df):,} rows)")
 
-        # Ensure table then upload
-        _ensure_raw_table(engine)
-        logger.info(f"Uploading {len(df):,} rows to DB {SCHEMA}.{TABLE_NAME}...")
-        upload_to_postgis(engine, df, TABLE_NAME, SCHEMA, primary_keys=["id"])
-        logger.info("✅ IOM ingestion complete.")
+    # Ensure table then upload
+    _ensure_raw_table(engine)
+    logger.info(f"Uploading {len(df):,} rows to DB {SCHEMA}.{TABLE_NAME}...")
+    upload_to_postgis(engine, df, TABLE_NAME, SCHEMA, primary_keys=["id"])
+    logger.info("✅ IOM ingestion complete.")
 
-    finally:
-        client.close()
+    client.close()
 
 
 if __name__ == "__main__":
