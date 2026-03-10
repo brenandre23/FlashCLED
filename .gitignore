@@ -107,3 +107,19 @@ agrimatrix_outputs/
 .gemini/
 # Claude agent infrastructure (local only)
 .claude/
+
+# --- Agent Context Files (Claude/Gemini internal, not project code) ---
+MANIFEST.md
+CONTEXT.md
+TASK_QUEUE.md
+DECISIONS.md
+DATA_DICTIONARY.md
+FIGURES.md
+GLOSSARY.md
+RUNBOOK.md
+PLAN.md
+PRD.md
+PLAN_onset_diagnostic.md
+FlashCLED_ML_Specs.md
+final_audit.ini
+MCP/
