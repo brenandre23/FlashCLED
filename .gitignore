@@ -105,5 +105,5 @@ OG_Analysis/
 agrimatrix_outputs/
 # Gemini settings (deleted; prevent recurrence)
 .gemini/
-# Machine-specific Claude settings
-.claude/settings.local.json
+# Claude agent infrastructure (local only)
+.claude/
