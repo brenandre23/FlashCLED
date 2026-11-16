@@ -37,7 +37,8 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from utils import logger, PATHS, load_configs  # noqa: E402
+from utils import logger, PATHS, load_configs, get_step_days  # noqa: E402
+from pipeline.modeling.temporal_splits import embargoed_train_mask  # noqa: E402
 from pipeline.modeling.two_stage_ensemble import TwoStageEnsemble  # noqa: E402
 
 try:
@@ -331,6 +332,12 @@ def main():
     # Train/Test split
     # ------------------------------------------------------------------
     train_df, test_df = get_train_test_split(df, cutoff="2020-12-31")
+    # Embargo: drop training rows whose label window reaches into the test period.
+    step_days = get_step_days()
+    embargo_ok = embargoed_train_mask(
+        train_df["date"], pd.Timestamp("2021-01-01"), horizon["steps"], step_days
+    )
+    train_df = train_df[embargo_ok].sort_values(["date", "h3_index"], kind="mergesort")
     
     # Drop rows with missing targets
     train_df = train_df.dropna(subset=[target_col])
@@ -412,7 +419,10 @@ def main():
                 continue
             
             # Build and fit ensemble
-            ensemble = TwoStageEnsemble(theme_models=themes, n_folds=5)
+            ensemble = TwoStageEnsemble(
+                theme_models=themes, n_folds=5,
+                embargo_steps=horizon["steps"], step_days=step_days,
+            )
             ensemble.fit(X_train, y_train_bin, y_train_reg)
 
             # Predict

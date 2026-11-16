@@ -41,7 +41,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from utils import logger, PATHS, get_db_engine
+from utils import logger, PATHS, get_db_engine, get_train_cutoff
 from pipeline.modeling.two_stage_ensemble import TwoStageEnsemble
 
 
@@ -49,7 +49,10 @@ from pipeline.modeling.two_stage_ensemble import TwoStageEnsemble
 # CONFIGURATION
 # ==============================================================================
 HORIZON = "14d"  # Forecast horizon to analyze
-TEST_SPLIT_DATE = "2020-12-31"  # Data after this date is test set
+# Test set = rows dated on/after the training cutoff in configs/data.yaml. The saved
+# ensembles are trained up to that cutoff, so any earlier 'test' date would score
+# them on their own training data. (split_train_test keeps date > TEST_SPLIT_DATE.)
+TEST_SPLIT_DATE = str((get_train_cutoff() - pd.Timedelta(days=1)).date())
 FEATURE_MATRIX_PATH = PATHS["data"] / "processed" / "feature_matrix.parquet"
 MODELS_DIR = PATHS["models"]
 ANALYSIS_DIR = PATHS["root"] / "analysis"

@@ -33,7 +33,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 try:
-    from utils import logger, PATHS, load_configs, get_db_engine
+    from utils import logger, PATHS, load_configs, get_db_engine, get_train_cutoff
     from pipeline.modeling.two_stage_ensemble import TwoStageEnsemble
     from pipeline.modeling.load_data_utils import sanitize_dataframe
 except ImportError as e:
@@ -47,7 +47,9 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # Configuration
 MODEL_FILENAME = "two_stage_ensemble_14d_xgboost.pkl"
 SAMPLE_SIZE = 1000
-TEST_DATE_CUTOFF = "2020-12-31"
+# Out-of-sample boundary comes from configs/data.yaml (split.train_cutoff), the same
+# value training uses. A hardcoded date here once pointed inside the training period.
+TEST_DATE_CUTOFF = get_train_cutoff()
 SCHEMA = "car_cewp"
 
 
@@ -380,7 +382,7 @@ def main():
     df = apply_pca_if_needed(df, bundle)
 
     # Filter Test Set & Sample
-    test_df = df[df["date"] > pd.Timestamp(TEST_DATE_CUTOFF)]
+    test_df = df[df["date"] >= pd.Timestamp(TEST_DATE_CUTOFF)]
     X_sample = test_df.sample(n=SAMPLE_SIZE, random_state=42) if len(test_df) > SAMPLE_SIZE else test_df
     
     # Run Analysis

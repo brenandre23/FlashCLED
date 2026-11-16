@@ -16,10 +16,12 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
 
-from utils import logger, PATHS
+from utils import logger, PATHS, get_train_cutoff
 
 # Parameters
-TEST_DATE_CUTOFF = "2021-01-01"
+# Out-of-sample boundary comes from configs/data.yaml (split.train_cutoff), the same
+# value training uses. A hardcoded date here once pointed inside the training period.
+TEST_DATE_CUTOFF = get_train_cutoff()
 MODEL_PATH = PATHS["models"] / "two_stage_ensemble_14d_xgboost.pkl"
 FEATURE_MATRIX_PATH = PATHS["data_proc"] / "feature_matrix.parquet"
 OUTPUT_PATH = PATHS["root"] / "analysis" / "conformal_diagnostics.csv"

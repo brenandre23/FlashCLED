@@ -261,7 +261,8 @@ def compute_signal_dip(df_oos: pd.DataFrame,
 
 def main(horizon="14d", learner="xgboost", plot=False):
     config = load_configs()
-    train_cutoff = pd.Timestamp(config["data"].get("train_cutoff", TRAIN_CUTOFF))
+    # split.train_cutoff (the old lookup read a key that does not exist and always fell back)
+    train_cutoff = pd.Timestamp(config["data"].get("split", {}).get("train_cutoff", TRAIN_CUTOFF))
 
     # -----------------------------------------------------------------------
     # DATA LOADING

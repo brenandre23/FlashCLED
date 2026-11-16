@@ -6,7 +6,7 @@
 # --- GLOBAL DATE CONTROL ---
 global_date_window:
   start_date: "2000-01-01"
-  end_date: "2025-12-31"
+  end_date: "2026-11-16"   # Updated run (2026-11): extend to the day of the run
 
 # --- STRUCTURAL BREAK DATES (Centralized Source of Truth) ---
 # NOTE (Audit Fix 2026-01-27): Updated from actual MIN(date) in database
@@ -37,7 +37,10 @@ structural_breaks:
 split:
   test_year: 2023
   validation_years: [2021, 2022, 2024, 2025]
-  train_cutoff: "2024-01-01"  # Matches hardcoded split_date in train_single_model.py:364
+  # Single source of truth, read through utils.get_train_cutoff() by training AND by
+  # every evaluation script. Rows dated on/after it are out-of-sample. Training stops
+  # one forecast horizon earlier (embargo), so no training label comes from the hold-out.
+  train_cutoff: "2026-01-01"
 
 # --- VALIDATION ---
 validation:
@@ -53,6 +56,9 @@ car_bbox: [14.0, 2.0, 28.0, 11.5]
 # 1. CONFLICT & EVENTS
 acled:
   local_file: "data/raw/acled.csv"
+  # Pipeline stops if ACLED ends more than this many days before the window end
+  # (later periods would be zero-filled as "no conflict"). Override: CEWP_ALLOW_STALE_ACLED=1
+  max_staleness_days: 45
   country: "Central African Republic"
 
 gdelt:
