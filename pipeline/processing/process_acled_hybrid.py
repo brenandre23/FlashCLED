@@ -224,65 +224,93 @@ def compute_text_quality_weight(text: str) -> float:
     return max(0.1, length_weight)
 
 
+def actor_weights_from_window(window: pd.DataFrame) -> dict:
+    """
+    Actor -> weight in [0, 1] from one calibration window of events
+    (columns: actor, fatalities). log1p of total fatalities, top actor = 1.0.
+    Actors with no fatalities in the window get no weight.
+    """
+    totals = window.groupby("actor")["fatalities"].sum()
+    totals = totals[totals > 0]
+    if totals.empty:
+        return {}
+    weights = np.log1p(totals)
+    return (weights / weights.max()).to_dict()
+
+
+def point_in_time_actor_weights(events: pd.DataFrame, lookback_years: int = None) -> dict:
+    """
+    Actor risk weights that only use the past.
+
+    For every calendar month M that contains events, weights are calibrated on
+    events dated in [M - lookback, M): strictly before the month starts. An
+    event is then scored with the weights of its own month.
+
+    The previous version calibrated ONE set of weights on the last year before
+    today and applied it to every event since 2000. A feature for 2010 was
+    therefore built from knowing which actors killed most in the most recent
+    year: fatalities (the prediction target) from the future, and from the
+    hold-out period, flowed into the training features. Months whose lookback
+    window has no lethal actor get an empty mapping (score 0) rather than a
+    hand-written fallback list, which would also encode hindsight.
+
+    Args:
+        events: DataFrame with event_date, actor (lower-cased, trimmed), fatalities.
+    Returns:
+        {month_start Timestamp: {actor: weight}}
+    """
+    if lookback_years is None:
+        lookback_years = CALIBRATION_LOOKBACK_YEARS
+    ev = events.dropna(subset=["event_date", "actor"]).copy()
+    ev = ev[ev["actor"] != ""]
+    ev["event_date"] = pd.to_datetime(ev["event_date"])
+    ev["fatalities"] = pd.to_numeric(ev["fatalities"], errors="coerce").fillna(0)
+    ev = ev.sort_values("event_date")
+    dates = ev["event_date"].to_numpy()
+
+    weights_by_month = {}
+    for month_start in sorted(ev["event_date"].dt.to_period("M").dt.to_timestamp().unique()):
+        month_start = pd.Timestamp(month_start)
+        lo = np.searchsorted(dates, (month_start - pd.DateOffset(years=lookback_years)).to_datetime64(), side="left")
+        hi = np.searchsorted(dates, month_start.to_datetime64(), side="left")  # strictly before the month
+        weights_by_month[month_start] = actor_weights_from_window(ev.iloc[lo:hi])
+    return weights_by_month
+
+
 def calibrate_actor_risk_model(engine) -> dict:
     """
-    Dynamically calibrate actor risk weights from recent fatality data.
-    
-    Methodology:
-    1. Query total fatalities per actor over the lookback window
-    2. Filter to actors with >0 fatalities (lethal actors only)
-    3. Apply log1p transform to compress scale
-    4. Normalize so top killer = 1.0
-    
-    Returns:
-        dict: Mapping of actor name (lowercase) to normalized risk weight [0, 1]
+    Point-in-time actor risk weights from ACLED fatalities (see
+    point_in_time_actor_weights). Returns {month_start: {actor: weight}}.
     """
-    logger.info(f"Calibrating actor risk model (lookback={CALIBRATION_LOOKBACK_YEARS} year(s))...")
-    
+    logger.info(
+        f"Calibrating point-in-time actor risk weights "
+        f"(trailing {CALIBRATION_LOOKBACK_YEARS} year(s) before each month)..."
+    )
     query = f"""
-        SELECT 
-            LOWER(TRIM(actor1)) AS actor,
-            SUM(fatalities) AS total_fatalities
+        SELECT event_date, LOWER(TRIM(actor1)) AS actor, fatalities
         FROM {SCHEMA}.acled_events
-        WHERE event_date >= CURRENT_DATE - INTERVAL '{CALIBRATION_LOOKBACK_YEARS} year'
-          AND actor1 IS NOT NULL
-          AND actor1 != ''
-        GROUP BY LOWER(TRIM(actor1))
-        HAVING SUM(fatalities) > 0
-        ORDER BY total_fatalities DESC
+        WHERE actor1 IS NOT NULL AND actor1 != ''
     """
-    
-    try:
-        df = pd.read_sql(query, engine)
-        
-        if df.empty:
-            logger.warning("No lethal actors found in calibration window. Using fallback weights.")
-            return FALLBACK_RISK_WEIGHTS.copy()
-        
-        # Log1p transform to compress scale (prevents extreme outliers from dominating)
-        df['weight'] = np.log1p(df['total_fatalities'])
-        
-        # Normalize to [0, 1] where top killer = 1.0
-        max_weight = df['weight'].max()
-        if max_weight > 0:
-            df['weight_normalized'] = df['weight'] / max_weight
-        else:
-            df['weight_normalized'] = 0.0
-        
-        # Build dictionary
-        risk_weights = dict(zip(df['actor'], df['weight_normalized']))
-        
-        # Log top actors for diagnostics
-        top_5 = df.nlargest(5, 'total_fatalities')[['actor', 'total_fatalities', 'weight_normalized']]
-        logger.info(f"Calibrated {len(risk_weights)} lethal actors. Top 5:")
-        for _, row in top_5.iterrows():
-            logger.info(f"  {row['actor'][:50]}: {row['total_fatalities']} fatalities -> weight={row['weight_normalized']:.3f}")
-        
-        return risk_weights
-        
-    except Exception as e:
-        logger.error(f"Actor calibration query failed: {e}. Using fallback weights.")
-        return FALLBACK_RISK_WEIGHTS.copy()
+    events = pd.read_sql(query, engine)
+    weights_by_month = point_in_time_actor_weights(events)
+    n_nonempty = sum(1 for w in weights_by_month.values() if w)
+    logger.info(f"Calibrated {len(weights_by_month)} monthly weight sets ({n_nonempty} with lethal actors).")
+    return weights_by_month
+
+
+def score_actor_risk_point_in_time(df: pd.DataFrame, weights_by_month: dict) -> pd.Series:
+    """Score each event with the actor weights calibrated before its own month."""
+    months = pd.to_datetime(df["event_date"]).dt.to_period("M").dt.to_timestamp()
+    scores = pd.Series(0.0, index=df.index)
+    for month_start, group in df.groupby(months):
+        weights = weights_by_month.get(pd.Timestamp(month_start), {})
+        if not weights:
+            continue
+        scores.loc[group.index] = [
+            compute_actor_risk_score(a1, a2, weights)
+            for a1, a2 in zip(group.get("actor1"), group.get("actor2"))
+        ]
+    return scores
 
 
 def compute_actor_risk_score(actor1: str, actor2: str, risk_weights: dict) -> float:
@@ -374,7 +402,8 @@ def process_data(df: pd.DataFrame, risk_weights: dict) -> pd.DataFrame:
     
     Args:
         df: DataFrame with ACLED events (must have notes, actor1, actor2 columns)
-        risk_weights: Dynamically calibrated actor risk weights from calibrate_actor_risk_model()
+        risk_weights: Point-in-time weights {month_start: {actor: weight}} from
+            calibrate_actor_risk_model()
     
     Steps:
     1. Clean text
@@ -407,10 +436,7 @@ def process_data(df: pd.DataFrame, risk_weights: dict) -> pd.DataFrame:
     # Step 3: Actor Risk Scores (using dynamic calibration)
     # -------------------------------------------------------------------------
     logger.info("Computing actor risk scores...")
-    df['acled_actor_risk_score'] = df.apply(
-        lambda x: compute_actor_risk_score(x.get('actor1'), x.get('actor2'), risk_weights), 
-        axis=1
-    )
+    df['acled_actor_risk_score'] = score_actor_risk_point_in_time(df, risk_weights)
     
     actor_coverage = (df['acled_actor_risk_score'] > 0).mean()
     logger.info(f"  Actor coverage: {actor_coverage:.1%} of events matched lethal actors")

@@ -180,6 +180,79 @@ def load_configs() -> ConfigBundle:
     return ConfigBundle(loaded[0], loaded[1], loaded[2])
 
 # -----------------------------------------------------------------
+# 4b. TEMPORAL SPLIT / DATA-FRESHNESS HELPERS (single source of truth)
+# -----------------------------------------------------------------
+DEFAULT_TRAIN_CUTOFF = "2024-01-01"
+
+
+def get_train_cutoff(data_cfg: Optional[dict] = None) -> pd.Timestamp:
+    """
+    Train/hold-out boundary from configs/data.yaml (split.train_cutoff).
+
+    Rows with date >= cutoff are out-of-sample. Every module that trains or
+    evaluates must read the boundary from here so the two can never disagree
+    (evaluating "test" rows the model was trained on inflates every metric).
+    """
+    if data_cfg is None:
+        data_cfg = load_configs().data
+    value = (data_cfg.get("split", {}) or {}).get("train_cutoff", DEFAULT_TRAIN_CUTOFF)
+    return pd.Timestamp(value).normalize()
+
+
+def get_step_days(features_cfg: Optional[dict] = None) -> int:
+    """Length of one spine step in days (features.yaml temporal.step_days)."""
+    if features_cfg is None:
+        features_cfg = load_configs().features
+    return int((features_cfg.get("temporal", {}) or {}).get("step_days", 14))
+
+
+def get_acled_coverage_end(engine, schema: str = "car_cewp") -> Optional[pd.Timestamp]:
+    """Latest event_date held in acled_events, or None if the table is empty/missing."""
+    try:
+        with engine.connect() as conn:
+            exists = conn.execute(text("SELECT to_regclass(:t)"), {"t": f"{schema}.acled_events"}).scalar()
+            if not exists:
+                return None
+            value = conn.execute(text(f"SELECT MAX(event_date) FROM {schema}.acled_events")).scalar()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(f"Could not read ACLED coverage end: {exc}")
+        return None
+    return None if value is None else pd.Timestamp(value).normalize()
+
+
+def assert_acled_fresh(engine, requested_end, data_cfg: Optional[dict] = None, schema: str = "car_cewp") -> None:
+    """
+    Stop the pipeline when ACLED coverage ends long before the requested window end.
+
+    Conflict columns are zero-filled ("no event recorded = no event"). If ACLED
+    itself is stale, every period after its last event silently becomes
+    "no conflict", which corrupts both the conflict-history features and the
+    labels. Override deliberately with CEWP_ALLOW_STALE_ACLED=1.
+    """
+    if data_cfg is None:
+        data_cfg = load_configs().data
+    max_stale = int((data_cfg.get("acled", {}) or {}).get("max_staleness_days", 45))
+    end = min(pd.Timestamp(requested_end).normalize(), pd.Timestamp.today().normalize())
+    coverage = get_acled_coverage_end(engine, schema)
+    if coverage is None:
+        msg = "acled_events is empty or missing."
+    else:
+        stale_days = (end - coverage).days
+        if stale_days <= max_stale:
+            logger.info(f"ACLED coverage ends {coverage.date()} ({stale_days} days before window end) - OK")
+            return
+        msg = (f"ACLED coverage ends {coverage.date()}, {stale_days} days before the window end "
+               f"{end.date()} (limit {max_stale} days).")
+    msg += (" Later periods would be zero-filled as 'no conflict'. Set ACLED_EMAIL/ACLED_PASSWORD "
+            "for the API, or download a current export to data/raw/acled.csv, then re-run. "
+            "To proceed anyway set CEWP_ALLOW_STALE_ACLED=1.")
+    if os.environ.get("CEWP_ALLOW_STALE_ACLED") == "1":
+        logger.warning(f"STALE ACLED (override active): {msg}")
+        return
+    raise RuntimeError(msg)
+
+
+# -----------------------------------------------------------------
 # 5. DATABASE
 # -----------------------------------------------------------------
 def get_secrets() -> dict:

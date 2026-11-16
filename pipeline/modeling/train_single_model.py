@@ -26,7 +26,8 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from utils import logger, load_configs, PATHS
+from utils import logger, load_configs, PATHS, get_train_cutoff, get_step_days
+from pipeline.modeling.temporal_splits import embargoed_train_mask
 from pipeline.modeling.load_data_utils import sanitize_dataframe
 from pipeline.modeling.two_stage_ensemble import TwoStageEnsemble
 from pipeline.modeling.conformal_prediction import (
@@ -268,11 +269,15 @@ def build_theme_models(config, learner_name, pruned_features: set | None = None)
     learner_type = learner_cfg["type"]
     base_params = learner_cfg["params"].copy()
     reg_params = base_params.copy()
+    # Models are trained one at a time in their own process, so each fit may
+    # use every core. Override with CEWP_TRAIN_THREADS (e.g. inside a
+    # CPU-limited container, where os.cpu_count() over-reports).
+    n_threads = int(os.environ.get("CEWP_TRAIN_THREADS", os.cpu_count() or 1))
 
     if learner_type == "xgboost":
         Cls, Reg = XGBClassifier, XGBRegressor
-        base_params["n_jobs"] = 1
-        reg_params["n_jobs"] = 1
+        base_params["n_jobs"] = n_threads
+        reg_params["n_jobs"] = n_threads
         base_params["objective"] = "binary:logistic"
         base_params["eval_metric"] = "logloss"
         reg_params["objective"] = "count:poisson"
@@ -283,9 +288,9 @@ def build_theme_models(config, learner_name, pruned_features: set | None = None)
         
     elif learner_type == "lightgbm":
         Cls, Reg = LGBMClassifier, LGBMRegressor
-        base_params["num_threads"] = 1
+        base_params["num_threads"] = n_threads
         base_params["verbose"] = -1
-        reg_params["num_threads"] = 1
+        reg_params["num_threads"] = n_threads
         reg_params["verbose"] = -1
         base_params["objective"] = "binary"
         reg_params["objective"] = "poisson"
@@ -328,6 +333,53 @@ def build_theme_models(config, learner_name, pruned_features: set | None = None)
 
 
 # =============================================================================
+# MODEL / DATA FINGERPRINT (prevents silently reusing a stale model)
+# =============================================================================
+
+def training_fingerprint(horizon: str, learner_name: str, data_cfg: dict, models_cfg: dict) -> str:
+    """
+    Hash of everything a saved model depends on: the split, its own config and
+    the feature matrix it was fitted on. A saved model is reused only when this
+    matches; otherwise it is set aside and retrained.
+    """
+    import hashlib
+    import json
+
+    fm_path = PATHS["data_proc"] / "feature_matrix.parquet"
+    meta_path = PATHS["data_proc"] / "matrix_meta.json"
+    pruned_path = PATHS["root"] / "configs" / "pruned_features.yaml"
+    payload = {
+        "version": 3,  # bump when the training procedure itself changes
+        "train_cutoff": str(get_train_cutoff(data_cfg).date()),
+        "horizon": next(h for h in models_cfg["horizons"] if h["name"] == horizon),
+        "learner": models_cfg["learners"][learner_name],
+        "submodels": models_cfg.get("submodels"),
+        "calibration": models_cfg.get("calibration"),
+        "meta_learner": models_cfg.get("meta_learner"),
+        "hurdle_params": models_cfg.get("hurdle_params"),
+        "conformal_prediction": models_cfg.get("conformal_prediction"),
+        "matrix_meta": meta_path.read_text() if meta_path.exists() else None,
+        "matrix_bytes": fm_path.stat().st_size if fm_path.exists() else None,
+        "pruned_features": pruned_path.read_text() if pruned_path.exists() else None,
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def set_aside_stale_model(output_path: Path, sidecar_path: Path) -> None:
+    """Move a superseded model (never delete it) to models/superseded/<timestamp>/."""
+    from datetime import datetime
+    import shutil
+
+    dest = PATHS["models"] / "superseded" / datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest.mkdir(parents=True, exist_ok=True)
+    for path in (output_path, sidecar_path):
+        if path.exists():
+            shutil.move(str(path), str(dest / path.name))
+    logger.warning(f"♻️ Existing {output_path.name} does not match current data/config; moved to {dest}")
+
+
+# =============================================================================
 # MAIN TRAINING FUNCTION
 # =============================================================================
 
@@ -336,14 +388,20 @@ def run_single_training(horizon, learner_name):
     filename = f"two_stage_ensemble_{horizon}_{learner_name}.pkl"
     output_path = PATHS["models"] / filename
 
+    sidecar_path = output_path.with_suffix(".fingerprint")
+    data_cfg, features_cfg, models_cfg = load_configs()
+    fingerprint = training_fingerprint(horizon, learner_name, data_cfg, models_cfg)
+
     if output_path.exists():
-        logger.info(f"⏭️ [WORKER] Skipping {filename} (Already exists)")
-        return
+        saved = sidecar_path.read_text().strip() if sidecar_path.exists() else None
+        if saved == fingerprint:
+            logger.info(f"⏭️ [WORKER] Skipping {filename} (up to date for current data and config)")
+            return
+        set_aside_stale_model(output_path, sidecar_path)
 
     logger.info(f"🟢 [WORKER PID {os.getpid()}] Starting: {horizon} | {learner_name}")
 
     try:
-        _, _, models_cfg = load_configs()
         horizon_cfg = next(h for h in models_cfg["horizons"] if h["name"] == horizon)
         lookahead_steps = horizon_cfg["steps"]
 
@@ -361,10 +419,31 @@ def run_single_training(horizon, learner_name):
             df[target_col] = df.groupby("h3_index")[source].shift(-lookahead_steps)
             df.dropna(subset=[target_col], inplace=True)
 
-        split_date = pd.to_datetime("2024-01-01")
-        train_mask = pd.to_datetime(df["date"]) < split_date
-        df = df[train_mask].reset_index(drop=True)
+        # ---------------------------------------------------------------
+        # LEAK-SAFE TRAINING WINDOW
+        # Hold-out = rows dated >= train_cutoff. A training row dated d carries
+        # the label of the window ending d + horizon, so training stops one
+        # horizon BEFORE the cutoff: no training label comes from inside the
+        # hold-out period (see temporal_splits.py).
+        # ---------------------------------------------------------------
+        split_date = get_train_cutoff(data_cfg)
+        step_days = get_step_days(features_cfg)
+        df["date"] = pd.to_datetime(df["date"])
+        train_mask = embargoed_train_mask(df["date"], split_date, lookahead_steps, step_days)
+        train_mask &= df[target_col].notna().to_numpy()
+        # Deterministic order (date, then cell). Splits are derived from the
+        # date values, not from row position, but a fixed order keeps
+        # subsampling and tie-breaking reproducible between runs.
+        df = df[train_mask].sort_values(["date", "h3_index"], kind="mergesort").reset_index(drop=True)
         gc.collect()
+        if df.empty:
+            raise ValueError(f"No training rows before {split_date.date()} minus {lookahead_steps} step(s).")
+        last_label = df["date"].max() + pd.Timedelta(days=lookahead_steps * step_days)
+        assert last_label < split_date, "Embargo violated: a training label falls inside the hold-out period"
+        logger.info(
+            f"Training window: {df['date'].min().date()} -> {df['date'].max().date()} "
+            f"({len(df):,} rows); last label window ends {last_label.date()}; hold-out starts {split_date.date()}"
+        )
 
         df, pca_bundle = process_pca_subsampled(df, models_cfg)
         y_reg = df[target_col]
@@ -388,6 +467,8 @@ def run_single_training(horizon, learner_name):
             theme_models=theme_models,
             calibration_config=models_cfg.get("calibration", {}),
             meta_config=models_cfg.get("meta_learner", {}),
+            embargo_steps=lookahead_steps,
+            step_days=step_days,
         )
         # FIT the ensemble (computes and stores train_idx_ and cal_idx_ internally)
         ensemble.fit(df, y_bin, y_reg)
@@ -415,19 +496,29 @@ def run_single_training(horizon, learner_name):
         else:
             logger.info("ℹ️ Calibration disabled; metrics/BCCP using training indices.")
         
-        cal_idx = ensemble.cal_idx_
-        if cal_idx is None:
-            raise ValueError("cal_idx is None before indexing df")
-            
-        # Isolate the Calibration Set using ensemble-defined indices
-        df_cal = df.iloc[cal_idx]
-        y_reg_cal = y_reg.iloc[cal_idx]
-        
-        logger.info(f"Using ensemble-defined calibration set: {len(cal_idx):,} rows")
-        
-        # Predict on Calibration Set ONLY
-        # Returns: prob, expected_fatalities (unconditional)
-        _, expected_fatalities_cal = ensemble.predict(df_cal)
+        if cal_method != "none":
+            # Held-out calibration tail (whole dates, embargoed from training).
+            cal_idx = ensemble.cal_idx_
+            y_reg_cal = y_reg.iloc[cal_idx]
+            logger.info(f"Conformal/metrics data: held-out calibration set, {len(cal_idx):,} rows")
+            _, expected_fatalities_cal = ensemble.predict(df.iloc[cal_idx])
+        else:
+            # No calibration set is held out, so the fitted models have seen
+            # every row. Residuals of in-sample predictions are too small and
+            # would make the conformal intervals too narrow. Use the stack's
+            # out-of-fold predictions instead (each from base models that never
+            # saw that row's period).
+            cal_idx = ensemble.oof_idx_
+            if cal_idx is None or len(cal_idx) == 0:
+                raise ValueError("No out-of-fold predictions available for conformal calibration")
+            y_reg_cal = y_reg.iloc[cal_idx]
+            expected_fatalities_cal = ensemble.oof_expected_fatalities_
+            logger.info(f"Conformal/metrics data: out-of-fold predictions, {len(cal_idx):,} rows")
+
+        # OOF arrays are only needed here; keep them out of the saved model.
+        ensemble.oof_idx_ = None
+        ensemble.oof_prob_ = None
+        ensemble.oof_expected_fatalities_ = None
 
         # =================================================================
         # FEATURE IMPORTANCE MONITORING
@@ -506,10 +597,14 @@ def run_single_training(horizon, learner_name):
             "bccp": bccp,
             "config": horizon_cfg,
             "learner": learner_name,
+            "train_cutoff": str(split_date.date()),
+            "embargo_steps": lookahead_steps,
+            "train_last_date": str(df["date"].max().date()),
         }
         save_dict.update(pca_bundle)
 
         joblib.dump(save_dict, output_path)
+        sidecar_path.write_text(fingerprint)
         logger.info(f"✅ [WORKER] Success: {filename}")
 
     except Exception as e:

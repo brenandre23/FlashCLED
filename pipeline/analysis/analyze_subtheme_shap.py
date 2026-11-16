@@ -28,7 +28,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 try:
-    from utils import logger, PATHS, load_configs
+    from utils import logger, PATHS, load_configs, get_train_cutoff
     from pipeline.modeling.two_stage_ensemble import TwoStageEnsemble
     from pipeline.modeling.load_data_utils import sanitize_dataframe
 except ImportError as e:
@@ -42,7 +42,9 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # SHAP Settings
 SAMPLE_SIZE = 2000  # Higher than importance script, but still manageable
-TEST_DATE_CUTOFF = "2020-12-31"
+# Out-of-sample boundary comes from configs/data.yaml (split.train_cutoff), the same
+# value training uses. A hardcoded date here once pointed inside the training period.
+TEST_DATE_CUTOFF = get_train_cutoff()
 
 
 def load_model_bundle(model_name: str):
@@ -226,7 +228,7 @@ def main():
     if not np.issubdtype(df["date"].dtype, np.datetime64):
         df["date"] = pd.to_datetime(df["date"])
 
-    test_df = df[df["date"] > pd.Timestamp(TEST_DATE_CUTOFF)].copy()
+    test_df = df[df["date"] >= pd.Timestamp(TEST_DATE_CUTOFF)].copy()
     test_sample = (
         test_df.sample(n=SAMPLE_SIZE, random_state=42) if len(test_df) > SAMPLE_SIZE else test_df
     )

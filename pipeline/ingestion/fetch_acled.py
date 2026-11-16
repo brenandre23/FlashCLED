@@ -36,7 +36,8 @@ from utils import (
     load_configs, 
     logger, 
     upload_to_postgis, 
-    get_incremental_window
+    get_incremental_window,
+    assert_acled_fresh,
 )
 
 SCHEMA = "car_cewp"
@@ -98,24 +99,70 @@ def ensure_table_structure(engine):
         conn.execute(text(CREATE_TABLE_SQL))
 
 
+ACLED_TOKEN_URL = "https://acleddata.com/oauth/token"
+ACLED_READ_URL = "https://acleddata.com/api/acled/read"
+ACLED_MAX_PAGES = 500
+
+
+def _acled_access_token(email: str, password: str) -> str:
+    """OAuth password grant (ACLED API, 2025 onward). Token is valid for 24 hours."""
+    response = requests.post(
+        ACLED_TOKEN_URL,
+        data={
+            "username": email,
+            "password": password,
+            "grant_type": "password",
+            "client_id": "acled",
+            "scope": "authenticated",
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=60,
+    )
+    response.raise_for_status()
+    token = response.json().get("access_token")
+    if not token:
+        raise RuntimeError("ACLED token response contained no access_token")
+    return token
+
+
 def fetch_from_api(start, end, email, key):
-    """Programmatic API fetch using ACLED /read endpoint."""
-    base_url = "https://api.acleddata.com/acled/read"
-    params = {
-        "email": email,
-        "key": key,
-        "event_date": f"{start}|{end}",
-        "event_date_where": "BETWEEN",
-        "country": "Central African Republic",
-        "limit": 0  # Get all records in window
-    }
-    
+    """
+    Programmatic fetch from the ACLED API (OAuth bearer token, cursor pagination).
+
+    `key` is the account password (ACLED_PASSWORD). Returns a DataFrame, or
+    None when the API could not be used, so the caller falls back to the CSV.
+    """
+    if not email or not key:
+        logger.warning("⚠️ ACLED_EMAIL / ACLED_PASSWORD not set. Reverting to CSV...")
+        return None
+
+    start_s = pd.to_datetime(start).strftime("%Y-%m-%d")
+    end_s = pd.to_datetime(end).strftime("%Y-%m-%d")
     try:
-        logger.info(f"📡 API Request: {start} -> {end}")
-        response = requests.get(base_url, params=params, timeout=60)
-        response.raise_for_status()
-        data = response.json().get("data", [])
-        return pd.DataFrame(data) if data else pd.DataFrame()
+        logger.info(f"📡 API Request: {start_s} -> {end_s}")
+        headers = {"Authorization": f"Bearer {_acled_access_token(email, key)}"}
+        params = {
+            "_format": "json",
+            "country": "Central African Republic",
+            "event_date": f"{start_s}|{end_s}",
+            "event_date_where": "BETWEEN",
+            "limit": 5000,
+            "cursor": 0,
+        }
+        rows = []
+        for _ in range(ACLED_MAX_PAGES):
+            response = requests.get(ACLED_READ_URL, params=params, headers=headers, timeout=120)
+            response.raise_for_status()
+            payload = response.json()
+            rows.extend(payload.get("data", []) or [])
+            next_cursor = payload.get("next_cursor")
+            if next_cursor in (None, "", params["cursor"]):
+                break
+            params["cursor"] = next_cursor
+        else:
+            raise RuntimeError(f"ACLED pagination did not finish within {ACLED_MAX_PAGES} pages")
+        logger.info(f"   API returned {len(rows):,} events")
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
     except Exception as e:
         logger.warning(f"⚠️ API failed ({e}). Reverting to CSV...")
         return None
@@ -258,10 +305,11 @@ def run(configs=None, engine=None, args=None):
     if args is None:
         args = ACLEDArgs()
     
+    data_cfg = configs.get("data", configs[0] if isinstance(configs, tuple) else {})
+
     # Ensure args has required attributes with defaults
     if not hasattr(args, 'end_date') or args.end_date is None:
         # Derive from config
-        data_cfg = configs.get("data", configs[0] if isinstance(configs, tuple) else {})
         args.end_date = data_cfg.get("global_date_window", {}).get(
             "end_date", 
             datetime.now().strftime("%Y-%m-%d")
@@ -286,6 +334,17 @@ def run(configs=None, engine=None, args=None):
     if start is None:
         logger.info("✅ ACLED is already fresh. No fetch needed.")
         return
+
+    _fetch_and_store(engine, start, end)
+
+    # Whatever happened above (API down, stale CSV, nothing new), never let the
+    # pipeline continue on ACLED data that stops long before the window end:
+    # later periods would be zero-filled as "no conflict".
+    assert_acled_fresh(engine, args.end_date, data_cfg)
+
+
+def _fetch_and_store(engine, start, end):
+    """Fetch the missing ACLED window (API first, CSV fallback) and upsert it."""
 
     # 2. Schema Guard
     ensure_table_structure(engine)

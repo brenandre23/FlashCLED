@@ -35,7 +35,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
 try:
-    from utils import logger, PATHS
+    from utils import logger, PATHS, get_train_cutoff
 except ImportError:
     # Fallback if utils not found, for standalone debugging
     import logging
@@ -245,6 +245,14 @@ def run_analysis_single_pass() -> Tuple[Dict, Dict, list]:
         logger.error(f"Feature matrix not found at {fm_path}; cannot attach targets for analysis.")
         return {}, {}, []
     df_labels_full = pd.read_parquet(fm_path)
+    # Newest periods: some horizons already have a known outcome there even
+    # though the longest one does not. compute_metrics drops rows without one.
+    forecast_path = data_dir / "feature_matrix_forecast.parquet"
+    if forecast_path.exists():
+        df_forecast = pd.read_parquet(forecast_path)
+        df_labels_full = pd.concat(
+            [df_labels_full, df_forecast[df_labels_full.columns]], ignore_index=True
+        )
     target_cols_all = ["h3_index", "date"] + [
         c for c in df_labels_full.columns
         if c.startswith("target_") or c.startswith("fatalities_")
@@ -303,10 +311,10 @@ def run_analysis_single_pass() -> Tuple[Dict, Dict, list]:
                 df = df.merge(df_labels, on=["h3_index", "date"], how="left")
 
                 # OOS filter: evaluate only on held-out test period.
-                # train_single_model.py hardcodes split_date = 2024-01-01.
-                # Metrics computed on the full 2000-2025 range are contaminated by
-                # in-sample predictions (inflates ROC-AUC to ~0.99).
-                OOS_CUTOFF = pd.to_datetime("2024-01-01")
+                # The boundary is the training cutoff from configs/data.yaml, the
+                # same value train_single_model.py uses. Metrics on earlier dates
+                # are contaminated by in-sample predictions (ROC-AUC ~0.99).
+                OOS_CUTOFF = get_train_cutoff()
                 df_oos = df[df["date"] >= OOS_CUTOFF]
 
                 # 1. Compute Main Metrics (OOS period only)

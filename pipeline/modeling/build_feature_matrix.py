@@ -42,7 +42,10 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if "utils" not in sys.modules:
     sys.path.append(str(ROOT_DIR))
 
-from utils import logger, PATHS, get_db_engine, load_configs, SCHEMA, ensure_h3_int64, validate_h3_types
+from utils import (
+    logger, PATHS, get_db_engine, load_configs, SCHEMA, ensure_h3_int64, validate_h3_types,
+    get_step_days, get_acled_coverage_end,
+)
 from pipeline.modeling.load_data_utils import sanitize_dataframe
 
 
@@ -272,6 +275,40 @@ def identify_target_columns(df: pd.DataFrame, horizons: List[Dict[str, Any]]) ->
     return target_cols
 
 
+def compute_targets(
+    target_df: pd.DataFrame,
+    horizons: List[Dict[str, Any]],
+    step_days: int,
+    label_known_until: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """
+    Add h-step-ahead targets to a (h3_index, date, fatalities_14d_sum) frame.
+
+    The label of a row dated d for horizon h is the fatality count of the
+    spine window ending d + h * step_days. It is set to NaN (unknown) when
+      - that window lies beyond the end of the spine, or
+      - that window ends after `label_known_until` (the last date covered by
+        ACLED). Conflict columns are zero-filled upstream, so without this
+        mask an unobserved period would be recorded as a confirmed zero.
+    The lead is matched on the label DATE rather than on row position, so a
+    gap in the spine can never silently shift a label to the wrong period.
+    """
+    out = target_df.sort_values(["h3_index", "date"]).reset_index(drop=True)
+    lookup = out.set_index(["h3_index", "date"])["fatalities_14d_sum"]
+    if not lookup.index.is_unique:
+        raise ValueError("Duplicate (h3_index, date) rows in temporal_features; cannot build targets.")
+    for h in horizons:
+        steps = int(h["steps"])
+        label_date = out["date"] + pd.Timedelta(days=steps * step_days)
+        keys = pd.MultiIndex.from_arrays([out["h3_index"], label_date])
+        lead_vals = pd.Series(lookup.reindex(keys).to_numpy(), index=out.index, dtype="float64")
+        if label_known_until is not None:
+            lead_vals = lead_vals.where(label_date <= label_known_until)
+        out[f"target_fatalities_{steps}_step"] = lead_vals.astype("float32")
+        out[f"target_binary_{steps}_step"] = (lead_vals > 0).astype("float32").where(lead_vals.notna())
+    return out
+
+
 def run(
     configs: Dict[str, Any], 
     engine: SqlEngine, 
@@ -439,14 +476,12 @@ def run(
     target_df = pd.concat(target_rows, ignore_index=True)
     del target_rows; gc.collect()
 
-    target_df.sort_values(["h3_index", "date"], inplace=True)
-    for h in horizons:
-        steps = h["steps"]
-        lead_vals = target_df.groupby("h3_index")["fatalities_14d_sum"].shift(-steps)
-        target_df[f"target_fatalities_{steps}_step"] = lead_vals.astype("float32")
-        target_df[f"target_binary_{steps}_step"] = (
-            lead_vals.map(lambda x: 1.0 if x > 0 else (np.nan if pd.isna(x) else 0.0))
-        ).astype("float32")
+    step_days = get_step_days(features_cfg)
+    acled_end = get_acled_coverage_end(engine, SCHEMA)
+    if acled_end is None:
+        raise ValueError("acled_events is empty or missing; cannot build targets.")
+    logger.info(f"ACLED coverage ends {acled_end.date()}; labels of later windows are treated as unknown.")
+    target_df = compute_targets(target_df, horizons, step_days, label_known_until=acled_end)
 
     target_col_names = [c for c in target_df.columns if c.startswith("target_")]
 
@@ -466,11 +501,46 @@ def run(
     final_target_cols = identify_target_columns(master_df, horizons)
     logger.info(f"Identified {len(final_target_cols)} target columns: {final_target_cols}")
 
+    # ---------------------------------------------------------------
+    # Labelled rows -> feature_matrix.parquet (training / evaluation).
+    # Rows whose outcome is not known yet -> feature_matrix_forecast.parquet.
+    # These are the newest periods, i.e. the actual forecasts. They are
+    # scored by generate_predictions but can never reach training: every
+    # trainer drops NaN targets and stops before the train cutoff.
+    # ---------------------------------------------------------------
+    forecast_path = PATHS["data_proc"] / "feature_matrix_forecast.parquet"
+    labelled = master_df[final_target_cols].notna().all(axis=1)
+    forecast_df = master_df[~labelled]
+    # A forecast row dated d uses conflict history up to the window ending
+    # d - 1 step (the *_lag1 features). Beyond ACLED coverage that history is
+    # zero-filled, not observed, so such rows are not forecast at all.
+    usable = forecast_df["date"] - pd.Timedelta(days=step_days) <= acled_end
+    n_unusable = int((~usable).sum())
+    forecast_df = forecast_df[usable].sort_values(["date", "h3_index"], kind="mergesort")
+    if n_unusable:
+        logger.warning(
+            f"Excluded {n_unusable:,} newest rows from forecasting: their conflict history "
+            f"lies beyond ACLED coverage ({acled_end.date()})."
+        )
+    if forecast_df.empty:
+        forecast_path.unlink(missing_ok=True)
+        logger.warning("No forecast rows (no periods with known history but unknown outcome).")
+    else:
+        forecast_df.to_parquet(forecast_path, index=False)
+        logger.info(
+            f"✓ Saved {len(forecast_df):,} forecast rows "
+            f"({forecast_df['date'].min().date()} -> {forecast_df['date'].max().date()}) to {forecast_path}"
+        )
+    forecast_rows = len(forecast_df)
+    del forecast_df
+
     before_drop = len(master_df)
-    master_df = master_df.dropna(subset=final_target_cols)
+    # Fixed (date, cell) order: reproducible file, and positional consumers
+    # see time-ordered rows.
+    master_df = master_df[labelled].sort_values(["date", "h3_index"], kind="mergesort").reset_index(drop=True)
     dropped_count = before_drop - len(master_df)
     if dropped_count > 0:
-        logger.warning(f"Dropped {dropped_count:,} rows with missing targets (temporal boundary).")
+        logger.info(f"{dropped_count:,} rows without a known outcome kept out of the training matrix.")
 
     logger.info(f"Final Matrix Shape: {master_df.shape}")
 
@@ -482,6 +552,7 @@ def run(
 
     master_df.to_parquet(out_path, index=False)
     final_row_count = len(master_df)
+    last_labelled_date = str(master_df["date"].max().date())
     del master_df; gc.collect()
 
     tmp_path.unlink(missing_ok=True)
@@ -497,6 +568,9 @@ def run(
         "start": str(start_date),
         "end": str(end_date),
         "rows": final_row_count,
+        "forecast_rows": forecast_rows,
+        "acled_coverage_end": str(acled_end.date()),
+        "last_labelled_date": last_labelled_date,
         "features": req_feats,
         "horizons": [h["name"] for h in horizons],
         "target_columns": final_target_cols,
