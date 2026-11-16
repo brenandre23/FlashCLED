@@ -53,7 +53,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from utils import logger, get_db_engine, load_configs, upload_to_postgis
+from utils import logger, get_db_engine, load_configs, upload_to_postgis, assert_acled_fresh
 from pipeline.processing.utils_processing import (
     SCHEMA, OUTPUT_TABLE, PRIMARY_KEYS, CHUNK_SIZE,
     parse_registry, safe_merge,
@@ -1027,6 +1027,10 @@ def run():
     start_date = data_cfg['global_date_window']['start_date']
     end_date = data_cfg['global_date_window']['end_date']
     specs = parse_registry(feat_cfg)
+
+    # Conflict columns are zero-filled below. Refuse to do that on ACLED data
+    # that stops long before the window end (also covers --skip-acled runs).
+    assert_acled_fresh(engine, end_date, data_cfg)
 
     logger.info("=" * 70)
     logger.info("CONFLICT FEATURES PROCESSING (v3.2 - fatalities_lag1 fix)")

@@ -95,6 +95,16 @@ def generate_single_run(horizon_name, learner_name):
         bccp = bundle.get("bccp")
 
         df = pd.read_parquet(PATHS["data_proc"] / "feature_matrix.parquet")
+        # Newest periods whose outcome is not known yet (the actual forecasts).
+        forecast_path = PATHS["data_proc"] / "feature_matrix_forecast.parquet"
+        if forecast_path.exists():
+            df_forecast = pd.read_parquet(forecast_path)
+            logger.info(
+                f"Adding {len(df_forecast):,} forecast rows "
+                f"({df_forecast['date'].min()} -> {df_forecast['date'].max()})"
+            )
+            df = pd.concat([df, df_forecast[df.columns]], ignore_index=True)
+            del df_forecast
         df = apply_pca_if_needed(df, bundle)
 
         probs, fatalities = ensemble.predict(df)
