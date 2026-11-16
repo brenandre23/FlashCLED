@@ -28,6 +28,11 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.base import clone
 from sklearn.metrics import brier_score_loss, log_loss
 
+try:
+    from pipeline.modeling.temporal_splits import date_block_folds, temporal_tail_split
+except ImportError:  # executed as a script from pipeline/modeling
+    from temporal_splits import date_block_folds, temporal_tail_split
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -56,12 +61,26 @@ class TwoStageEnsemble:
         calibration_config: Optional[Dict[str, Any]] = None,
         meta_config: Optional[Dict[str, Any]] = None,
         # Safety cap for base regressor outputs before they hit the Poisson meta-learner
-        regressor_input_cap: float = 500.0 
+        regressor_input_cap: float = 500.0,
+        embargo_steps: int = 0,
+        step_days: int = 14,
+        date_col: str = "date",
     ) -> None:
         self.theme_models = theme_models
         self.n_folds = n_folds
         self.random_state = random_state
         self.regressor_input_cap = regressor_input_cap
+        # Leak-safe splitting (see temporal_splits.py): the forecast horizon in
+        # steps is the embargo between any training block and what it is scored on.
+        self.embargo_steps = int(embargo_steps)
+        self.step_days = int(step_days)
+        self.date_col = date_col
+        # Out-of-fold predictions of the stacked model, exposed for conformal
+        # calibration when no separate calibration set is held out. Cleared by
+        # the caller before pickling.
+        self.oof_idx_: Optional[np.ndarray] = None
+        self.oof_prob_: Optional[np.ndarray] = None
+        self.oof_expected_fatalities_: Optional[np.ndarray] = None
         self.meta_config = meta_config or {"type": "xgboost", "params": {"n_estimators": 50, "max_depth": 3, "scale_pos_weight": 8}}
         
         # Parse calibration config (SINGLE SOURCE OF TRUTH)
@@ -187,7 +206,7 @@ class TwoStageEnsemble:
         oof_regress = np.zeros((n_samples, n_themes), dtype=float)
         is_valid_oof = np.zeros(n_samples, dtype=bool)
 
-        tscv = TimeSeriesSplit(n_splits=self.n_folds)
+        folds = self._make_folds(X)
 
         for theme_idx, theme in enumerate(self._validated_theme_models):
             feature_cols = theme["features"]
@@ -208,7 +227,7 @@ class TwoStageEnsemble:
             base_clf = theme["binary_model"]
             base_reg = theme["regress_model"]
 
-            for train_idx, val_idx in tscv.split(X_theme):
+            for train_idx, val_idx in folds:
                 X_train, X_val = X_theme.iloc[train_idx], X_theme.iloc[val_idx]
                 y_train_bin = y_binary.iloc[train_idx]
                 y_train_fat = y_fatalities.iloc[train_idx]
@@ -236,78 +255,82 @@ class TwoStageEnsemble:
 
         return oof_binary, oof_regress, is_valid_oof
 
+    def _make_folds(self, X: pd.DataFrame) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Stacking folds. With a date column: expanding window over whole dates
+        with an embargo of `embargo_steps` (no look-ahead, no date shared
+        between train and validation). Without one: positional TimeSeriesSplit,
+        which is only temporal if the caller sorted the rows by date.
+        """
+        if self.date_col in X.columns:
+            folds = date_block_folds(X[self.date_col], self.n_folds, self.embargo_steps, self.step_days)
+            logger.info(
+                f"Stacking folds: {len(folds)} date blocks, embargo={self.embargo_steps} step(s) "
+                f"x {self.step_days} days"
+            )
+            return folds
+        logger.warning(
+            f"No '{self.date_col}' column passed to TwoStageEnsemble.fit: falling back to positional "
+            "TimeSeriesSplit. This is leak-safe ONLY if rows are sorted by date."
+        )
+        return list(TimeSeriesSplit(n_splits=self.n_folds).split(X))
+
+    def _split_once(self, n: int, fraction: float, dates: Optional[pd.Series]) -> Tuple[np.ndarray, np.ndarray]:
+        """One train/calibration split for the configured method."""
+        all_indices = np.arange(n)
+        if self.calibration_split_method == "temporal_tail":
+            if dates is not None:
+                # Whole dates only, with an embargo of one forecast horizon
+                # between the last training date and the calibration tail.
+                return temporal_tail_split(dates, fraction, self.embargo_steps, self.step_days)
+            logger.warning("temporal_tail calibration split without dates: positional split, no embargo.")
+            split_idx = int(n * (1 - fraction))
+            return all_indices[:split_idx], all_indices[split_idx:]
+        if self.calibration_split_method == "random":
+            logger.warning(
+                "calibration split_method='random' mixes periods between training and calibration; "
+                "it is not leak-safe for forecasting. Prefer 'temporal_tail'."
+            )
+            rng = np.random.default_rng(self.calibration_random_seed)
+            shuffled = rng.permutation(all_indices)
+            split_idx = int(n * (1 - fraction))
+            return np.sort(shuffled[:split_idx]), np.sort(shuffled[split_idx:])
+        if self.calibration_split_method == "rolling":
+            raise NotImplementedError("Rolling calibration not yet implemented")
+        raise ValueError(f"Unknown split_method: {self.calibration_split_method}")
+
     def _compute_calibration_indices(
         self,
         y_binary: pd.Series,
+        dates: Optional[pd.Series] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute train/calibration indices based on calibration policy from config.
-        
+
         SINGLE SOURCE OF TRUTH: This is the ONLY place calibration splits are computed.
         All downstream code must use self.train_idx_ and self.cal_idx_.
-        
-        Supported split methods:
-        - temporal_tail: Last `fraction` of rows (preserves temporal order)
-        - random: Reproducible random split using calibration_random_seed
-        - rolling: Reserved for future rolling-window calibration
-        
-        Returns:
-            train_idx: Array of indices for training set
-            cal_idx: Array of indices for calibration set
+
+        temporal_tail holds out the last `fraction` of distinct dates; training
+        rows stop one forecast horizon earlier (rows in the gap are unused).
         """
         n = len(y_binary)
-        all_indices = np.arange(n)
-        
-        if self.calibration_split_method == "temporal_tail":
-            # Temporal split: last `fraction` of rows
-            split_idx = int(n * (1 - self.calibration_fraction))
-            train_idx = all_indices[:split_idx]
-            cal_idx = all_indices[split_idx:]
-            
-        elif self.calibration_split_method == "random":
-            # Reproducible random split
-            rng = np.random.default_rng(self.calibration_random_seed)
-            shuffled = rng.permutation(all_indices)
-            split_idx = int(n * (1 - self.calibration_fraction))
-            train_idx = np.sort(shuffled[:split_idx])  # Sort to maintain some order
-            cal_idx = np.sort(shuffled[split_idx:])
-            
-        elif self.calibration_split_method == "rolling":
-            # Reserved for future rolling-window calibration
-            raise NotImplementedError("Rolling calibration not yet implemented")
-            
-        else:
-            raise ValueError(f"Unknown split_method: {self.calibration_split_method}")
-        
-        # Check minimum positive events in calibration set
+        train_idx, cal_idx = self._split_once(n, self.calibration_fraction, dates)
+
         n_pos_cal = y_binary.iloc[cal_idx].sum()
-        
         if n_pos_cal < self.min_positive_events:
             logger.warning(
                 f"Only {n_pos_cal} positive cases in calibration set "
                 f"(min={self.min_positive_events}). Applying fallback_fraction={self.fallback_fraction}"
             )
-            # Recompute with fallback fraction
-            if self.calibration_split_method == "temporal_tail":
-                split_idx = int(n * (1 - self.fallback_fraction))
-                train_idx = all_indices[:split_idx]
-                cal_idx = all_indices[split_idx:]
-            elif self.calibration_split_method == "random":
-                rng = np.random.default_rng(self.calibration_random_seed)
-                shuffled = rng.permutation(all_indices)
-                split_idx = int(n * (1 - self.fallback_fraction))
-                train_idx = np.sort(shuffled[:split_idx])
-                cal_idx = np.sort(shuffled[split_idx:])
-            
+            train_idx, cal_idx = self._split_once(n, self.fallback_fraction, dates)
             n_pos_cal = y_binary.iloc[cal_idx].sum()
             logger.info(f"After fallback: {n_pos_cal} positive cases in calibration set")
-        
+
         logger.info(
             f"Calibration split ({self.calibration_split_method}): "
             f"train={len(train_idx):,}, cal={len(cal_idx):,} "
             f"(cal positives: {n_pos_cal:,})"
         )
-        
         return train_idx, cal_idx
 
     def _split_for_calibration(
@@ -323,7 +346,8 @@ class TwoStageEnsemble:
         stored in self.train_idx_ and self.cal_idx_. This method uses those indices.
         """
         # Compute and persist indices (SINGLE SOURCE OF TRUTH)
-        self.train_idx_, self.cal_idx_ = self._compute_calibration_indices(y_binary)
+        dates = X[self.date_col] if self.date_col in X.columns else None
+        self.train_idx_, self.cal_idx_ = self._compute_calibration_indices(y_binary, dates)
         
         X_train = X.iloc[self.train_idx_]
         X_cal = X.iloc[self.cal_idx_]
@@ -408,6 +432,12 @@ class TwoStageEnsemble:
             y_fat_train, y_fat_cal = y_fatalities, y_fatalities
 
         # 2. Generate OOF Predictions (Level 1) on training data
+        # Positional alignment: after a calibration split the pandas index is no
+        # longer 0..n-1, while every OOF array below is positional.
+        X_train = X_train.reset_index(drop=True)
+        y_bin_train = y_bin_train.reset_index(drop=True)
+        y_fat_train = y_fat_train.reset_index(drop=True)
+
         oof_binary, oof_regress, is_valid_oof = self._generate_oof_predictions(X_train, y_bin_train, y_fat_train)
 
         # 3. Train Meta-Classifier (using only rows with valid OOF predictions)
@@ -461,6 +491,20 @@ class TwoStageEnsemble:
             self.meta_regress = None
 
         # 5. Final Retrain of Base Models on Full Training Data
+        # Out-of-fold predictions of the full stack. Base-learner inputs are
+        # strictly out-of-fold (date blocks + embargo); only the low-capacity
+        # meta-learners have seen these rows. Used for conformal calibration
+        # when no separate calibration set exists.
+        oof_prob = self.meta_binary.predict_proba(oof_binary[is_valid_oof])[:, 1]
+        if self.meta_regress is not None:
+            oof_inputs = np.minimum(np.maximum(oof_regress[is_valid_oof], 0), self.regressor_input_cap)
+            oof_mu = np.clip(self.meta_regress.predict(oof_inputs), 0.0, None)
+        else:
+            oof_mu = np.zeros_like(oof_prob)
+        self.oof_idx_ = np.asarray(self.train_idx_)[np.flatnonzero(is_valid_oof)]
+        self.oof_prob_ = oof_prob
+        self.oof_expected_fatalities_ = oof_prob * oof_mu
+
         logger.info("Retraining base models on full training dataset...")
         for theme in self._validated_theme_models:
             X_theme = self._safe_get_features(X_train, theme["features"])
