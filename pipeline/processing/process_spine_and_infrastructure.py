@@ -82,6 +82,26 @@ DOMAIN_TYPES = {
 # HELPER FUNCTIONS
 # =============================================================================
 
+def lag1_stationary_start(spine: pd.DataFrame, col: str) -> pd.Series:
+    """
+    One-step lag per cell; the first step of each series takes its own value
+    ("stationary start") instead of NaN.
+
+    This replaces `shift(1)` followed by an unlimited per-cell `bfill()`. The
+    unlimited backfill copied the NEXT observed value into every earlier
+    missing step: all periods before a source began, and every gap left after
+    the forward-fill limit, received a value measured later. That is temporal
+    leakage (for displacement, a later survey that may itself reflect the
+    violence being predicted) and it contradicted the stock rule of keeping
+    NaN once the forward-fill limit is exhausted. Only the first row is filled
+    now, with a contemporaneous value; all other gaps stay NaN.
+    """
+    grouped = spine.groupby('h3_index')[col]
+    lagged = grouped.shift(1)
+    first_step = grouped.cumcount() == 0
+    return lagged.where(~first_step, spine[col])
+
+
 def process_viirs_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute VIIRS derived features: Kinetic Delta and strict availability flag.
@@ -359,9 +379,7 @@ def process_economics(engine, spine, econ_specs, feat_cfg):
             continue
         
         if 'lag' in trans:
-            # Shift then backfill first gap to avoid leading NaN per series (stationary start)
-            spine[out_col] = spine.groupby('h3_index')[raw].shift(1)
-            spine[out_col] = spine.groupby('h3_index')[out_col].bfill()
+            spine[out_col] = lag1_stationary_start(spine, raw)
         else:
             spine[out_col] = spine[raw]
     
@@ -467,9 +485,7 @@ def process_social_data(engine, spine, social_specs, feat_cfg):
     # Generate lag (preserves NaN)
     out_col = iom_spec.get('output_col', 'iom_displacement_count_lag1')
     if 'lag' in iom_spec.get('transformation', ''):
-        # Shift then backfill first gap to avoid leading NaN per series (stationary start)
-        spine[out_col] = spine.groupby('h3_index')['iom_displacement_sum'].shift(1)
-        spine[out_col] = spine.groupby('h3_index')[out_col].bfill()
+        spine[out_col] = lag1_stationary_start(spine, 'iom_displacement_sum')
     else:
         spine[out_col] = spine['iom_displacement_sum']
     
