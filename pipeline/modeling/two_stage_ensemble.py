@@ -75,6 +75,11 @@ class TwoStageEnsemble:
         self.embargo_steps = int(embargo_steps)
         self.step_days = int(step_days)
         self.date_col = date_col
+        # Meta-learner input scales (see _binary_meta_inputs / _regress_meta_inputs).
+        # Stored on the instance so models pickled before this change still predict
+        # with the scale they were fitted on (attribute absent -> raw inputs).
+        self.meta_logit_inputs = True
+        self.regress_meta_log_inputs = True
         # Out-of-fold predictions of the stacked model, exposed for conformal
         # calibration when no separate calibration set is held out. Cleared by
         # the caller before pickling.
@@ -255,6 +260,37 @@ class TwoStageEnsemble:
 
         return oof_binary, oof_regress, is_valid_oof
 
+    def _binary_meta_inputs(self, probs: np.ndarray) -> np.ndarray:
+        """
+        Base-learner probabilities -> meta-learner inputs, on the logit scale.
+
+        A logistic meta-learner is linear in its inputs on the log-odds scale, so
+        feeding it probabilities mis-specifies it: the base learners are trained
+        with scale_pos_weight and squeeze almost all rows near 0, where equal
+        probability differences mean very different evidence. On logits the
+        stack is a weighted sum of log-odds plus an intercept, i.e. a joint
+        Platt-style recalibration to the true base rate. Tree meta-learners are
+        unaffected (monotone transform).
+        """
+        if not getattr(self, "meta_logit_inputs", False):
+            return probs
+        p = np.clip(probs, 1e-6, 1 - 1e-6)
+        return np.log(p / (1 - p))
+
+    def _regress_meta_inputs(self, preds: np.ndarray) -> np.ndarray:
+        """
+        Base-learner fatality predictions -> Poisson meta-learner inputs.
+
+        The Poisson GLM has a log link: mu = exp(b0 + sum b_k x_k). With raw
+        counts as x_k the prediction grows exponentially in the base prediction,
+        which is what produced the overflows the 500 cap was added to contain.
+        With x_k = log1p(prediction) the stack is a weighted geometric mean of
+        the base predictions (b_k = 1 reproduces a base model exactly), the
+        natural scale for a log-link model. The cap stays as a safety bound.
+        """
+        a = np.minimum(np.maximum(preds, 0), self.regressor_input_cap)
+        return np.log1p(a) if getattr(self, "regress_meta_log_inputs", False) else a
+
     def _make_folds(self, X: pd.DataFrame) -> List[Tuple[np.ndarray, np.ndarray]]:
         """
         Stacking folds. With a date column: expanding window over whole dates
@@ -377,7 +413,7 @@ class TwoStageEnsemble:
                 l1_binary[:, i] = theme["binary_model"].predict(X_theme)
         
         # Get raw meta-learner probabilities
-        raw_probs = self.meta_binary.predict_proba(l1_binary)[:, 1]
+        raw_probs = self.meta_binary.predict_proba(self._binary_meta_inputs(l1_binary))[:, 1]
         
         if self.calibration_method == "sigmoid":
             from sklearn.linear_model import LogisticRegression as LR_Calib
@@ -441,7 +477,7 @@ class TwoStageEnsemble:
         oof_binary, oof_regress, is_valid_oof = self._generate_oof_predictions(X_train, y_bin_train, y_fat_train)
 
         # 3. Train Meta-Classifier (using only rows with valid OOF predictions)
-        X_meta_bin = oof_binary[is_valid_oof]
+        X_meta_bin = self._binary_meta_inputs(oof_binary[is_valid_oof])
         y_meta_bin = y_bin_train[is_valid_oof]
         
         meta_type = self.meta_config.get("type", "logistic")
@@ -483,8 +519,7 @@ class TwoStageEnsemble:
             y_fat_conflict = np.maximum(y_fat_train[conflict_mask], 0)
             
             # CLIP INPUTS: prevent base model outliers from exploding the Poisson exponent
-            X_regress = np.maximum(oof_regress[conflict_mask.values, :], 0)
-            X_regress = np.minimum(X_regress, self.regressor_input_cap) 
+            X_regress = self._regress_meta_inputs(oof_regress[conflict_mask.values, :])
 
             self.meta_regress.fit(X_regress, y_fat_conflict)
         else:
@@ -495,9 +530,9 @@ class TwoStageEnsemble:
         # strictly out-of-fold (date blocks + embargo); only the low-capacity
         # meta-learners have seen these rows. Used for conformal calibration
         # when no separate calibration set exists.
-        oof_prob = self.meta_binary.predict_proba(oof_binary[is_valid_oof])[:, 1]
+        oof_prob = self.meta_binary.predict_proba(X_meta_bin)[:, 1]
         if self.meta_regress is not None:
-            oof_inputs = np.minimum(np.maximum(oof_regress[is_valid_oof], 0), self.regressor_input_cap)
+            oof_inputs = self._regress_meta_inputs(oof_regress[is_valid_oof])
             oof_mu = np.clip(self.meta_regress.predict(oof_inputs), 0.0, None)
         else:
             oof_mu = np.zeros_like(oof_prob)
@@ -563,7 +598,7 @@ class TwoStageEnsemble:
             l1_regress[:, i] = theme["regress_model"].predict(X_theme)
 
         # Level 2: Meta-learner probabilities
-        raw_prob = self.meta_binary.predict_proba(l1_binary)[:, 1]
+        raw_prob = self.meta_binary.predict_proba(self._binary_meta_inputs(l1_binary))[:, 1]
 
         # Level 3: Calibration
         if self.calibrator is not None:
@@ -577,8 +612,7 @@ class TwoStageEnsemble:
         # Fatality predictions (Conditional)
         if self.meta_regress:
             # SAFETY CLIP on inputs before feeding to Poisson meta-learner
-            regress_inputs = np.maximum(l1_regress, 0)
-            regress_inputs = np.minimum(regress_inputs, self.regressor_input_cap)
+            regress_inputs = self._regress_meta_inputs(l1_regress)
             
             conditional_mu = self.meta_regress.predict(regress_inputs)
             conditional_mu = np.clip(conditional_mu, 0.0, None)

@@ -349,7 +349,7 @@ def training_fingerprint(horizon: str, learner_name: str, data_cfg: dict, models
     meta_path = PATHS["data_proc"] / "matrix_meta.json"
     pruned_path = PATHS["root"] / "configs" / "pruned_features.yaml"
     payload = {
-        "version": 2,  # bump when the training procedure itself changes
+        "version": 3,  # bump when the training procedure itself changes
         "train_cutoff": str(get_train_cutoff(data_cfg).date()),
         "horizon": next(h for h in models_cfg["horizons"] if h["name"] == horizon),
         "learner": models_cfg["learners"][learner_name],

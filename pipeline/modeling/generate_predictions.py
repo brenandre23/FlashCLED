@@ -134,7 +134,12 @@ def generate_single_run(horizon_name, learner_name):
                 pred_df["fatalities_lower"] = np.maximum(0, intervals.lower)
                 pred_df["fatalities_upper"] = np.clip(intervals.upper, 0, 1000)
             
-            pred_df["risk_score"] = pred_df["fatalities_upper"]
+            # Rank on the expected fatality count (P(onset) x E[fatalities | onset]).
+            # It is the quantity that maximises fatalities captured per cell monitored,
+            # and it is continuous. The conformal upper bound is a step function of the
+            # prediction (one width per bin), so ranking on it produced large ties and
+            # arbitrary tier membership; it stays available as fatalities_upper.
+            pred_df["risk_score"] = fatalities
         else:
             pred_df["fatalities_lower"] = 0
             pred_df["fatalities_upper"] = fatalities

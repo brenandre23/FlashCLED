@@ -190,3 +190,19 @@ def test_ensemble_fits_with_date_folds_and_exposes_out_of_fold_predictions():
     assert np.isfinite(ens.oof_expected_fatalities_).all()
     prob, expected = ens.predict(df)
     assert prob.shape == (len(df),) and (expected >= 0).all()
+
+
+# --------------------------------------------------------------------------- meta-learner input scales
+
+def test_meta_learner_input_scales():
+    from pipeline.modeling.two_stage_ensemble import TwoStageEnsemble
+
+    ens = TwoStageEnsemble([])
+    logits = ens._binary_meta_inputs(np.array([0.0, 0.02, 0.5, 1.0]))
+    assert np.isfinite(logits).all() and (np.diff(logits) > 0).all() and logits[2] == 0
+    # log scale for the log-link Poisson stack; negatives floored, cap still applied
+    assert np.allclose(ens._regress_meta_inputs(np.array([-3.0, 0.0, 5.0, 1e9])), np.log1p([0, 0, 5, 500]))
+    # a model pickled before these flags existed keeps raw inputs
+    del ens.meta_logit_inputs, ens.regress_meta_log_inputs
+    assert np.array_equal(ens._binary_meta_inputs(np.array([0.2])), np.array([0.2]))
+    assert np.array_equal(ens._regress_meta_inputs(np.array([7.0])), np.array([7.0]))

@@ -423,8 +423,12 @@ def process_food_security(engine, spine, gdf_grid, start_date, end_date, feat_cf
     window = 26  # approx 12 months at 14-day steps
     for col in price_cols:
         if col in spine.columns:
+            # Baseline = median of the PREVIOUS 26 steps (thesis eq. 4.1). The old
+            # baseline was a mean that included the current step, so a spike pulled
+            # its own baseline up and was damped, and one outlier distorted the
+            # baseline for a year. min_periods avoids ratios to 1-2 observations.
             rolling_mean = spine.groupby('h3_index')[col].transform(
-                lambda x: x.rolling(window=window, min_periods=1).mean()
+                lambda x: x.shift(1).rolling(window=window, min_periods=6).median()
             )
             # Shock is ratio to rolling mean; NaN if base data is NaN
             spine[f"{col}_shock"] = (spine[col] / (rolling_mean + 1e-6))
